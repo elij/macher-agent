@@ -7,10 +7,11 @@ https://github.com/user-attachments/assets/461e695a-1315-4975-bbfb-c3a411819e11
 ## Table of Contents
 1. [Core Concepts](#core-concepts)
 2. [Quick Start and Installation](#quick-start-and-installation)
-3. [Tool Creation](#tool-creation)
-4. [Agent Skills](#agent-skills)
-5. [Orchestrating Workflows](#orchestrating-workflows)
-6. [Command Reference](#command-reference)
+3. [Architecture](#architecture)
+4. [Tool Creation](#tool-creation)
+5. [Agent Skills](#agent-skills)
+6. [Orchestrating Workflows](#orchestrating-workflows)
+7. [Command Reference](#command-reference)
 
 ## Core Concepts
 
@@ -34,6 +35,34 @@ The context tree shows the agent's current state. It tracks intermediate edits a
   :config
   ;; Configuration
   )
+```
+
+## Architecture
+
+```mermaid
+graph TD
+    gptel --> macher
+    macher --> macher-agent
+
+    subgraph world [World]
+        direction LR
+        block
+        emacs-buffer[buffer]
+    end
+
+    subgraph macher-context [Macher Context]
+        files
+        buffer
+        media
+    end
+
+    gptel --> |gated| world
+    macher --> files
+    macher-context --> |ediff| world
+    macher-agent --> buffer
+    macher-agent --> media
+    macher-context -->|macher-agent<br /> continuations + tools| macher-context 
+
 ```
 
 ## Tool Creation
