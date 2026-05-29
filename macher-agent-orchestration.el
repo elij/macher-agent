@@ -4,10 +4,12 @@
 
 (declare-function macher-agent--set-system-message "macher-agent-gptel-tools" (msg))
 (declare-function macher-agent-current-context "macher-agent-context")
-(declare-function macher-agent-resolve-tool "macher-agent-skills" (tool-name))
 (declare-function macher-agent--auto-sync-context "macher-agent-context" (&optional ctx fsm))
 
-(defvar macher-agent-skills-alist)
+(defvar macher-agent-subagent-setup-hook nil
+  "Hook run after a subagent buffer is prepared.
+This allows external packages (like macher-agent-skills) to apply
+presets such as system messages and tools.")
 
 (defun macher-agent--add-buffer-to-scope-headless (buf-name persistent-context)
   "Headless core logic for adding BUF-NAME to PERSISTENT-CONTEXT.
@@ -60,18 +62,7 @@ the inherited CONTEXT."
     (unless gptel-mode
       (gptel-mode 1))
     
-    (let* ((preset-sym 'macher-agent-worker)
-           (skill-meta (alist-get preset-sym macher-agent-skills-alist)))
-      (when skill-meta
-        (macher-agent--set-system-message (plist-get skill-meta :body))
-        (make-local-variable 'gptel-tools)
-        (setq gptel-tools nil)
-        (let ((dir-context (plist-get skill-meta :context-dir)))
-          (dolist (tname (plist-get skill-meta :tools))
-            (let ((tool (macher-agent-resolve-tool tname dir-context)))
-              (when tool
-                (push tool gptel-tools)))))
-        (setq gptel-tools (nreverse gptel-tools))))))
+    (run-hooks 'macher-agent-subagent-setup-hook)))
 
 ;;;###autoload
 (defun macher-agent-add-subagent (name dir &optional _display context)

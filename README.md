@@ -44,26 +44,44 @@ graph TD
     gptel --> macher
     macher --> macher-agent
 
-    subgraph world [World]
+    subgraph world
         direction LR
         block
         emacs-buffer[buffer]
     end
 
-    subgraph macher-context [Macher Context]
+    subgraph macher-context
         files
         buffer
         media
     end
+    
 
     gptel --> |gated| world
     macher --> files
     macher-context --> |ediff| world
     macher-agent --> buffer
     macher-agent --> media
-    macher-context -->|macher-agent<br /> continuations + tools| macher-context 
-
+    macher-context -->|macher-agent<br /> continuations + tools| macher-context
 ```
+
+The framework is decoupled into a core engine (`macher-agent`) and external skill asset packs (such as `macher-agent-skills`). The core engine manages the virtual workspace, subagent orchestration, and the user interface. It exposes a stable public API bridge (`macher-agent-api.el`) that allows external packages to safely interact with the agent's internal state without relying on private implementation details.
+
+### Public API Bridge
+
+If you are developing custom skills or extending the agent, use the public API functions provided by `macher-agent-api`. This contract ensures stable integration:
+
+| Command                                         | Description                                                                                                     |
+|-------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| `macher-agent-workspace-resolve-path`           | Resolves a path within the current virtual workspace.                                                           |
+| `macher-agent-context-read`                     | Reads the contents of a context file.                                                                           |
+| `macher-agent-context-update`                   | Updates a context file with new content.                                                                        |
+| `macher-agent-scope-add-file`                   | Headlessly adds a file to the current agent scope.                                                              |
+| `macher-agent-execute-parallel`                 | Orchestrates parallel execution of multiple subagents.                                                          |
+| `macher-agent-prepare-instructions`             | Prepares system instructions for a specific task.                                                               |
+| `macher-agent-submit-task-result`               | Submits the final output from a worker back to the parent agent.                                                |
+| `macher-agent-ui-show`                          | Refreshes and displays the agent user interface.                                                                |
+| `macher-agent-api-register-skills-in-directory` | Scans a provided directory for `SKILL.md` assets and Elisp tools, injecting them into the core UI and registry. |
 
 ## Tool Creation
 
@@ -101,6 +119,8 @@ For more complex tasks, use output filters and success functions. This helps rou
 ## Agent Skills
 
 Agent Skills are defined via folders containing a `SKILL.md` file. This format is similar to typical agent skills. 
+
+By default, the core `macher-agent` package acts as an agnostic consumer. To access the standard default prompts and presets, you should install the separate `macher-agent-skills` package alongside the core.
 
 A skill includes YAML or JSON frontmatter specifying a name, description, and an array of required tools (`allowed-tools`). The Markdown body provides the system prompt. 
 
@@ -148,6 +168,17 @@ This skill requires the `run_pytest` tool. The corresponding Emacs Lisp support 
 ```
 
 You can set a global repository using `macher-agent-global-skills-directory`. Local workspace skills can be loaded interactively, but they cannot execute arbitrary `.el` scripts and must rely on globally registered tools.
+
+### Registering Skill Packs
+
+Since the core engine is decoupled, you can create your own skill pack by placing your `SKILL.md` folders inside a directory and calling the public registration API in your package initialization:
+
+```elisp
+(require 'macher-agent-api)
+
+(defvar my-custom-skills-directory "/path/to/my/skills/")
+(macher-agent-api-register-skills-in-directory my-custom-skills-directory)
+```
 
 ## Orchestrating Workflows
 

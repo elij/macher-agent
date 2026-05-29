@@ -206,13 +206,19 @@ Relies on macher-agent--bridge-context-advice to safely bind virtual memory."
         msg
       (format "ERROR: %s" msg))))
 
-(defun macher-agent--prepare-subagent-instructions (buf instructions)
-  "Insert INSTRUCTIONS into BUF for the delegated sub-agent without the hardcoded preset."
+(defun macher-agent--prepare-subagent-instructions (buf instructions preset)
+  "Insert INSTRUCTIONS into BUF with cloaked system reminders based on PRESET."
   (with-current-buffer buf
     (goto-char (point-max))
     (unless (string-empty-p instructions)
       (macher-agent--insert-hidden "\n\n=== DELEGATED TASK ===\n")
-      (insert (substring-no-properties instructions)))))
+      (insert (substring-no-properties instructions)))
+    
+    ;; Inject the dynamic preset AND the mandatory tool reminder as hidden text
+    (macher-agent--insert-hidden 
+     (concat "\n\n" preset "\n=== SYSTEM REMINDER ===\n"
+             "You MUST use the `submit_task_result` tool to return your answer. "
+             "Do not just type it as plain text.\n"))))
 
 (defvar-local macher-agent--final-result nil
   "Stores the clean, synthesised final answer from the sub-agent.")
