@@ -6,6 +6,8 @@ https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 
 macher-agent integrates with gptel and macher. Please review their respective repositories for further video examples of what can be done when all are used in tandem.
 
+Please review the [wiki](https://github.com/elij/macher-agent/wiki) for advanced use cases.
+
 ## Another emacs agent harness?
 
 - Strict sandboxes
@@ -16,7 +18,7 @@ macher-agent integrates with gptel and macher. Please review their respective re
 
 gptel
 - No longer able to change global state (to avoid race conditions), use mode hooks for defaults.
-- Prompt level presets are composed.
+- Prompt level presets are composed by default using (#905)[https://github.com/karthink/gptel/commit/3cf7bd0c850f6f72249d08d3f749dd4d04efa0f9].
 - If an inline preset is used without further text the preset prompt becomes a user prompt rather than a system prompt (similar to a command rather than a skill)
 - As media in gptel is based on absolute paths and gptel can't access the macher vfs an additional media reading method is added based on base64 payloads (this is also important for agents with computer use use-cases).
 
@@ -68,13 +70,19 @@ graph TD
 
 The agent interacts with a `macher` context rather than live files. This environment records file and buffer modifications. These changes are presented as a diff patch (through ediff) for your review before any disk modifications occur. If the agent needs to use an external CLI tool (like `rg` or `cargo`), `macher-agent` automatically overlays the context onto a temporary directory to allow safe execution.
 
-<img width="708" height="727" alt="macher-agent-context-tree" src="https://github.com/user-attachments/assets/38f55b4c-4de9-4382-b87a-0586ccd0306f" />
-
 ## Quick Start and Installation
 
 `macher-agent` requires `macher` and `gptel`. It also requires `rsync` on your system path.
 
 ```elisp
+;; lazy load on first gptel rather than startup
+(use-package gptel
+  :defer t
+  :config (require 'macher))
+
+(use-package macher
+  :defer t)
+
 (use-package macher-agent
   :after (gptel macher)
   :bind (("C-c m" . macher-agent-inject-thought))

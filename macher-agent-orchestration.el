@@ -99,68 +99,79 @@ Return the normalised preset symbol, or nil."
 
 (defun macher-agent-compose-payload (base-state inline-presets)
   "Pure function to compose a transmission payload.
-Merges BASE-STATE with the resolved configuration of INLINE-PRESETS.
-Returns a property list containing the unified state.
+Merges BASE-STATE with the resolved configuration of INLINE-PRESETS
+using native gptel modification values.
+
+The function clones the initial base state and processes each preset or
+standalone tool sequentially. For each preset, it recursively resolves
+any declared parent dependencies first.
+
+If a preset declares the `:exclusive' flag, it completely clears the
+accumulated system prompt and tools before applying its own configurations,
+preventing base environment bleed.
+
+System prompts and tools are merged using gptel's declarative modifier logic.
+Legacy string-based system prompts are automatically wrapped in native
+append operations, and the original `\n---\n' delimiter is dynamically
+injected if a preceding system prompt exists. Flat properties like model,
+temperature, and token limits are applied as direct overrides.
+
+Finally, if available, `macher-agent-normalize-tools' is invoked on the
+composed tools list.
 
 BASE-STATE is the base state property list.
 INLINE-PRESETS is the list of inline preset symbols.
 
 Return the unified state property list."
-  (let ((composed-system nil)
-        (accumulated-base-sys (plist-get base-state :system))
-        (composed-tools (append (plist-get base-state :tools) nil))
-        (final-model (plist-get base-state :model))
-        (final-temp (plist-get base-state :temperature))
-        (final-tokens (plist-get base-state :max-tokens))
-        (known-presets (plist-get base-state :known-presets)))
+  (let ((state (copy-sequence base-state))
+        (known (plist-get base-state :known-presets)))
     
     (cl-labels
         ((apply-spec (sym spec)
-           (when-let ((parents (plist-get spec :parents)))
+           (when-let* ((parents (plist-get spec :parents)))
              (dolist (parent (if (listp parents) parents (list parents)))
-               (let ((parent-spec (alist-get parent known-presets)))
-                 (when parent-spec (apply-spec parent parent-spec)))))
+               (when-let* ((parent-spec (alist-get parent known)))
+                 (apply-spec parent parent-spec))))
 
            (when (plist-get spec :exclusive)
-             (setq accumulated-base-sys nil
-                   composed-system nil
-                   composed-tools nil))
+             (setq state (plist-put state :system nil))
+             (setq state (plist-put state :tools nil)))
 
-           (when-let ((sys-spec (or (plist-get spec :system) (plist-get spec :system-message))))
-             (if (and (consp sys-spec) (keywordp (car sys-spec)))
-                 (setq accumulated-base-sys (gptel--modify-value accumulated-base-sys sys-spec))
-               (push (format "### Skill: %s\n%s\n" sym sys-spec) composed-system)))
+           (when-let* ((sys-spec (or (plist-get spec :system) (plist-get spec :system-message))))
+             (when (stringp sys-spec)
+               (let ((current-sys (plist-get state :system)))
+                 (setq sys-spec `(:append ,(concat (if current-sys "\n---\n" "")
+                                                   (format "### Skill: %s\n%s\n" sym sys-spec))))))
+             (setq state (plist-put state :system
+                                    (gptel--modify-value (plist-get state :system) sys-spec))))
 
-           (when-let ((tools-spec (or (plist-get spec :tools) (plist-get spec :allowed-tools))))
-             (let ((resolved (gptel--modify-value composed-tools tools-spec)))
-               (setq composed-tools 
-                     (cl-loop for t-obj in (if (listp resolved) resolved (list resolved))
-                              collect (if (stringp t-obj) (or (ignore-errors (gptel-get-tool t-obj)) t-obj) t-obj)))))
+           (when-let* ((tools-spec (or (plist-get spec :tools) (plist-get spec :allowed-tools))))
+             (let ((merged-tools (gptel--modify-value (plist-get state :tools) tools-spec)))
+               (setq state (plist-put state :tools 
+                                      (cl-loop for t-obj in (if (listp merged-tools) merged-tools (list merged-tools))
+                                               collect (if (stringp t-obj) 
+                                                           (or (ignore-errors (gptel-get-tool t-obj)) t-obj) 
+                                                         t-obj))))))
 
-           (when-let ((mod (plist-get spec :model))) (setq final-model mod))
-           (when-let ((temp (plist-get spec :temperature))) (setq final-temp temp))
-           (when-let ((tok (plist-get spec :max-tokens))) (setq final-tokens tok))))
+           (dolist (key '(:model :temperature :max-tokens))
+             (when-let* ((val (plist-get spec key)))
+               (setq state (plist-put state key val))))))
 
       (dolist (sym inline-presets)
         (let* ((clean-sym (if (fboundp 'macher-normalise-preset-name)
                               (macher-normalise-preset-name sym) sym))
-               (spec (when clean-sym (alist-get clean-sym known-presets)))
+               (spec (when clean-sym (alist-get clean-sym known)))
                (tool (when (and (not spec) clean-sym (fboundp 'gptel-get-tool))
                        (or (ignore-errors (gptel-get-tool (symbol-name clean-sym)))
                            (ignore-errors (gptel-get-tool (replace-regexp-in-string "-" "_" (symbol-name clean-sym))))))))
           (cond
            (spec (apply-spec sym spec))
-           (tool (push tool composed-tools))))))
+           (tool (setq state (plist-put state :tools (append (plist-get state :tools) (list tool)))))))))
 
-    (let ((final-sys (string-join (delq nil (cons accumulated-base-sys (nreverse composed-system))) "\n---\n"))
-          (final-tools (if (fboundp 'macher-agent-normalize-tools)
-                           (macher-agent-normalize-tools composed-tools)
-                         composed-tools)))
-      (list :model final-model
-            :system final-sys
-            :temperature final-temp
-            :max-tokens final-tokens
-            :tools final-tools))))
+    (when (fboundp 'macher-agent-normalize-tools)
+      (setq state (plist-put state :tools (macher-agent-normalize-tools (plist-get state :tools)))))
+
+    state))
 
 (defun macher-agent--apply-payload-locally (payload)
   "Apply a composed payload to the current buffer variables.
