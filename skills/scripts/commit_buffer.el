@@ -12,6 +12,7 @@
                       (with-current-buffer target-buffer
                         (when (bound-and-true-p auto-save-visited-mode)
                           (auto-save-visited-mode -1))
+                        (goto-char (point-max))
                         (insert content)
                         (set-buffer-modified-p t))
                       (when context
