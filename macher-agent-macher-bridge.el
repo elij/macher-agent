@@ -180,8 +180,8 @@ PROJECT-ROOT is the project root directory string.
 
 Return a list containing virtual context, physical context, and physical contents."
   (let* ((vfs-ctx (or (ignore-errors (macher-agent-resolve-context (or fsm context))) context))
-         (raw-contents (or (and vfs-ctx (macher-agent--get-context-contents vfs-ctx))
-                           (macher-agent--get-context-contents context)))
+         (raw-contents (or (and context (macher-agent--get-context-contents context))
+                           (and vfs-ctx (macher-agent--get-context-contents vfs-ctx))))
          (struct-contents (mapcar (lambda (entry)
                                     (if (and (fboundp 'macher-agent-vfs-entry-p)
                                              (macher-agent-vfs-entry-p entry))

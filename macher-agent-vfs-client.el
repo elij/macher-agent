@@ -743,8 +743,10 @@ Return nil."
     (let ((contents (macher-agent--get-context-contents ctx))
           (synced nil))
       (dolist (entry contents)
-        (when (macher-agent--sync-context-entry entry)
-          (setq synced t)))
+        (when (and (fboundp 'macher-agent-vfs-entry-p)
+                   (macher-agent-vfs-entry-p entry))
+          (when (macher-agent--sync-context-entry entry)
+            (setq synced t))))
       (when synced
         (macher-agent--set-context-dirty-p ctx nil)
         (macher-agent--persist-vfs-to-hidden-buffer ctx)
