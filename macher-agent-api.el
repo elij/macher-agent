@@ -785,32 +785,48 @@ Return the wrapped gptel-tool structure."
 
 (defvar macher-agent--allow-gptel-restore)
 
+(declare-function macher-agent-setup-gptel-buffer "macher-agent-gptel-bridge")
+
 (defun macher-agent-gptel-mode-setup ()
-  "Initialise macher-agent defaults for all gptel buffers.
+  "Initialise macher-agent defaults for gptel buffers inside a workspace.
+If outside a workspace, allows standard gptel execution and emits a message."
+  (let ((is-workspace (and default-directory
+                           (or (and (fboundp 'project-current) (project-current nil default-directory))
+                               (and (fboundp 'vc-root-dir) (vc-root-dir))))))
+    (if is-workspace
+        (progn
+          (make-local-variable 'gptel--preset)
+          (make-local-variable 'gptel-tools)
+          (make-local-variable 'gptel-model)
+          (make-local-variable 'gptel-backend)
+          (make-local-variable 'gptel-system-prompt)
+          (make-local-variable 'gptel-temperature)
+          (make-local-variable 'gptel-max-tokens)
+          (make-local-variable 'gptel--tool-names)
+          (make-local-variable 'gptel--backend-name)
 
-Return nil."
-  (make-local-variable 'gptel--preset)
-  (make-local-variable 'gptel-tools)
-  (make-local-variable 'gptel-model)
-  (make-local-variable 'gptel-backend)
-  (make-local-variable 'gptel-system-prompt)
-  (make-local-variable 'gptel-temperature)
-  (make-local-variable 'gptel-max-tokens)
-  (make-local-variable 'gptel--tool-names)
-  (make-local-variable 'gptel--backend-name)
+          (setq-local gptel--set-buffer-locally t)
+          
+          (setq-local gptel-tools nil)
 
-  (setq-local gptel--set-buffer-locally t)
-  
-  (setq-local gptel-tools nil)
+          (unless (macher-agent-subagent-p)
+            (macher-agent--init-workspace-state 
+             (file-name-as-directory (macher-agent-root default-directory))))
+          
+          (when (fboundp 'gptel--restore-state)
+            (let ((macher-agent--allow-gptel-restore t))
+              (gptel--restore-state))))
+      
+      (message "Macher-Agent: Not in a recognised project workspace. Running standard gptel."))))
 
+(defun macher-agent-force-enable ()
+  "Force Macher Agent to treat the current directory as a workspace root."
+  (interactive)
   (unless (macher-agent-subagent-p)
-    (when default-directory
-      (macher-agent--init-workspace-state 
-       (file-name-as-directory (macher-agent-root default-directory)))))
-  
-  (when (fboundp 'gptel--restore-state)
-    (let ((macher-agent--allow-gptel-restore t))
-      (gptel--restore-state))))
+    (macher-agent--init-workspace-state 
+     (file-name-as-directory (expand-file-name default-directory))))
+  (macher-agent-setup-gptel-buffer)
+  (message "Macher-Agent manually forced on for: %s" default-directory))
 
 (add-hook 'gptel-mode-hook #'macher-agent-gptel-mode-setup)
 
