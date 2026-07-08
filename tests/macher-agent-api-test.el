@@ -32,4 +32,41 @@
   (should (equal (macher-agent-sandbox-run '(let ((x 10) (y 20)) (progn (setq x 15) (+ x y))) '(+)) 35))
   (should (equal (macher-agent-sandbox-run '(funcall (lambda (x) (* x x)) 5) '(*)) 25)))
 
+(ert-deftest macher-agent-sandbox-comprehensive-test ()
+  "Test newly implemented sandboxed features."
+  ;; Keyword self-evaluation
+  (should (equal (macher-agent-sandbox-run ':foo nil) :foo))
+  (should (equal (macher-agent-sandbox-run '(let ((x :bar)) x) nil) :bar))
+  
+  ;; Built-in and whitelisted functions
+  (should (equal (macher-agent-sandbox-run '(not nil) nil) t))
+  (should (equal (macher-agent-sandbox-run '(not t) nil) nil))
+  (should (equal (macher-agent-sandbox-run '(reverse '(1 2 3)) nil) '(3 2 1)))
+  (should (equal (macher-agent-sandbox-run '(split-string "foo bar" " ") nil) '("foo" "bar")))
+  (should (equal (macher-agent-sandbox-run '(plist-get '(:a 1 :b 2) :b) nil) 2))
+  
+  ;; Functional application
+  (should (equal (macher-agent-sandbox-run '(apply '+ 1 2 '(3 4)) '(+)) 10))
+  (should (equal (macher-agent-sandbox-run '(apply '+ '(1 2 3)) '(+)) 6))
+  (should (equal (macher-agent-sandbox-run '(mapcar (lambda (x) (* x 2)) '(1 2 3)) '(*)) '(2 4 6)))
+  
+  ;; Control flow and Error handling
+  (should (equal (macher-agent-sandbox-run '(condition-case err (/ 1 0) (error 'caught)) '(/)) 'caught))
+  (should (equal (macher-agent-sandbox-run '(unwind-protect 1 2) nil) 1))
+  (should (equal (macher-agent-sandbox-run '(catch 'tag (throw 'tag 42)) nil) 42))
+  
+  ;; Introspection
+  (should (equal (macher-agent-sandbox-run '(fboundp 'car) nil) t))
+  (should (equal (macher-agent-sandbox-run '(fboundp 'nonexistent) nil) nil))
+  (should (equal (macher-agent-sandbox-run '(let ((x 1)) (boundp 'x)) nil) t))
+  (should (equal (macher-agent-sandbox-run '(boundp 'nonexistent) nil) nil))
+  
+  ;; Macros
+  (should (equal (macher-agent-sandbox-run '(progn
+                                              (defalias 'my-when '(macro lambda (cond &rest body)
+                                                                         (list 'if cond (cons 'progn body))))
+                                              (my-when t 42))
+                                           nil)
+                 42)))
+
 (provide 'macher-agent-api-test)
