@@ -30,11 +30,12 @@ macher
 1. [Core Concepts and Architecture](#core-concepts-and-architecture)
 2. [Quick Start and Installation](#quick-start-and-installation)
 3. [Tool Creation and The Sandbox](#tool-creation-and-the-sandbox)
-4. [Agent Skills and Registration](#agent-skills-and-registration)
-5. [Advanced Context (Media and Instructions)](#advanced-context-media-and-instructions)
-6. [Orchestrating Workflows](#orchestrating-workflows)
-7. [Lifecycle Hook Mapping Matrix](#lifecycle-hook-mapping-matrix)
-8. [Command Reference](#command-reference)
+4. [Runtime sandboxing](#runtime-sandboxing)
+5. [Agent Skills and Registration](#agent-skills-and-registration)
+6. [Advanced Context (Media and Instructions)](#advanced-context-media-and-instructions)
+7. [Orchestrating Workflows](#orchestrating-workflows)
+8. [Lifecycle Hook Mapping Matrix](#lifecycle-hook-mapping-matrix)
+9. [Command Reference](#command-reference)
 
 ## Core Concepts and Architecture
 
@@ -55,12 +56,19 @@ graph TD
         media
     end
 
+    subgraph elisp-sandbox [Elisp Sandbox]
+        direction LR
+        evaluator[safe evaluator]
+        primitives[allowed primitives]
+    end
+
     gptel --> |gated| world
     macher --> files
     macher-context --> |diff/ediff/vdiff mode| world
     macher-agent --> buffer
     macher-agent --> media
     macher-context -->|macher-agent<br /> continuations + tools| macher-context 
+    macher-agent --> |sandboxed execution| elisp-sandbox
 
 ```
 
@@ -134,6 +142,44 @@ By accepting `payload`, `context`, and `root`, you can utilise the virtual file 
                   (if content
                       (make-macher-agent-lisp-result-response :payload content)
                     (error "File not found in the virtual file system: %s" path)))))
+```
+
+## Runtime sandboxing
+
+To protect host environments from unintended side effects during code evaluation, the package includes an isolated, safe Emacs Lisp evaluator. This evaluator executes untrusted or dynamically generated Lisp code without exposing your local files or configuration to risk.
+
+The sandbox executes programs inside a restricted environment with limited primitives. You must explicitly declare any additional host operations that the program is permitted to call.
+
+### Safe block
+
+This example defines and calls a local volume calculation function while safely shadowing variables:
+
+```elisp
+(let ((safe-program
+       '(progn
+
+          (defun calculate-volume (width height depth)
+            (* width height depth))
+            
+          ;; variable same name
+          (let ((calculate-volume 999))
+            (message (concat "Volume is: " 
+                    (number-to-string (calculate-volume 5 10 2))))))))
+                    
+  (macher-agent-sandbox-run safe-program '(number-to-string message)))
+```
+
+### Unsafe block
+
+In this example, trying to call a restricted host primitive results in an error, which prevents the malicious program from reading sensitive files:
+
+```elisp
+(let ((malicious-program
+       '(insert-file-contents "/etc/passwd")))
+       
+  (condition-case err
+      (macher-agent-sandbox-run malicious-program nil)
+    (error (message "Execution halted: %S" err))))
 ```
 
 ## Agent Skills and Registration

@@ -7,6 +7,7 @@
 (require 'macher-agent-macher-bridge)
 (require 'macher-agent-orchestration)
 (require 'macher-agent-gptel-tools)
+(require 'macher-agent-sandbox)
 
 (defcustom macher-agent-skill-directories nil
   "List of user-defined directories to scan for SKILL.md files."
@@ -859,5 +860,15 @@ Return nil."
       (when active-skill (setq-local macher-agent--active-skill-sym active-skill))
       
       (switch-to-buffer (current-buffer)))))
+
+(defun macher-agent-sandbox-run (expression extra-operations)
+  "Execute EXPRESSION in a sandboxed environment with EXTRA-OPERATIONS.
+
+EXPRESSION is the Lisp form to evaluate.
+EXTRA-OPERATIONS is a list of allowed host function symbols.
+
+Return the evaluated result."
+  (declare (ftype (function (t list) t)))
+  (macher-agent--sandbox-run expression extra-operations))
 
 (provide 'macher-agent-api)
