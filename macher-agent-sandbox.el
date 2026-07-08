@@ -201,7 +201,7 @@ Return the evaluated result of the expression."
            
            (t (error "Void function: %s" operator))))))))))
 
-(defun macher-agent-sandbox--run (expression extra-operations)
+(defun macher-agent--sandbox-run (expression extra-operations)
   "Expand EXPRESSION and execute in a sandboxed environment.
 
 EXPRESSION is the Lisp form to evaluate.
