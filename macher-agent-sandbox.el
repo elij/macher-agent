@@ -12,7 +12,11 @@
 
 ;;; Code:
 
+
 (require 'cl-lib)
+
+(defvar-local macher-agent-sandbox--globals nil
+  "Global variable environment for guest execution.")
 
 (defvar-local macher-agent-sandbox--primitives nil
   "Allowed host operations.")
@@ -24,10 +28,7 @@
   "Execute a CLOSURE with ARGUMENTS.
 
 CLOSURE is the closure form to execute.
-ARGUMENTS is the list of arguments to pass.
-
-Return the evaluated result."
-  (declare (ftype (function (list list) t)))
+ARGUMENTS is the list of arguments to pass"
   (let ((new-env (cadddr closure))
         (params (cadr closure))
         (result nil))
@@ -45,7 +46,6 @@ EXPRESSION is the Lisp form to evaluate.
 ENVIRONMENT is the association list of current variable bindings.
 
 Return the evaluated result of the expression."
-  (declare (ftype (function (t list) t)))
   (cond
    ((or (numberp expression) (stringp expression) (memq expression '(t nil)))
     expression)
@@ -54,7 +54,11 @@ Return the evaluated result of the expression."
     (let ((binding (assoc expression environment)))
       (if binding
           (cdr binding)
-        (error "Unbound variable: %s" expression))))
+        (let* ((unbound-marker (make-symbol "unbound"))
+               (val (gethash expression macher-agent-sandbox--globals unbound-marker)))
+          (if (eq val unbound-marker)
+              (error "Unbound variable: %s" expression)
+            val)))))
 
    ((consp expression)
     (let ((operator (car expression))
@@ -65,7 +69,10 @@ Return the evaluated result of the expression."
 
        ((memq operator '(lambda function))
         (if (eq operator 'function)
-            (macher-agent-sandbox--eval (car arguments) environment)
+            (let ((fn-target (car arguments)))
+              (if (symbolp fn-target)
+                  fn-target
+                (macher-agent-sandbox--eval fn-target environment)))
           (list 'closure (car arguments) (cdr arguments) environment)))
 
        ((eq operator 'progn)
@@ -78,6 +85,31 @@ Return the evaluated result of the expression."
             (macher-agent-sandbox--eval (cadr arguments) environment)
           (macher-agent-sandbox--eval (caddr arguments) environment)))
 
+       ((memq operator '(and or))
+        (let ((args arguments)
+              (is-and (eq operator 'and))
+              (result (eq operator 'and))) 
+          (while (and args (if is-and result (not result)))
+            (setq result (macher-agent-sandbox--eval (car args) environment))
+            (setq args (cdr args)))
+          result))
+
+       ((eq operator 'cond)
+        (let ((clauses arguments)
+              (result nil)
+              (matched nil))
+          (while (and clauses (not matched))
+            (let* ((clause (car clauses))
+                   (condition-result (macher-agent-sandbox--eval (car clause) environment)))
+              (when condition-result
+                (setq matched t)
+                (if (cdr clause)
+                    (dolist (form (cdr clause))
+                      (setq result (macher-agent-sandbox--eval form environment)))
+                  (setq result condition-result))))
+            (setq clauses (cdr clauses)))
+          result))
+
        ((eq operator 'setq)
         (let ((args arguments)
               (val nil))
@@ -87,7 +119,7 @@ Return the evaluated result of the expression."
               (setq val (macher-agent-sandbox--eval (cadr args) environment))
               (if binding
                   (setcdr binding val)
-                (error "Cannot setq unbound variable: %s" var)))
+                (puthash var val macher-agent-sandbox--globals)))
             (setq args (cddr args)))
           val))
 
@@ -112,12 +144,28 @@ Return the evaluated result of the expression."
           (dolist (form (cdr arguments) result)
             (setq result (macher-agent-sandbox--eval form new-env)))))
 
-       ;; allow inline funcs
        ((eq operator 'defalias)
         (let ((func-name (macher-agent-sandbox--eval (car arguments) environment))
               (func-body (macher-agent-sandbox--eval (cadr arguments) environment)))
           (puthash func-name func-body macher-agent-sandbox--functions)
           func-name))
+
+       ((eq operator 'mapcar)
+        (let ((func (macher-agent-sandbox--eval (car arguments) environment))
+              (seq (macher-agent-sandbox--eval (cadr arguments) environment)))
+          (mapcar (lambda (item)
+                    (cond
+                     ((and (consp func) (eq (car func) 'closure))
+                      (macher-agent-sandbox--apply-closure func (list item)))
+                     ((symbolp func)
+                      (cond
+                       ((gethash func macher-agent-sandbox--primitives)
+                        (funcall (gethash func macher-agent-sandbox--primitives) item))
+                       ((gethash func macher-agent-sandbox--functions)
+                        (macher-agent-sandbox--apply-closure (gethash func macher-agent-sandbox--functions) (list item)))
+                       (t (error "Void function in mapcar: %s" func))))
+                     (t (error "Invalid function in mapcar: %s" func))))
+                  seq)))
 
        ((eq operator 'funcall)
         (let ((func (macher-agent-sandbox--eval (car arguments) environment))
@@ -160,30 +208,24 @@ EXPRESSION is the Lisp form to evaluate.
 EXTRA-OPERATIONS is a list of allowed host function symbols.
 
 Return the evaluated result."
-  (declare (ftype (function (t list) t)))
   (let ((expanded-expression (macroexpand-all expression))
         (macher-agent-sandbox--primitives (make-hash-table :test 'eq))
-        (macher-agent-sandbox--functions (make-hash-table :test 'eq)))
+        (macher-agent-sandbox--functions (make-hash-table :test 'eq))
+        (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
 
     (mapatoms
      (lambda (sym)
        (when (and (fboundp sym) (get sym 'pure))
          (puthash sym sym macher-agent-sandbox--primitives))))
 
-    (dolist (op extra-operations)
+    (dolist (op (append '(cons list string-to-list substring
+                               expt string-upcase string= string< random format
+                               string-match string-to-number number-to-string
+                               int-to-string make-vector vector make-list append)
+                        extra-operations))
       (puthash op op macher-agent-sandbox--primitives))
 
     (macher-agent-sandbox--eval expanded-expression nil)))
-
-(defun macher-agent--sandbox-run (expression extra-operations)
-  "Expand EXPRESSION and execute in a sandboxed environment.
-
-EXPRESSION is the Lisp form to evaluate.
-EXTRA-OPERATIONS is a list of allowed host function symbols.
-
-Return the evaluated result."
-  (declare (ftype (function (t list) t)))
-  (macher-agent-sandbox--run expression extra-operations))
 
 (provide 'macher-agent-sandbox)
 ;;; macher-agent-sandbox.el ends here
