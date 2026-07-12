@@ -322,15 +322,8 @@ SANDBOX-DIR is the sandbox directory path string.
 
 Return nil."
   (when (and context (macher-agent--get-context-dirty-p context))
-    (let* ((ws-root (macher-agent-context-root context))
-           (raw-contents (macher-agent--get-context-contents context))
-           (contents (seq-filter (lambda (entry)
-                                   (and entry
-                                        (not (consp entry))
-                                        (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                 (macher-agent-vfs-entry-p entry))
-                                            (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                 raw-contents)))
+    (let ((ws-root (macher-agent-context-root context))
+          (contents (macher-agent--get-context-contents context)))
       (macher-agent--vfs-apply-overlay-stateless contents ws-root sandbox-dir))))
 
 (defun macher-agent-call-with-strict-vfs-pipeline (context body-fn)
@@ -341,29 +334,15 @@ BODY-FN is the function containing pipeline logic.
 
 Return the result of BODY-FN."
   (let* ((workspace-root (macher-agent-context-root context))
-         (sandbox-dir (make-temp-file "macher-sandbox-" t))
-         (original-contents (and context (macher-agent--get-context-contents context))))
+         (sandbox-dir (make-temp-file "macher-sandbox-" t)))
     (unwind-protect
         (progn
-          (when context          
-            (macher-agent--set-context-contents context
-                                                (seq-filter (lambda (entry)
-                                                              (and entry
-                                                                   (not (consp entry))
-                                                                   (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                                            (macher-agent-vfs-entry-p entry))
-                                                                       (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                                            original-contents)))
-          (unwind-protect
-              (progn
-                (macher-agent--vfs-verify-clean-merge workspace-root context)
-                (macher-agent--vfs-sync-baseline workspace-root sandbox-dir)
-                (macher-agent--vfs-apply-overlay context sandbox-dir)
-                (let ((default-directory sandbox-dir))
-                  (funcall body-fn)))
-            (when context
-              (macher-agent--set-context-contents context original-contents))
-            (delete-directory sandbox-dir t))))))
+          (macher-agent--vfs-verify-clean-merge workspace-root context)
+          (macher-agent--vfs-sync-baseline workspace-root sandbox-dir)
+          (macher-agent--vfs-apply-overlay context sandbox-dir)
+          (let ((default-directory sandbox-dir))
+            (funcall body-fn)))
+      (delete-directory sandbox-dir t))))
 
 (defmacro macher-agent-with-strict-vfs-pipeline (context &rest body)
   `(macher-agent-call-with-strict-vfs-pipeline ,context (lambda () ,@body)))
