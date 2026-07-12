@@ -89,10 +89,10 @@ RESULT is the final synthesised answer string.
 Return nil."
   (setq-local macher-agent--final-result result)
   (when (boundp 'macher-agent--parent-callback)
-    (funcall macher-agent--parent-callback 
-             (make-macher-agent-lisp-result-response 
-              :status 'success 
-              :data result 
+    (funcall macher-agent--parent-callback
+             (make-macher-agent-lisp-result-response
+              :status 'success
+              :data result
               :buffer-name (buffer-name)))
     (makunbound 'macher-agent--parent-callback)))
 
@@ -150,7 +150,7 @@ TOOL is the tool representation to convert.
 
 Return the canonical tool name string, or nil."
   (and tool
-       (let ((raw-name 
+       (let ((raw-name
               (cond
                ((stringp tool) tool)
                ((and (fboundp 'gptel-tool-p) (gptel-tool-p tool))
@@ -208,7 +208,7 @@ Return a hash table of key-value pairs."
           (puthash current-list-key (nreverse current-list-val) ht)
           (setq current-list-key nil
                 current-list-val nil))
-        
+
         (let* ((key (match-string 1 line))
                (raw-val (string-trim (match-string 2 line))))
           (cond
@@ -216,18 +216,18 @@ Return a hash table of key-value pairs."
             (let* ((inner (match-string 1 raw-val))
                    (items (split-string inner "[, \t\n\r\"]+" t)))
               (puthash key items ht)))
-           
+
            ((string-empty-p raw-val)
             (setq current-list-key key
                   current-list-val nil))
-           
+
            (t
             (let ((clean-val (replace-regexp-in-string "\\`['\"]\\|['\"]\\'" "" raw-val)))
               (cond
                ((member (downcase clean-val) '("true" "yes" "1")) (puthash key t ht))
                ((member (downcase clean-val) '("false" "no" "0")) (puthash key nil ht))
                (t (puthash key clean-val ht))))))))))
-    
+
     (when current-list-key
       (puthash current-list-key (nreverse current-list-val) ht))
     ht))
@@ -240,7 +240,7 @@ FILEPATH is the path to the skill file (string).
 Return a property list containing skill properties."
   (with-temp-buffer
     (let* ((org-inhibit-startup t)
-           (abs-file (expand-file-name filepath))) 
+           (abs-file (expand-file-name filepath)))
       (setq default-directory (file-name-directory abs-file))
       (insert-file-contents abs-file)
       (goto-char (point-max))
@@ -250,21 +250,21 @@ Return a property list containing skill properties."
       (org-macro-initialize-templates)
       (org-macro-replace-all org-macro-templates)
       (goto-char (point-min))
-      
+
       (let ((fm-hash (make-hash-table :test 'equal))
             body name has-tools)
-        
+
         (when-let* (((re-search-forward "^---\n" nil t))
                     (start (point))
                     ((re-search-forward "^---\n" nil t))
                     (frontmatter (buffer-substring-no-properties start (match-beginning 0))))
           (setq fm-hash (macher-agent--parse-frontmatter frontmatter)))
-        
+
         (setq body (string-trim (buffer-substring-no-properties (point) (point-max))))
         (setq name (gethash "name" fm-hash))
-        
+
         (setq has-tools (not (eq (gethash "allowed-tools" fm-hash 'missing) 'missing)))
-        
+
         (list :name name
               :name-sym (when name (intern name))
               :description (gethash "description" fm-hash)
@@ -385,7 +385,7 @@ Return nil."
           (remhash canonical-name registry)
           (remhash tool-name registry)
           (remhash (intern tool-name) registry)))
-      
+
       (when (and macher-agent--persistent-context workspace)
         (let ((skills-dir (expand-file-name "skills" (macher-agent-root workspace))))
           (when (and skills-dir (file-directory-p skills-dir))
@@ -464,7 +464,7 @@ Return the evaluated tool struct, or nil."
             (cond
              ((macher-tool-valid-p res)
               (setq captured-tool res))
-             ((and (symbolp res) (boundp res) 
+             ((and (symbolp res) (boundp res)
                    (macher-tool-valid-p (symbol-value res)))
               (setq captured-tool (symbol-value res))))))
       (error
@@ -498,17 +498,17 @@ Return the resolved tool object, or TOOL-NAME if unresolved."
             (let ((trusted-forms (macher-agent--parse-and-validate-tool-ast content-to-eval canonical-name)))
               (when trusted-forms
                 (setq loaded-tool (macher-agent--evaluate-trusted-tool-ast trusted-forms canonical-name))))))))
-    
+
     (unless loaded-tool
       (let* ((tool-sym (if (symbolp tool-name) tool-name (intern-soft tool-name)))
              (sym-val (when (and tool-sym (boundp tool-sym)) (symbol-value tool-sym))))
         (if (and sym-val (macher-tool-valid-p sym-val))
             (setq loaded-tool sym-val)
           (when canonical-name
-            (setq loaded-tool 
-                  (ignore-errors 
+            (setq loaded-tool
+                  (ignore-errors
                     (gptel-get-tool canonical-name)))))))
-    
+
     (when loaded-tool
       (macher-agent--cache-tool loaded-tool registry))
 
@@ -553,10 +553,10 @@ Return nil."
              (exclusive (plist-get parsed :exclusive))
              (workspace (when context (macher-agent--get-context-workspace context)))
              (skill-base-dir (file-name-directory skill-file)))
-        
+
         (when (and sym body)
-          (let* ((alist (if workspace 
-                            (macher-agent-workspace-skills-alist workspace) 
+          (let* ((alist (if workspace
+                            (macher-agent-workspace-skills-alist workspace)
                           macher-agent-global-skills-alist))
                  (resolved-tools (when tool-names
                                    (delq nil (mapcar (lambda (tname)
@@ -624,11 +624,11 @@ Return nil."
                                 (if (listp macher-agent-skill-directories)
                                     macher-agent-skill-directories
                                   (list macher-agent-skill-directories))))))
-    
+
     (cl-loop for d in (delete-dups directories)
              do (when (file-directory-p d)
                   (macher-agent-api-register-skills-in-directory d context)))
-    
+
     (let* ((workspace (when context (macher-agent--get-context-workspace context)))
            (ws-skills (when workspace (macher-agent-workspace-skills-alist workspace)))
            (global-skills macher-agent-global-skills-alist)
@@ -636,13 +636,13 @@ Return nil."
                                                 :key #'car
                                                 :test #'eq
                                                 :from-end t)))
-      
+
       (unless (local-variable-p 'gptel-directives)
         (setq-local gptel-directives (copy-tree (default-value 'gptel-directives))))
-      
+
       (unless (local-variable-p 'gptel--known-presets)
         (setq-local gptel--known-presets (copy-tree (default-value 'gptel--known-presets))))
-      
+
       (cl-loop for (sym . meta) in merged-skills
                for system-prompt = (plist-get meta :system)
                for desc = (plist-get meta :description)
@@ -656,11 +656,11 @@ Return nil."
                                              :system system-prompt)))
                       (when exclusive (setq preset-spec (plist-put preset-spec :exclusive t)))
                       (when model (setq preset-spec (plist-put preset-spec :model model)))
-                      (when tool-names 
-                        (setq preset-spec (plist-put preset-spec :tools 
+                      (when tool-names
+                        (setq preset-spec (plist-put preset-spec :tools
                                                      (if exclusive tool-names `(:append ,tool-names)))))
                       (setf (alist-get sym gptel--known-presets) preset-spec))))))
-  
+
   (when (fboundp 'gptel--setup-directive-menu)
     (gptel--setup-directive-menu 'gptel-system-prompt "Agent Profile")))
 
@@ -673,13 +673,13 @@ Return the gptel-tool struct if found, otherwise nil."
   (let* ((t-str (if (symbolp tool-name) (symbol-name tool-name) tool-name))
          (normalized-target (replace-regexp-in-string "-" "_" t-str))
          (found nil))
-    
+
     (dolist (t_ (append (default-value 'gptel-tools) (bound-and-true-p gptel-tools)))
       (when (and (not found) (macher-tool-valid-p t_))
         (let ((t-name (macher-agent-canonical-tool-name t_)))
           (when (and t-name (equal (replace-regexp-in-string "-" "_" t-name) normalized-target))
             (setq found t_)))))
-    
+
     (unless found
       (when (boundp 'gptel--known-tools)
         (cl-loop for category-alist in gptel--known-tools
@@ -769,16 +769,16 @@ Return the wrapped gptel-tool structure."
              (tool-name-str (macher-agent-canonical-tool-name tool))
              (tool-sym (when tool-name-str (intern tool-name-str)))
              (cached-wrapped-fn (when tool-sym (get tool-sym 'macher-agent-wrapped-fn))))
-        
+
         (if (and cached-wrapped-fn (eq orig-fn cached-wrapped-fn))
             tool
-          
+
           (let ((new-tool (copy-sequence tool)))
             (setf (gptel-tool-function new-tool)
                   (lambda (&rest args)
-                    (macher-agent-with-project-root 
+                    (macher-agent-with-project-root
                      (apply orig-fn args))))
-            
+
             (when tool-sym
               (put tool-sym 'macher-agent-wrapped-fn (gptel-tool-function new-tool)))
             new-tool)))
@@ -807,24 +807,24 @@ If outside a workspace, allows standard gptel execution and emits a message."
           (make-local-variable 'gptel--backend-name)
 
           (setq-local gptel--set-buffer-locally t)
-          
+
           (setq-local gptel-tools nil)
 
           (unless (macher-agent-subagent-p)
-            (macher-agent--init-workspace-state 
+            (macher-agent--init-workspace-state
              (file-name-as-directory (macher-agent-root default-directory))))
-          
+
           (when (fboundp 'gptel--restore-state)
             (let ((macher-agent--allow-gptel-restore t))
               (gptel--restore-state))))
-      
+
       (message "Macher-Agent: Not in a recognised project workspace. Running standard gptel."))))
 
 (defun macher-agent-force-enable ()
   "Force Macher Agent to treat the current directory as a workspace root."
   (interactive)
   (unless (macher-agent-subagent-p)
-    (macher-agent--init-workspace-state 
+    (macher-agent--init-workspace-state
      (file-name-as-directory (expand-file-name default-directory))))
   (macher-agent-setup-gptel-buffer)
   (message "Macher-Agent manually forced on for: %s" default-directory))
@@ -846,19 +846,19 @@ Return nil."
          (active-model gptel-model)
          (active-sys gptel-system-prompt)
          (active-skill (bound-and-true-p macher-agent--active-skill-sym)))
-    
+
     (with-current-buffer (generate-new-buffer new-name)
       (funcall parent-mode)
       (gptel-mode)
       (insert content)
 
       (setq-local macher-agent-parent-buffer parent-name)
-      
+
       (when active-backend (setq-local gptel-backend active-backend))
       (when active-model (setq-local gptel-model active-model))
       (when active-sys (setq-local gptel-system-prompt active-sys))
       (when active-skill (setq-local macher-agent--active-skill-sym active-skill))
-      
+
       (switch-to-buffer (current-buffer)))))
 
 (defun macher-agent-sandbox-run (expression extra-operations)

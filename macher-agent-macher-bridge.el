@@ -85,18 +85,18 @@ Return the context struct."
             (setf (macher-context-prompt persistent-ctx) (plist-get kwargs :prompt)))
           (when (plist-member kwargs :process-request-function)
             (setf (macher-context-process-request-function persistent-ctx) (plist-get kwargs :process-request-function)))
-          
+
           (when-let ((contents (plist-get kwargs :contents)))
             (let* ((ws (macher-agent--get-context-workspace persistent-ctx))
                    (project-root (if ws (macher-agent-root ws) default-directory)))
               (dolist (e contents)
                 (let ((struct-entry (macher-agent--hydrate-vfs-entry e project-root)))
-                  (macher-agent--update-context-file persistent-ctx 
+                  (macher-agent--update-context-file persistent-ctx
                                                      (macher-agent-vfs-entry-path struct-entry) 
                                                      (macher-agent-vfs-entry-curr struct-entry))))))
-          
+
           persistent-ctx)
-      
+
       (apply orig-fn kwargs))))
 
 (advice-add 'macher--make-context :around #'macher-agent--override-make-context)
@@ -114,11 +114,11 @@ Return the result of ORIG-FN."
   (let* ((live-ctx (bound-and-true-p macher-agent--persistent-context))
          (raw-buf (plist-get kwargs :buffer))
          (target-buf (when raw-buf (get-buffer raw-buf))))
-    
+
     (when (and live-ctx target-buf (not (eq target-buf (current-buffer))))
       (with-current-buffer target-buf
         (setq-local macher-agent--persistent-context live-ctx)))
-    
+
     (apply orig-fn prompt kwargs)))
 
 (advice-add 'gptel-request :around #'macher-agent--propagate-vfs-to-gptel-target)
@@ -245,7 +245,7 @@ Return nil."
                           :new-content new-content
                           :shadow-buffer nil)
                     shadow-descriptors))))
-        
+
         (setq shadow-descriptors
               (mapcar (lambda (desc)
                         (let* ((orig-buf (plist-get desc :original-buffer))
@@ -265,12 +265,12 @@ Return nil."
                               (auto-save-mode -1))
                             (plist-put desc :shadow-buffer shadow-buf))))
                       shadow-descriptors))
-        
+
         (when (fboundp 'macher-agent--set-context-shadow-buffers)
           (macher-agent--set-context-shadow-buffers p-ctx shadow-descriptors))
 
         (setq macher-agent--pause-auto-sync t)
-        
+
         (let ((cleanup-fn nil))
           (setq cleanup-fn
                 (lambda ()
@@ -282,7 +282,7 @@ Return nil."
                               (orig-file (plist-get desc :original-file-name)))
                           (when (and shadow (buffer-live-p shadow))
                             (with-current-buffer shadow
-                              (set-buffer-modified-p nil) 
+                              (set-buffer-modified-p nil)
                               (setq buffer-file-name nil))
                             (kill-buffer shadow))
                           (when (and orig-buf (buffer-live-p orig-buf))
@@ -292,7 +292,7 @@ Return nil."
 
                     (setq macher-agent--pause-auto-sync nil)
                     (remove-hook 'macher-patch-ready-hook cleanup-fn))))
-          
+
           (add-hook 'macher-patch-ready-hook cleanup-fn))
 
         (funcall orig-fn p-ctx fsm)))))

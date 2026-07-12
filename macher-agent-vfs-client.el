@@ -170,7 +170,7 @@ BASE-DIR is the absolute directory path string.
 Return the resolved absolute safe path string."
   (when (file-name-absolute-p unsafe-path)
     (error "SECURITY ERROR: Absolute paths are forbidden. You must use relative paths (for example, ./file). Path attempted: %s" unsafe-path))
-  
+
   (let* ((relative (if (string-prefix-p "~" unsafe-path) (concat "./" unsafe-path) unsafe-path))
          (resolved (expand-file-name relative base-dir)))
     (if (or (file-in-directory-p resolved base-dir)
@@ -248,14 +248,14 @@ DEST is the destination directory string.
 Return the shell command string."
   (let* ((src-dir (file-name-as-directory (expand-file-name src)))
          (dest-dir (file-name-as-directory (expand-file-name dest))))
-    
+
     (unless (executable-find "git")
       (error "Macher-Agent: Git executable not found in PATH"))
-    
+
     (unless (eq 0 (let ((default-directory src-dir))
                     (call-process "git" nil nil nil "rev-parse" "--is-inside-work-tree")))
       (error "Macher-Agent: Source directory is not inside a Git repository: %s" src-dir))
-    
+
     (format "(cd %s && git ls-files -c -o --exclude-standard) | rsync -aLC --delete --files-from=- %s %s"
             (shell-quote-argument src-dir)
             (shell-quote-argument src-dir)
@@ -322,16 +322,15 @@ SANDBOX-DIR is the sandbox directory path string.
 
 Return nil."
   (when (and context (macher-agent--get-context-dirty-p context))
-        (let* ((ws-root (macher-agent-context-root context))
-                          (raw-contents (macher-agent--get-context-contents context))
-                          (contents (seq-filter (lambda (entry)
-                                                                                     (and entry
-                                                                                                                                  (not (consp entry))
-                                                                                                                                  (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                                                                                                                                                            (macher-agent-vfs-entry-p entry))
-                                                                                                                                                                                  (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                                                                 raw-contents)))
-          (macher-agent--vfs-apply-overlay-stateless contents ws-root sandbox-dir))))
+    (let* ((ws-root (macher-agent-context-root context))
+           (raw-contents (macher-agent--get-context-contents context))
+           (contents (seq-filter (lambda (entry)
+                                   (and entry (not (consp entry))
+                                        (or (and (fboundp 'macher-agent-vfs-entry-p)
+                                                 (macher-agent-vfs-entry-p entry))
+                                            (eq (type-of entry) 'macher-agent-vfs-entry))))
+                                 raw-contents)))
+      (macher-agent--vfs-apply-overlay-stateless contents ws-root sandbox-dir))))
 
 (defun macher-agent-call-with-strict-vfs-pipeline (context body-fn)
   "Execute BODY-FN within a physical sandbox directory populated with CONTEXT.
@@ -341,26 +340,26 @@ BODY-FN is the function containing pipeline logic.
 
 Return the result of BODY-FN."
   (let* ((workspace-root (macher-agent-context-root context))
-                  (sandbox-dir (make-temp-file "macher-sandbox-" t))
-                  (original-contents (and context (macher-agent--get-context-contents context))))
+         (sandbox-dir (make-temp-file "macher-sandbox-" t))
+         (original-contents (and context (macher-agent--get-context-contents context))))
     (unwind-protect
         (progn
-                    (when context
-                                  (macher-agent--set-context-contents context
-                                                                                        (seq-filter (lambda (entry)
-                                                                                                                                      (and entry
-                                                                                                                                                                                (not (consp entry))
-                                                                                                                                                                                (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                                                                                                                                                                                                       (macher-agent-vfs-entry-p entry))
-                                                                                                                                                                                                                             (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                                                                                                                  original-contents)))
+          (when context
+            (macher-agent--set-context-contents context
+                                                (seq-filter (lambda (entry)
+                                                              (and entry
+                                                                   (not (consp entry))
+                                                                   (or (and (fboundp 'macher-agent-vfs-entry-p)
+                                                                            (macher-agent-vfs-entry-p entry))
+                                                                       (eq (type-of entry) 'macher-agent-vfs-entry))))
+                                                            original-contents)))
           (macher-agent--vfs-verify-clean-merge workspace-root context)
           (macher-agent--vfs-sync-baseline workspace-root sandbox-dir)
           (macher-agent--vfs-apply-overlay context sandbox-dir)
           (let ((default-directory sandbox-dir))
             (funcall body-fn)))
-            (when context
-                      (macher-agent--set-context-contents context original-contents))
+      (when context
+        (macher-agent--set-context-contents context original-contents))
       (delete-directory sandbox-dir t))))
 
 (defmacro macher-agent-with-strict-vfs-pipeline (context &rest body)
@@ -442,7 +441,7 @@ Return the resolved context structure, or nil."
            (active-root-expanded (and active-root (expand-file-name active-root)))
            (primary-ctx (and active-root-expanded
                              (gethash active-root-expanded macher-agent-active-workspaces))))
-      
+
       (unless primary-ctx
         (if macher-agent--allow-lazy-init
             (save-excursion
@@ -460,7 +459,7 @@ PATH is the relative or absolute path string.
 
 Return the content string, or nil."
   (let ((buf (or (get-file-buffer path) (get-buffer path)))
-        (is-media (and (file-exists-p path) 
+        (is-media (and (file-exists-p path)
                        (macher-agent-media-file-p path))))
     (cond
      ((and buf (buffer-live-p buf))
@@ -483,11 +482,11 @@ Return nil."
          (context (macher-agent--make-vfs-context :workspace macher-ws :contents nil)))
     (setq-local macher--workspace macher-ws)
     (macher-agent--inject-context-state context)
-    
+
     (puthash (expand-file-name workspace-root) context macher-agent-active-workspaces)
-    
+
     (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
-    
+
     (let ((skills-dir (expand-file-name "skills" workspace-root))
           (bundled (or (and (boundp 'macher-agent--bundled-skills-dir) macher-agent--bundled-skills-dir)
                        (and (boundp 'macher-agent-bundled-skills-directory) macher-agent-bundled-skills-directory))))
@@ -661,7 +660,7 @@ Return a list of file path strings."
   (let* ((expanded-dir (expand-file-name (macher-agent-workspace-project-root workspace)))
          (home-dir (expand-file-name "~/")))
     (condition-case err
-        (let* ((raw-files 
+        (let* ((raw-files
                 (if-let ((proj (project-current nil expanded-dir)))
                     (project-files proj)
                   (when (or (string= expanded-dir home-dir) (string= expanded-dir "/"))

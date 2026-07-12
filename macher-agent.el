@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.0.31
+;; Version: 0.8.0.33
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -10,7 +10,7 @@
 ;;; Commentary:
 ;;
 ;; An Emacs-native LLM agent harness featuring isolated sandboxing,
-;; asynchronous sub-agent orchestration, and fail-fast sync file merging. 
+;; asynchronous sub-agent orchestration, and fail-fast sync file merging.
 ;;
 
 ;;; Code:

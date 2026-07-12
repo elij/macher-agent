@@ -167,10 +167,10 @@ Return the result of calling NEXT-FN."
   (let* ((callback (cl-find-if #'functionp all-args))
          (injected-context (cl-find-if (lambda (x) (and (boundp 'macher-context-p) 
                                                         (fboundp 'macher-context-p) 
-                                                        (macher-context-p x))) 
+                                                        (macher-context-p x)))
                                        all-args))
-         (raw-tool-args (cl-remove-if (lambda (x) 
-                                        (or (and callback (eq x callback)) 
+         (raw-tool-args (cl-remove-if (lambda (x)
+                                        (or (and callback (eq x callback))
                                             (and injected-context (eq x injected-context)))) 
                                       all-args))
          (aligned-args (last raw-tool-args (length schema)))
@@ -182,14 +182,14 @@ Return the result of calling NEXT-FN."
              for expected-type = (plist-get arg-def :type)
              for arg-key = (intern (concat ":" (plist-get arg-def :name)))
              for val = (nth i aligned-args)
-             for parsed-val = (cond 
+             for parsed-val = (cond
                                ((and (eq expected-type 'object) (stringp val))
                                 (ignore-errors (json-parse-string val :object-type 'plist)))
                                ((and (eq expected-type 'array) (stringp val))
                                 (ignore-errors (json-parse-string val :array-type 'vector)))
                                (t val))
              do (setq payload (plist-put payload arg-key (or parsed-val val))))
-    
+
     (funcall next-fn payload context (or callback (lambda (res) res)))))
 
 (cl-defmacro macher-agent-make-tool (name-symbol description &key category args command-fn success-fn output-filter-fn)
@@ -227,7 +227,7 @@ Return the result of calling NEXT-FN."
                                                                 nil)))
                                                          (if abort-val
                                                              (funcall wrap-cb (list :status 'error :error (plist-get abort-val :error)))
-                                                           (let* ((on-success 
+                                                           (let* ((on-success
                                                                    (lambda (response-obj)
                                                                      (condition-case err
                                                                          (let* ((raw-payload (if (macher-agent-tool-response-p response-obj)
@@ -246,10 +246,10 @@ Return the result of calling NEXT-FN."
                                                                                   (if (or (eq max-args 'many) (>= max-args 3))
                                                                                       (funcall cmd-eval payload context root)
                                                                                     (funcall cmd-eval payload)))))
-                                                                   
+
                                                                    (unless (macher-agent-tool-response-p action)
                                                                      (error "Tool contract violation: command must return a macher-agent-tool-response struct"))
-                                                                   
+
                                                                    (macher-agent-execute-response action context on-success wrap-cb))
                                                                (error
                                                                 (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ',name-symbol payload err)
@@ -258,18 +258,18 @@ Return the result of calling NEXT-FN."
 (cl-defmethod macher-agent-execute-response ((res macher-agent-process-response) context on-success on-error)
   (let ((payload (macher-agent-tool-response-payload res)))
     (if (stringp payload)
-        (macher-agent--run-in-persistent-sandbox 
-         context payload 
-         (lambda (process-output) 
+        (macher-agent--run-in-persistent-sandbox
+         context payload
+         (lambda (process-output)
            (setf (macher-agent-tool-response-payload res) process-output)
-           (funcall on-success res)) 
+           (funcall on-success res))
          on-error)
       (funcall on-error (list :status 'error :error "Process payload must be a string.")))))
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-delegate-response) _context on-success _on-error)
-  (macher-agent-execute-parallel 
-   (macher-agent-tool-response-payload res) 
-   (lambda (sub-agent-results) 
+  (macher-agent-execute-parallel
+   (macher-agent-tool-response-payload res)
+   (lambda (sub-agent-results)
      (setf (macher-agent-tool-response-payload res) sub-agent-results)
      (funcall on-success res))))
 
@@ -331,10 +331,10 @@ Return nil."
                (when (memq (process-status proc) '(exit signal))
                  (let ((output (with-current-buffer out-buf (buffer-string)))
                        (exit-code (process-exit-status proc)))
-                   
+
                    (kill-buffer out-buf)
                    (ignore-errors (delete-directory sandbox-dir t))
-                   
+
                    (if (= exit-code 0)
                        (funcall on-success output)
                      (funcall on-error (list :status 'error :error output)))))))))
@@ -416,7 +416,7 @@ Return the base64-encoded representation string."
              (actual-name (if (and workspace-root (file-name-absolute-p file))
                               (file-relative-name file workspace-root)
                             file))
-             (content (when ctx 
+             (content (when ctx
                         (condition-case nil
                             (macher-agent--read-context-file ctx actual-name)
                           (error nil)))))

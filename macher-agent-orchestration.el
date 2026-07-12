@@ -40,8 +40,8 @@ Return nil."
       (cl-loop for task in task-list
                for index from 0
                do (let ((idx index))
-                    (macher-agent-spawn-task 
-                     task 
+                    (macher-agent-spawn-task
+                     task
                      (lambda (result)
                        (unless (aref completed-flags idx)
                          (aset completed-flags idx t)
@@ -125,7 +125,7 @@ INLINE-PRESETS is the list of inline preset symbols.
 Return the unified state property list."
   (let ((state (copy-sequence base-state))
         (known (plist-get base-state :known-presets)))
-    
+
     (cl-labels
         ((apply-spec (sym spec)
            (when-let* ((parents (plist-get spec :parents)))
@@ -147,9 +147,9 @@ Return the unified state property list."
 
            (when-let* ((tools-spec (or (plist-get spec :tools) (plist-get spec :allowed-tools))))
              (let ((merged-tools (gptel--modify-value (plist-get state :tools) tools-spec)))
-               (setq state (plist-put state :tools 
+               (setq state (plist-put state :tools
                                       (cl-loop for t-obj in (if (listp merged-tools) merged-tools (list merged-tools))
-                                               collect (if (stringp t-obj) 
+                                               collect (if (stringp t-obj)
                                                            (or (ignore-errors (gptel-get-tool t-obj)) t-obj) 
                                                          t-obj))))))
 
@@ -233,20 +233,20 @@ Return nil."
       (with-current-buffer buf
         (unless is-background
           (macher-agent--show-ui buf))
-        
+
         (setq-local macher-agent--is-subagent t)
-        
-        (setq-local macher-agent--parent-callback 
+
+        (setq-local macher-agent--parent-callback
                     (lambda (res)
                       (when (buffer-live-p buf)
-                        (with-current-buffer buf 
+                        (with-current-buffer buf
                           (unless is-background
                             (setq-local macher-agent--ready-to-reap t))))
-                      
+
                       (unless callback-fired
                         (setq callback-fired t)
                         (when (buffer-live-p buf)
-                          (with-current-buffer buf 
+                          (with-current-buffer buf
                             (unless is-background
                               (setq-local macher-agent--ready-to-reap t))))
                         (funcall callback res))))
@@ -262,7 +262,7 @@ Return nil."
                           :target-buffer buf
                           :skill-sym clean-sym
                           :system-message gptel-system-prompt)))
-          
+
           (macher-agent-gptel-transmit
            task-ctx
            (list :on-success (lambda (res)
@@ -330,30 +330,30 @@ PARENT-TOKENS is the parent's max tokens.
 Return nil."
   (with-current-buffer buf
     (setq default-directory (file-name-as-directory (macher-agent-root full-dir)))
-    
+
     (when (and (fboundp 'markdown-mode) (not (derived-mode-p 'markdown-mode)))
       (markdown-mode))
-    
+
     (setq-local macher-agent--is-subagent t)
-    
+
     (when (and (fboundp 'gptel-mode) (not gptel-mode))
       (gptel-mode 1))
-    
+
     (setq-local gptel-stream nil)
-    
+
     (when context
       (macher-agent--inject-context-state context))
-    
+
     (when parent-model (setq-local gptel-model parent-model))
     (when parent-backend (setq-local gptel-backend parent-backend))
     (when parent-presets (setq-local gptel--known-presets parent-presets))
     (when parent-directives (setq-local gptel-directives parent-directives))
     (when parent-temp (setq-local gptel-temperature parent-temp))
     (when parent-tokens (setq-local gptel-max-tokens parent-tokens))
-    
+
     (unless (boundp 'gptel-tools) (setq gptel-tools nil))
     (make-local-variable 'gptel-tools)
-    
+
     (when parent-tools
       (setq gptel-tools (macher-agent-normalize-tools (append gptel-tools parent-tools))))
 
@@ -368,10 +368,10 @@ Return nil."
              (payload (macher-agent-compose-payload base-state preset-list)))
         (setq-local macher-agent-presets (delete-dups (append macher-agent-presets preset-list)))
         (macher-agent--apply-payload-locally payload)))
-    
+
     (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
     (add-hook 'gptel-post-response-functions #'macher-agent-post-response-reaper nil t)
-    
+
     (run-hooks 'macher-agent-subagent-setup-hook)))
 
 (defun macher-agent-add-subagent (name dir &optional instructions context presets)
@@ -392,11 +392,11 @@ Return the newly created subagent buffer."
          (parent-temp (bound-and-true-p gptel-temperature))
          (parent-tokens (bound-and-true-p gptel-max-tokens))
          (buf (get-buffer-create name)))
-    
+
     (macher-agent--prepare-subagent-buffer
      buf dir context presets parent-tools parent-model parent-backend
      parent-presets parent-directives parent-temp parent-tokens)
-    
+
     (when context
       (let ((workspace (macher-agent--get-context-workspace context)))
         (when workspace

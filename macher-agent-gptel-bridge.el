@@ -28,7 +28,7 @@ side effects to the user's source buffer. It then invokes the
 composition engine to merge the base state with the inline presets,
 applying the resulting transmission state ephemerally before network dispatch.
 
-The payload is applied to buffer variables first, and the finite state machine 
+The payload is applied to buffer variables first, and the finite state machine
 property list is subsequently updated directly.
 
 When an inline skill is used without a prompt its body becomes a prompt
@@ -59,7 +59,7 @@ Return the result of ASYNC-FN."
           (prompt-start (save-excursion
                           (goto-char (or (previous-single-property-change (point-max) 'gptel) (point-min)))
                           (point))))
-      
+
       (save-excursion
         (goto-char prompt-start)
         (while (re-search-forward "@\\([[:alnum:]_-]+\\)" nil t)
@@ -70,7 +70,7 @@ Return the result of ASYNC-FN."
             (replace-match "")
             (when (looking-at "[ \t]+")
               (replace-match "")))))
-      
+
       (unless matched-skills
         (let ((active-sys (with-current-buffer orig-buf gptel-system-prompt))
               (directives (with-current-buffer orig-buf gptel-directives)))
@@ -94,30 +94,30 @@ Return the result of ASYNC-FN."
                           :tools gptel-tools
                           :known-presets (bound-and-true-p gptel--known-presets))))
                  (remaining-skills (nreverse matched-skills))
-                 (all-skills (if redirected-skill 
+                 (all-skills (if redirected-skill
                                  (append remaining-skills (list redirected-skill)) 
                                remaining-skills))
-                 (payload (when all-skills 
+                 (payload (when all-skills
                             (macher-agent-compose-payload base-state all-skills))))
-            
+
             (when payload
-              (let* ((sys-payload (when remaining-skills 
+              (let* ((sys-payload (when remaining-skills
                                     (macher-agent-compose-payload base-state remaining-skills)))
-                     (final-sys-prompt (if sys-payload 
+                     (final-sys-prompt (if sys-payload
                                            (plist-get sys-payload :system)
                                          (plist-get base-state :system))))
-                
+
                 (setq payload (plist-put payload :system final-sys-prompt)))
-              
+
               (macher-agent--apply-payload-locally payload)
-              
+
               (when fsm
                 (let ((new-info (copy-sequence (gptel-fsm-info fsm))))
                   (dolist (key '(:system :model :temperature :max-tokens :tools))
                     (when (plist-member payload key)
                       (setq new-info (plist-put new-info key (plist-get payload key)))))
                   (setf (gptel-fsm-info fsm) new-info))))
-            
+
             (when redirected-skill
               (when-let* ((dummy-base (plist-put (copy-sequence base-state) :system ""))
                           (dummy-payload (macher-agent-compose-payload dummy-base (list redirected-skill)))
@@ -129,7 +129,7 @@ Return the result of ASYNC-FN."
                 (when fsm
                   (setf (gptel-fsm-info fsm)
                         (plist-put (gptel-fsm-info fsm) :prompt sys-prompt)))))))))
-    
+
     (when-let* ((fn async-fn)
                 ((functionp fn)))
       (funcall fn))))
@@ -160,25 +160,25 @@ Return nil."
          (sys-msg (macher-agent-task-context-system-message task-context))
          (success-cb (plist-get callbacks :on-success))
          (error-cb (plist-get callbacks :on-error)))
-    
+
     (with-current-buffer target-buffer
       (setq-local gptel-system-prompt sys-msg)
-      
+
       (let ((response-hook nil))
         (setq response-hook
               (lambda (_beg _end)
                 (let ((res (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
-                  
+
                   (if (and (macher-agent-subagent-p)
                            (not (string-empty-p res)))
                       (message "DEBUG BRIDGE: Stream ended for sub-agent. Deferring to tool execution...")
-                    
+
                     (if (not (string-empty-p res))
                         (when success-cb (funcall success-cb res))
                       (when error-cb (funcall error-cb "Buffer stopped silently or returned empty.")))
-                    
+
                     (remove-hook 'gptel-post-response-functions response-hook t)))))
-        
+
         (add-hook 'gptel-post-response-functions response-hook nil t))
 
       (goto-char (point-max))
@@ -220,21 +220,21 @@ Return the result of ORIG-FUN."
       (let* ((info (macher-agent--extract-fsm-info fsm))
              (session (plist-get info :macher-agent-session))
              (pending (when session (macher-agent-session-pending-media session))))
-        
+
         (when pending
-          (let* ((msg-plist (list :role "user" 
+          (let* ((msg-plist (list :role "user"
                                   :content "Tool execution complete. Here is the requested visual data:"))
                  (prompts (list msg-plist))
                  (gptel-context pending))
-            
+
             (when (fboundp 'gptel--inject-media)
               (gptel--inject-media (plist-get info :backend) prompts))
-            
+
             (when (fboundp 'gptel--inject-prompt)
-              (gptel--inject-prompt (plist-get info :backend) 
-                                    (plist-get info :data) 
+              (gptel--inject-prompt (plist-get info :backend)
+                                    (plist-get info :data)
                                     (car prompts)))
-            
+
             (setf (macher-agent-session-pending-media session) nil))))))
   (apply orig-fun fsm args))
 
@@ -404,16 +404,18 @@ Return nil."
                 nil)))
         (setf (gptel-fsm-info fsm-arg) (plist-put (gptel-fsm-info fsm-arg) :macher-agent-cached-ctx resolved-ctx))))
     (plist-get (gptel-fsm-info fsm-arg) :macher-agent-cached-ctx)))
- 
+
 (defun macher-agent--init-handler-stateless (fsm-arg)
-    "Stateless initialisation handler."
-    (let ((info (gptel-fsm-info fsm-arg)))
-          (unless (plist-get info :macher-agent-init-invoked)
-                  (setf (gptel-fsm-info fsm-arg) (plist-put info :macher-agent-init-invoked t))
-                  (macher--setup-tools fsm-arg (apply-partially #'macher-agent--get-context-stateless fsm-arg)))))
+  "Stateless initialisation handler."
+  (let ((info (gptel-fsm-info fsm-arg)))
+    (unless (plist-get info :macher-agent-init-invoked)
+      (setf (gptel-fsm-info fsm-arg) (plist-put info :macher-agent-init-invoked t))
+      (macher--setup-tools fsm-arg (apply-partially #'macher-agent--get-context-stateless fsm-arg)))))
 
 (defun macher-agent--termination-handler-stateless (fsm-arg)
-  "Stateless termination handler."
+  "Stateless termination handler.
+
+Cache VFS (cap/protect/restore) to allow continuations after patch generation"
   (let* ((info (gptel-fsm-info fsm-arg))
          (ctx (plist-get info :macher-agent-cached-ctx))
          (prf (plist-get info :macher-agent-prf))
@@ -421,17 +423,21 @@ Return nil."
     (when ctx
       (when (and buf (buffer-live-p buf) (fboundp 'macher-agent--capture-pending-edits))
         (macher-agent--capture-pending-edits ctx buf))
-      
-      (funcall prf 'complete ctx fsm-arg))))
+
+      (let ((protected-contents (copy-sequence (macher-agent--get-context-contents ctx))))
+
+        (funcall prf 'complete ctx fsm-arg)
+
+        (macher-agent--set-context-contents ctx protected-contents)))))
 
 (defun macher--transform-setup-tools (callback fsm)
-    "Override for macher--transform-setup-tools immune to lexical scope loss."
-    (let ((info (gptel-fsm-info fsm)))
-          (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-prompt (buffer-string)))
-          (setf (gptel-fsm-info fsm) (plist-put (gptel-fsm-info fsm) :macher-agent-prf macher-process-request-function)))
-    
-    (macher--add-transition-handler fsm #'macher-agent--init-handler-stateless)
-    (macher--add-termination-handler fsm #'macher-agent--termination-handler-stateless)
-    (funcall callback))
+  "Override for macher--transform-setup-tools immune to lexical scope loss."
+  (let ((info (gptel-fsm-info fsm)))
+    (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-prompt (buffer-string)))
+    (setf (gptel-fsm-info fsm) (plist-put (gptel-fsm-info fsm) :macher-agent-prf macher-process-request-function)))
+
+  (macher--add-transition-handler fsm #'macher-agent--init-handler-stateless)
+  (macher--add-termination-handler fsm #'macher-agent--termination-handler-stateless)
+  (funcall callback))
 
 (provide 'macher-agent-gptel-bridge)
