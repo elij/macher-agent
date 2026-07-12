@@ -374,4 +374,64 @@ Return nil."
 
 (add-hook 'gptel-mode-hook #'macher-agent-setup-gptel-buffer)
 
+(defun macher-agent--get-context-stateless (fsm-arg)
+  "Stateless context resolver that extracts state directly from the FSM."
+  (let ((ctx-info (gptel-fsm-info fsm-arg)))
+    (unless (plist-member ctx-info :macher-agent-cached-ctx)
+      (let* ((fsm-buf (plist-get ctx-info :buffer))
+             (resolved-ctx
+              (if (and fsm-buf (buffer-live-p fsm-buf))
+                  (let ((agent-ctx (buffer-local-value 'macher-agent--persistent-context fsm-buf)))
+                    (if agent-ctx
+                        (let ((prompt (plist-get ctx-info :macher-agent-prompt))
+                              (prf (plist-get ctx-info :macher-agent-prf)))
+                          (when (fboundp 'macher-context-prompt)
+                            (setf (macher-context-prompt agent-ctx) prompt))
+                          (when (fboundp 'macher-context-process-request-function)
+                            (setf (macher-context-process-request-function agent-ctx) prf))
+                          (setf (gptel-fsm-info fsm-arg) (plist-put ctx-info :macher--context agent-ctx))
+                          agent-ctx)
+                      (if-let* ((workspace (with-current-buffer fsm-buf (macher-workspace fsm-buf))))
+                          (let* ((prompt (plist-get ctx-info :macher-agent-prompt))
+                                 (prf (plist-get ctx-info :macher-agent-prf))
+                                 (new-ctx (macher--make-context :workspace workspace
+                                                                :prompt prompt
+                                                                :process-request-function prf)))
+                            (setf (gptel-fsm-info fsm-arg) (plist-put ctx-info :macher--context new-ctx))
+                            (with-current-buffer fsm-buf (setq macher--fsm-latest fsm-arg))
+                            new-ctx)
+                        nil)))
+                nil)))
+        (setf (gptel-fsm-info fsm-arg) (plist-put (gptel-fsm-info fsm-arg) :macher-agent-cached-ctx resolved-ctx))))
+    (plist-get (gptel-fsm-info fsm-arg) :macher-agent-cached-ctx)))
+ 
+(defun macher-agent--init-handler-stateless (fsm-arg)
+    "Stateless initialisation handler."
+    (let ((info (gptel-fsm-info fsm-arg)))
+          (unless (plist-get info :macher-agent-init-invoked)
+                  (setf (gptel-fsm-info fsm-arg) (plist-put info :macher-agent-init-invoked t))
+                  (macher--setup-tools fsm-arg (apply-partially #'macher-agent--get-context-stateless fsm-arg)))))
+
+(defun macher-agent--termination-handler-stateless (fsm-arg)
+  "Stateless termination handler."
+  (let* ((info (gptel-fsm-info fsm-arg))
+         (ctx (plist-get info :macher-agent-cached-ctx))
+         (prf (plist-get info :macher-agent-prf))
+         (buf (plist-get info :buffer)))
+    (when ctx
+      (when (and buf (buffer-live-p buf) (fboundp 'macher-agent--capture-pending-edits))
+        (macher-agent--capture-pending-edits ctx buf))
+      
+      (funcall prf 'complete ctx fsm-arg))))
+
+(defun macher--transform-setup-tools (callback fsm)
+    "Override for macher--transform-setup-tools immune to lexical scope loss."
+    (let ((info (gptel-fsm-info fsm)))
+          (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-prompt (buffer-string)))
+          (setf (gptel-fsm-info fsm) (plist-put (gptel-fsm-info fsm) :macher-agent-prf macher-process-request-function)))
+    
+    (macher--add-transition-handler fsm #'macher-agent--init-handler-stateless)
+    (macher--add-termination-handler fsm #'macher-agent--termination-handler-stateless)
+    (funcall callback))
+
 (provide 'macher-agent-gptel-bridge)
