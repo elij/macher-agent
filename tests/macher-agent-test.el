@@ -158,6 +158,35 @@
                                     (with-current-buffer buf
                                       (macher-agent-apply-virtual-buffers))
                                     (kill-buffer buf))))
+
+                    (describe "Mid-stream VFS Injection (macher-agent-gptel-bridge.el)"
+                              (it "successfully captures pending markdown code blocks from chat buffer and updates context"
+                                  (let* ((ctx (macher--make-context))
+                                         (entry1 (macher-agent-vfs-make-entry "file1.txt" "old1" "old1"))
+                                         (entry2 (macher-agent-vfs-make-entry "path/to/file2.txt" "old2" "old2"))
+                                         (chat-buf (generate-new-buffer "mock-chat-buf")))
+                                    (push entry1 (macher-context-contents ctx))
+                                    (push entry2 (macher-context-contents ctx))
+                                    
+                                    (with-current-buffer chat-buf
+                                      (insert "The user asks for changes. Let us write the code:\n\n")
+                                      (insert "```file1.txt\n")
+                                      (insert "new content 1\n")
+                                      (insert "```\n\n")
+                                      (insert "And also modify the second file:\n\n")
+                                      (insert "```path/to/file2.txt\n")
+                                      (insert "new content 2\n")
+                                      (insert "```\n"))
+                                    
+                                    (unwind-protect
+                                        (progn
+                                          (macher-agent--capture-pending-edits ctx chat-buf)
+                                          (let ((updated-entry1 (cl-find "file1.txt" (macher-context-contents ctx) :key #'macher-agent-vfs-entry-path :test #'equal))
+                                                (updated-entry2 (cl-find "path/to/file2.txt" (macher-context-contents ctx) :key #'macher-agent-vfs-entry-path :test #'equal)))
+                                            (expect (macher-agent-vfs-entry-curr updated-entry1) :to-equal "new content 1\n")
+                                            (expect (macher-agent-vfs-entry-curr updated-entry2) :to-equal "new content 2\n")))
+                                      (kill-buffer chat-buf)))))
+
                     (describe "Macher-Agent Skill Model Selection"
 
                               (it "applies the correct model from the skill metadata to gptel-model"

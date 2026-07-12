@@ -13,6 +13,10 @@
 (declare-function macher-agent--reap-buffer "macher-agent--apply-payload-locally")
 (declare-function macher-agent-initialize-skills "macher-agent-api")
 (declare-function macher-agent-canonical-tool-name "macher-agent-api")
+(declare-function macher-agent--get-context-contents "macher-agent-vfs-client")
+(declare-function macher-agent-vfs-entry-path "macher-agent-vfs-client")
+(declare-function macher-agent-context-update "macher-agent-api")
+(declare-function macher-agent-context-root "macher-agent-vfs-client")
 
 (defvar gptel-system-prompt)
 
@@ -184,18 +188,71 @@ Return nil."
       (goto-char (point-max))
       (gptel-send))))
 
+(defun macher-agent--capture-pending-edits (ctx buf)
+  "Scrape BUF for pending LLM code edits and update CTX mid-stream.
+This ensures tools run against the newly proposed code, not the old disk state.
+
+CTX is the active context structure.
+BUF is the target buffer containing raw LLM response edits.
+
+Return nil."
+  (declare (ftype (function (t t) t)))
+  (when (and buf (buffer-live-p buf))
+    (with-current-buffer buf
+      (save-excursion
+        (goto-char (point-min))
+        (let ((vfs-contents (macher-agent--get-context-contents ctx)))
+          (while (re-search-forward "^```\\([^\n]*\\)\n\\(\\(?:.\\|\n\\)*?\n\\)```" nil t)
+            (let* ((info-string (match-string-no-properties 1))
+                   (content (match-string-no-properties 2))
+                   (context-text (save-excursion
+                                   (goto-char (match-beginning 0))
+                                   (forward-line -3)
+                                   (buffer-substring-no-properties (point) (match-beginning 0))))
+                   (target-path nil))
+              
+              (dolist (entry vfs-contents)
+                (let* ((path (macher-agent-vfs-entry-path entry))
+                       (filename (file-name-nondirectory path)))
+                  (when (or (string-match-p (regexp-quote path) info-string)
+                            (string-match-p (regexp-quote path) context-text)
+                            (string-match-p (regexp-quote filename) info-string)
+                            (string-match-p (regexp-quote filename) context-text))
+                    (setq target-path path))))
+              
+              (unless target-path
+                (let ((ws-root (when (fboundp 'macher-agent-context-root)
+                                 (macher-agent-context-root ctx))))
+                  (when ws-root
+                    (let ((tokens (append (split-string info-string "[ \t\n]+" t)
+                                          (split-string context-text "[ \t\n:`'\"]+" t))))
+                      (catch 'found
+                        (dolist (token tokens)
+                          (when (and (> (length token) 2)
+                                     (string-match-p "\\." token))
+                            (let ((full-path (expand-file-name token ws-root)))
+                              (when (file-exists-p full-path)
+                                (setq target-path token)
+                                (throw 'found t))))))))))
+              
+              (when target-path
+                (macher-agent-context-update ctx target-path content)))))))))
+
 (defun macher-agent--setup-tools-pre-hook (&rest _args)
   "Sync the VFS and inject the sandbox session before tools are executed.
 
 _ARGS represents the unused arguments passed to the hook.
 
 Return nil."
+  (declare (ftype (function (&rest t) nil)))
   (let* ((fsm (or macher-agent--active-fsm
                   (bound-and-true-p macher--fsm-latest)
                   (bound-and-true-p gptel--fsm-last)))
          (info (when fsm (gptel-fsm-info fsm)))
+         (buf (when info (plist-get info :buffer)))
          (ctx (ignore-errors (macher-agent-resolve-context fsm))))
     (when ctx
+      (macher-agent--capture-pending-edits ctx buf)
       (when (fboundp 'macher-agent--auto-sync-context)
         (macher-agent--auto-sync-context ctx))
       (when fsm
