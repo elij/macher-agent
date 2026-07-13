@@ -299,7 +299,7 @@ Return the modified string."
 (defun macher-agent--vfs-apply-overlay-stateless (contents ws-root sandbox-dir)
   "Apply virtual CONTENTS overlay to SANDBOX-DIR statelessly.
 
-CONTENTS is the list of VFS entry structures.
+CONTENTS is the list of VFS entry structures or native macher cons cells.
 WS-ROOT is the workspace root path string.
 SANDBOX-DIR is the sandbox directory path string.
 
@@ -308,11 +308,16 @@ Return nil."
    contents
    sandbox-dir
    (lambda (entry)
-     (let ((path (macher-agent-vfs-entry-path entry)))
+     (let ((path (if (consp entry)
+                     (car entry)
+                   (macher-agent-vfs-entry-path entry))))
        (if (file-name-absolute-p path)
            (file-relative-name path ws-root)
          path)))
-   #'macher-agent-vfs-entry-curr))
+   (lambda (entry)
+     (if (consp entry)
+         (cddr entry)
+       (macher-agent-vfs-entry-curr entry)))))
 
 (defun macher-agent--vfs-apply-overlay (context sandbox-dir)
   "Apply virtual context overlay to SANDBOX-DIR.
@@ -323,13 +328,7 @@ SANDBOX-DIR is the sandbox directory path string.
 Return nil."
   (when (and context (macher-agent--get-context-dirty-p context))
     (let* ((ws-root (macher-agent-context-root context))
-           (raw-contents (macher-agent--get-context-contents context))
-           (contents (seq-filter (lambda (entry)
-                                   (and entry (not (consp entry))
-                                        (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                 (macher-agent-vfs-entry-p entry))
-                                            (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                 raw-contents)))
+           (contents (macher-agent--get-context-contents context)))
       (macher-agent--vfs-apply-overlay-stateless contents ws-root sandbox-dir))))
 
 (defun macher-agent-call-with-strict-vfs-pipeline (context body-fn)
@@ -340,27 +339,16 @@ BODY-FN is the function containing pipeline logic.
 
 Return the result of BODY-FN."
   (let* ((workspace-root (macher-agent-context-root context))
-         (sandbox-dir (make-temp-file "macher-sandbox-" t))
-         (original-contents (and context (macher-agent--get-context-contents context))))
+         (sandbox-dir (make-temp-file "macher-sandbox-" t)))
     (unwind-protect
         (progn
-          (when context
-            (macher-agent--set-context-contents context
-                                                (seq-filter (lambda (entry)
-                                                              (and entry
-                                                                   (not (consp entry))
-                                                                   (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                                            (macher-agent-vfs-entry-p entry))
-                                                                       (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                                            original-contents)))
           (macher-agent--vfs-verify-clean-merge workspace-root context)
           (macher-agent--vfs-sync-baseline workspace-root sandbox-dir)
           (macher-agent--vfs-apply-overlay context sandbox-dir)
           (let ((default-directory sandbox-dir))
             (funcall body-fn)))
-      (when context
-        (macher-agent--set-context-contents context original-contents))
-      (delete-directory sandbox-dir t))))
+      (ignore-errors
+        (delete-directory sandbox-dir t)))))
 
 (defmacro macher-agent-with-strict-vfs-pipeline (context &rest body)
   `(macher-agent-call-with-strict-vfs-pipeline ,context (lambda () ,@body)))
