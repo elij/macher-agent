@@ -324,12 +324,11 @@ Return nil."
   (when (and context (macher-agent--get-context-dirty-p context))
     (let* ((ws-root (macher-agent-context-root context))
            (raw-contents (macher-agent--get-context-contents context))
-           (contents (seq-filter (lambda (entry)
-                                   (and entry (not (consp entry))
-                                        (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                 (macher-agent-vfs-entry-p entry))
-                                            (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                 raw-contents)))
+           (contents (mapcar (lambda (entry)
+                               (if (consp entry)
+                                   (make-macher-agent-vfs-entry :path (car entry) :orig (cadr entry) :curr (cddr entry))
+                                 entry))
+                             raw-contents)))
       (macher-agent--vfs-apply-overlay-stateless contents ws-root sandbox-dir))))
 
 (defun macher-agent-call-with-strict-vfs-pipeline (context body-fn)
@@ -346,13 +345,11 @@ Return the result of BODY-FN."
         (progn
           (when context
             (macher-agent--set-context-contents context
-                                                (seq-filter (lambda (entry)
-                                                              (and entry
-                                                                   (not (consp entry))
-                                                                   (or (and (fboundp 'macher-agent-vfs-entry-p)
-                                                                            (macher-agent-vfs-entry-p entry))
-                                                                       (eq (type-of entry) 'macher-agent-vfs-entry))))
-                                                            original-contents)))
+                                                (mapcar (lambda (entry)
+                                                          (if (consp entry)
+                                                              (make-macher-agent-vfs-entry :path (car entry) :orig (cadr entry) :curr (cddr entry))
+                                                            entry))
+                                                        original-contents)))
           (macher-agent--vfs-verify-clean-merge workspace-root context)
           (macher-agent--vfs-sync-baseline workspace-root sandbox-dir)
           (macher-agent--vfs-apply-overlay context sandbox-dir)
