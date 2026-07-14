@@ -78,11 +78,51 @@ Return the content string, or nil."
         content
       (macher-agent--read-content-from-disk-or-buffer file-path))))
 
-(cl-defstruct macher-agent-vfs-entry
-  "A structure representing a virtual file system entry."
-  path
-  orig
-  curr)
+;; :(
+(defun macher-agent-vfs-entry-path (entry)
+  (car entry))
+
+(defun macher-agent-vfs-entry-orig (entry)
+  (cadr entry))
+
+(defun macher-agent-vfs-entry-curr (entry)
+  (if (stringp (cddr entry))
+      (cddr entry)
+    (caddr entry)))
+
+(defun macher-agent-vfs-set-curr (entry new-content)
+  (if (stringp (cddr entry))
+      (setcdr (cdr entry) new-content)
+    (setcar (cddr entry) new-content)))
+
+(gv-define-setter macher-agent-vfs-entry-curr (val entry)
+  `(macher-agent-vfs-set-curr ,entry ,val))
+
+(defun macher-agent-vfs-set-orig (entry new-orig)
+  (setcar (cdr entry) new-orig))
+
+(gv-define-setter macher-agent-vfs-entry-orig (val entry)
+  `(macher-agent-vfs-set-orig ,entry ,val))
+
+(defun macher-agent-vfs-set-path (entry new-path)
+  (setcar entry new-path))
+
+(gv-define-setter macher-agent-vfs-entry-path (val entry)
+  `(macher-agent-vfs-set-path ,entry ,val))
+
+(defun copy-macher-agent-vfs-entry (entry)
+  "Create a copy of ENTRY."
+  (cons (car entry) (cons (cadr entry) (cddr entry))))
+
+(defun macher-agent-vfs-entry-p (entry)
+  "Return non-nil if ENTRY is a valid virtual file system entry.
+A valid virtual file system entry is a cons cell of the form (path orig . curr)."
+  (and (consp entry)
+       (stringp (car entry))
+       (consp (cdr entry))))
+
+(cl-defun make-macher-agent-vfs-entry (&key path orig curr)
+  (cons path (cons orig curr)))
 
 (defun macher-agent-vfs-make-entry (path orig curr)
   "Create a virtual file system entry structure.
@@ -196,7 +236,6 @@ Return nil."
                   (progn
                     (make-directory (file-name-directory sandbox-target-path) t)
                     (write-region new-content nil sandbox-target-path nil 'silent))
-                ;; Fix: Physically remove the file from the sandbox if marked for deletion.
                 (when (file-exists-p sandbox-target-path)
                   (delete-file sandbox-target-path)))))
           entries)))
