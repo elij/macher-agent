@@ -269,7 +269,6 @@ Return a property list containing skill properties."
                do (setq vfs-content (ignore-errors (macher-agent--read-context-file resolved-ctx cand)))))
     (with-temp-buffer
       (let ((org-inhibit-startup t))
-        (setq buffer-file-name abs-file)
         (setq default-directory (file-name-directory abs-file))
         (if vfs-content
             (insert vfs-content)
@@ -278,8 +277,9 @@ Return a property list containing skill properties."
         (unless (bolp) (insert "\n"))
         (org-mode)
         (setq-local org-element-use-cache nil)
-        (org-macro-initialize-templates)
-        (org-macro-replace-all org-macro-templates)
+        (let ((buffer-file-name abs-file))
+          (org-macro-initialize-templates)
+          (org-macro-replace-all org-macro-templates))
         (goto-char (point-min))
 
         (let ((fm-hash (make-hash-table :test 'equal))
