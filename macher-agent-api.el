@@ -232,47 +232,78 @@ Return a hash table of key-value pairs."
       (puthash current-list-key (nreverse current-list-val) ht))
     ht))
 
-(defun macher-agent-parse-skill-file (filepath)
+(defun macher-agent-parse-skill-file (filepath &optional context)
   "Parse a SKILL.md file at FILEPATH extracting frontmatter and body.
+Prioritises the virtual file system, falling back to physical disk.
 
 FILEPATH is the path to the skill file (string).
+CONTEXT is the optional active context structure.
 
 Return a property list containing skill properties."
-  (with-temp-buffer
-    (let* ((org-inhibit-startup t)
-           (abs-file (expand-file-name filepath)))
-      (setq default-directory (file-name-directory abs-file))
-      (insert-file-contents abs-file)
-      (goto-char (point-max))
-      (unless (bolp) (insert "\n"))
-      (org-mode)
-      (setq-local org-element-use-cache nil)
-      (org-macro-initialize-templates)
-      (org-macro-replace-all org-macro-templates)
-      (goto-char (point-min))
+  (let* ((resolved-ctx (or context (ignore-errors (macher-agent-resolve-context))))
+         (workspace-root (when resolved-ctx (macher-context-workspace-root resolved-ctx)))
+         (abs-file (expand-file-name filepath))
+         (rel-to-workspace (when (and workspace-root abs-file)
+                             (file-relative-name abs-file workspace-root)))
+         (visiting-buf (find-buffer-visiting abs-file))
+         (visiting-buf-name (when visiting-buf (buffer-name visiting-buf)))
+         (candidates (delq nil (list filepath abs-file rel-to-workspace visiting-buf-name)))
+         (vfs-content nil))
+    (when resolved-ctx
+      (let ((contents (macher-agent--get-context-contents resolved-ctx)))
+        (cl-loop for cand in candidates
+                 until vfs-content
+                 do (let ((entry (cl-find cand contents :key #'macher-agent-vfs-entry-path :test #'equal)))
+                      (when entry
+                        (setq vfs-content (macher-agent-vfs-entry-curr entry)))))))
+    (when (and (not vfs-content) resolved-ctx)
+      (let* ((workspace (macher-agent--get-context-workspace resolved-ctx))
+             (vfs-buffers (when workspace (macher-agent-workspace-vfs-buffers workspace))))
+        (when vfs-buffers
+          (cl-loop for cand in candidates
+                   until vfs-content
+                   do (setq vfs-content (gethash cand vfs-buffers))))))
+    (when (and (not vfs-content) resolved-ctx)
+      (cl-loop for cand in candidates
+               until vfs-content
+               do (setq vfs-content (ignore-errors (macher-agent--read-context-file resolved-ctx cand)))))
+    (with-temp-buffer
+      (let ((org-inhibit-startup t))
+        (setq buffer-file-name abs-file)
+        (setq default-directory (file-name-directory abs-file))
+        (if vfs-content
+            (insert vfs-content)
+          (insert-file-contents abs-file))
+        (goto-char (point-max))
+        (unless (bolp) (insert "\n"))
+        (org-mode)
+        (setq-local org-element-use-cache nil)
+        (org-macro-initialize-templates)
+        (org-macro-replace-all org-macro-templates)
+        (goto-char (point-min))
 
-      (let ((fm-hash (make-hash-table :test 'equal))
-            body name has-tools)
+        (let ((fm-hash (make-hash-table :test 'equal))
+              body name has-tools)
 
-        (when-let* (((re-search-forward "^---\n" nil t))
-                    (start (point))
-                    ((re-search-forward "^---\n" nil t))
-                    (frontmatter (buffer-substring-no-properties start (match-beginning 0))))
-          (setq fm-hash (macher-agent--parse-frontmatter frontmatter)))
+          (when-let* (((re-search-forward "^---\n" nil t))
+                      (start (point))
+                      ((re-search-forward "^---\n" nil t))
+                      (frontmatter (buffer-substring-no-properties start (match-beginning 0))))
+            (setq fm-hash (macher-agent--parse-frontmatter frontmatter)))
 
-        (setq body (string-trim (buffer-substring-no-properties (point) (point-max))))
-        (setq name (gethash "name" fm-hash))
+          (setq body (string-trim (buffer-substring-no-properties (point) (point-max))))
+          (setq name (gethash "name" fm-hash))
 
-        (setq has-tools (not (eq (gethash "allowed-tools" fm-hash 'missing) 'missing)))
+          (setq has-tools (not (eq (gethash "allowed-tools" fm-hash 'missing) 'missing)))
 
-        (list :name name
-              :name-sym (when name (intern name))
-              :description (gethash "description" fm-hash)
-              :model (gethash "model" fm-hash)
-              :has-tools has-tools
-              :allowed-tools (gethash "allowed-tools" fm-hash)
-              :exclusive (gethash "exclusive" fm-hash)
-              :body body)))))
+          (list :name name
+                :name-sym (when name (intern name))
+                :description (gethash "description" fm-hash)
+                :model (gethash "model" fm-hash)
+                :has-tools has-tools
+                :allowed-tools (gethash "allowed-tools" fm-hash)
+                :exclusive (gethash "exclusive" fm-hash)
+                :body body))))))
 
 (defun macher-agent--secure-ast-p (form)
   "Return t if FORM is a secure AST node (no top-level definitions).
@@ -544,7 +575,7 @@ Return nil."
                       path)
                      (t nil))))
     (when skill-file
-      (let* ((parsed (macher-agent-parse-skill-file skill-file))
+      (let* ((parsed (macher-agent-parse-skill-file skill-file context))
              (sym (plist-get parsed :name-sym))
              (body (plist-get parsed :body))
              (desc (plist-get parsed :description))

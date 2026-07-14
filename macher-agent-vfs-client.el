@@ -291,9 +291,10 @@ Return the shell command string."
     (unless (executable-find "git")
       (error "Macher-Agent: Git executable not found in PATH"))
 
-    (unless (eq 0 (let ((default-directory src-dir))
-                    (call-process "git" nil nil nil "rev-parse" "--is-inside-work-tree")))
-      (error "Macher-Agent: Source directory is not inside a Git repository: %s" src-dir))
+    (let ((safe-src-dir (if (file-directory-p src-dir) src-dir default-directory)))
+      (unless (eq 0 (let ((default-directory safe-src-dir))
+                      (call-process "git" nil nil nil "rev-parse" "--is-inside-work-tree")))
+        (error "Macher-Agent: Source directory is not inside a Git repository: %s" src-dir)))
 
     (format "(cd %s && git ls-files -c -o --exclude-standard) | rsync -aLC --delete --files-from=- %s %s"
             (shell-quote-argument src-dir)
