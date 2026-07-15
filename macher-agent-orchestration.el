@@ -246,47 +246,50 @@ Return nil."
          (callback-fired nil))
     (if (not buf)
         (funcall callback (make-macher-agent-delegate-response :status 'error :error (format "ERROR: Sub-agent buffer '%s' not found." buf-name) :buffer-name buf-name))
-      (macher-agent--prepare-subagent-instructions buf instructions presets)
-      (with-current-buffer buf
-        (unless is-background
-          (macher-agent--show-ui buf))
+      (let* ((parent-active-presets (with-current-buffer parent-buf (bound-and-true-p macher-agent-presets)))
+             (target-active-presets (with-current-buffer buf (bound-and-true-p macher-agent-presets)))
+             (resolved-presets (or presets target-active-presets parent-active-presets '("macher-agent-worker"))))
+        (macher-agent--prepare-subagent-instructions buf instructions resolved-presets)
+        (with-current-buffer buf
+          (unless is-background
+            (macher-agent--show-ui buf))
 
-        (setq-local macher-agent--is-subagent t)
-        (setq-local macher-agent--parent-buffer parent-buf)
+          (setq-local macher-agent--is-subagent t)
+          (setq-local macher-agent--parent-buffer parent-buf)
 
-        (setq-local macher-agent--parent-callback
-                    (lambda (res)
-                      (when (buffer-live-p buf)
-                        (with-current-buffer buf
-                          (unless is-background
-                            (setq-local macher-agent--ready-to-reap t))))
-
-                      (unless callback-fired
-                        (setq callback-fired t)
+          (setq-local macher-agent--parent-callback
+                      (lambda (res)
                         (when (buffer-live-p buf)
                           (with-current-buffer buf
                             (unless is-background
                               (setq-local macher-agent--ready-to-reap t))))
-                        (funcall callback res))))
 
-        (let* ((first-preset (cond ((stringp presets) presets)
-                                   ((symbolp presets) (symbol-name presets))
-                                   ((and (listp presets) (stringp (car presets))) (car presets))
-                                   ((and (vectorp presets) (> (length presets) 0) (stringp (aref presets 0))) (aref presets 0))
-                                   (t nil)))
-               (clean-sym (when first-preset (intern (replace-regexp-in-string "^@+" "" first-preset))))
-               (task-ctx (make-macher-agent-task-context
-                          :workspace nil
-                          :target-buffer buf
-                          :skill-sym clean-sym
-                          :system-message gptel-system-prompt)))
+                        (unless callback-fired
+                          (setq callback-fired t)
+                          (when (buffer-live-p buf)
+                            (with-current-buffer buf
+                              (unless is-background
+                                (setq-local macher-agent--ready-to-reap t))))
+                          (funcall callback res))))
 
-          (macher-agent-gptel-transmit
-           task-ctx
-           (list :on-success (lambda (res)
-                               (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'success :data res :buffer-name buf-name)))
-                 :on-error (lambda (err)
-                             (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'error :error (format "ERROR: %s" err) :buffer-name buf-name))))))))))
+          (let* ((first-preset (cond ((stringp resolved-presets) resolved-presets)
+                                     ((symbolp resolved-presets) (symbol-name resolved-presets))
+                                     ((and (listp resolved-presets) (stringp (car resolved-presets))) (car resolved-presets))
+                                     ((and (vectorp resolved-presets) (> (length resolved-presets) 0) (stringp (aref resolved-presets 0))) (aref resolved-presets 0))
+                                     (t nil)))
+                 (clean-sym (when first-preset (intern (replace-regexp-in-string "^@+" "" first-preset))))
+                 (task-ctx (make-macher-agent-task-context
+                            :workspace nil
+                            :target-buffer buf
+                            :skill-sym clean-sym
+                            :system-message gptel-system-prompt)))
+
+            (macher-agent-gptel-transmit
+             task-ctx
+             (list :on-success (lambda (res)
+                                 (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'success :data res :buffer-name buf-name)))
+                   :on-error (lambda (err)
+                               (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'error :error (format "ERROR: %s" err) :buffer-name buf-name)))))))))))
 
 (defvar macher-agent-subagent-setup-hook nil)
 
@@ -410,10 +413,12 @@ Return the newly created subagent buffer."
          (parent-directives (bound-and-true-p gptel-directives))
          (parent-temp (bound-and-true-p gptel-temperature))
          (parent-tokens (bound-and-true-p gptel-max-tokens))
+         (parent-active-presets (bound-and-true-p macher-agent-presets))
+         (resolved-presets (or presets parent-active-presets '("macher-agent-worker")))
          (buf (get-buffer-create name)))
 
     (macher-agent--prepare-subagent-buffer
-     buf dir context presets parent-tools parent-model parent-backend
+     buf dir context resolved-presets parent-tools parent-model parent-backend
      parent-presets parent-directives parent-temp parent-tokens)
 
     (with-current-buffer buf

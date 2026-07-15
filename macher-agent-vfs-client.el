@@ -86,14 +86,14 @@ Return the content string, or nil."
   (cadr entry))
 
 (defun macher-agent-vfs-entry-curr (entry)
-  (if (stringp (cddr entry))
-      (cddr entry)
-    (caddr entry)))
+  (if (consp (cddr entry))
+      (caddr entry)
+    (cddr entry)))
 
 (defun macher-agent-vfs-set-curr (entry new-content)
-  (if (stringp (cddr entry))
-      (setcdr (cdr entry) new-content)
-    (setcar (cddr entry) new-content)))
+  (if (consp (cddr entry))
+      (setcar (cddr entry) new-content)
+    (setcdr (cdr entry) new-content)))
 
 (gv-define-setter macher-agent-vfs-entry-curr (val entry)
   `(macher-agent-vfs-set-curr ,entry ,val))
