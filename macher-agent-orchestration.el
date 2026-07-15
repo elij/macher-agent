@@ -210,9 +210,25 @@ Return nil."
 (defvar-local macher-agent-presets nil
   "List of active preset or skill symbols for the current buffer.")
 
+(defvar-local macher-agent--parent-buffer nil
+  "The buffer of the orchestrator that spawned this agent.")
+
+(defvar-local macher-agent--pending-children nil
+  "A list of child buffer names this parent is currently waiting for.")
+
+(defvar-local macher-agent--child-results nil
+  "An alist storing the output of finished child agents.")
+
+(defvar-local macher-agent--resume-callback nil
+  "The saved callback of the suspended parent orchestrator.")
+
 (put 'macher-agent--is-subagent 'permanent-local t)
 (put 'macher-agent--ready-to-reap 'permanent-local t)
 (put 'macher-agent-presets 'permanent-local t)
+(put 'macher-agent--parent-buffer 'permanent-local t)
+(put 'macher-agent--pending-children 'permanent-local t)
+(put 'macher-agent--child-results 'permanent-local t)
+(put 'macher-agent--resume-callback 'permanent-local t)
 
 (defun macher-agent-spawn-task (task callback)
   "Spawn a task inside a target subagent.
@@ -221,7 +237,8 @@ TASK is the task specification list or name.
 CALLBACK is the completion callback function.
 
 Return nil."
-  (let* ((buf-name (if (listp task) (plist-get task :buffer_name) task))
+  (let* ((parent-buf (current-buffer))
+         (buf-name (if (listp task) (plist-get task :buffer_name) task))
          (instructions (if (listp task) (plist-get task :instructions) ""))
          (presets (if (listp task) (or (plist-get task :presets) (plist-get task :preset)) nil))
          (is-background (and (listp task) (plist-get task :background)))
@@ -235,6 +252,7 @@ Return nil."
           (macher-agent--show-ui buf))
 
         (setq-local macher-agent--is-subagent t)
+        (setq-local macher-agent--parent-buffer parent-buf)
 
         (setq-local macher-agent--parent-callback
                     (lambda (res)
@@ -384,7 +402,8 @@ CONTEXT is the optional active context structure.
 PRESETS represents optional requested presets.
 
 Return the newly created subagent buffer."
-  (let* ((parent-tools (bound-and-true-p gptel-tools))
+  (let* ((parent-buf (current-buffer))
+         (parent-tools (bound-and-true-p gptel-tools))
          (parent-model (bound-and-true-p gptel-model))
          (parent-backend (bound-and-true-p gptel-backend))
          (parent-presets (bound-and-true-p gptel--known-presets))
@@ -396,6 +415,9 @@ Return the newly created subagent buffer."
     (macher-agent--prepare-subagent-buffer
      buf dir context presets parent-tools parent-model parent-backend
      parent-presets parent-directives parent-temp parent-tokens)
+
+    (with-current-buffer buf
+      (setq-local macher-agent--parent-buffer parent-buf))
 
     (when context
       (let ((workspace (macher-agent--get-context-workspace context)))
@@ -449,5 +471,24 @@ Return nil."
           (lambda ()
             (let ((ctx (ignore-errors (macher-agent-resolve-context))))
               (when ctx (macher-agent--auto-sync-context ctx)))))
+
+(defun macher-agent-resume-parent-agent ()
+  "Aggregate sub-agent results and resume the parent LLM cycle on a clean stack."
+  (let ((parent-buf (current-buffer))
+        (callback macher-agent--resume-callback)
+        (results (copy-sequence macher-agent--child-results)))
+    (setq-local macher-agent--child-results nil)
+    (setq-local macher-agent--pending-children nil)
+    (setq-local macher-agent--resume-callback nil)
+    (when callback
+      (run-at-time 0 nil
+                   (lambda ()
+                     (when (buffer-live-p parent-buf)
+                       (with-current-buffer parent-buf
+                         (funcall callback
+                                  (make-macher-agent-delegate-response
+                                   :status 'success
+                                   :payload (vconcat results)
+                                   :buffer-name (buffer-name parent-buf))))))))))
 
 (provide 'macher-agent-orchestration)

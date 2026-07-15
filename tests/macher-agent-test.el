@@ -653,6 +653,12 @@
                                (setq macher-agent-post-tool-use-hook nil)
                                (setq macher-agent-post-tool-use-failure-hook nil))
 
+                              (after-all
+                               (setq macher-agent-pre-tool-use-hook nil)
+                               (setq macher-agent-permission-request-hook nil)
+                               (setq macher-agent-post-tool-use-hook nil)
+                               (setq macher-agent-post-tool-use-failure-hook nil))
+
                               (it "runs pre-tool-use-hook and aborts if it returns nil"
                                   (let ((pre-called nil)
                                         (callback-result nil))
