@@ -469,6 +469,9 @@ Return nil."
 
 (add-hook 'gptel-pre-response-hook
           (lambda ()
+            (setq-local macher-agent--pending-children nil)
+            (setq-local macher-agent--child-results nil)
+            (setq-local macher-agent--resume-callback nil)
             (let ((ctx (ignore-errors (macher-agent-resolve-context))))
               (when ctx (macher-agent--auto-sync-context ctx)))))
 
