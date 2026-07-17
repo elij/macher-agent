@@ -1,6 +1,13 @@
 ;;; macher-agent-api.el --- Public API for macher-agent -*- lexical-binding: t; -*-
 
+;;; Commentary:
+
+;; Public API implementation for Macher Agent.
+
+;;; Code:
+
 (require 'cl-lib)
+(require 'subr-x)
 (require 'org)
 (require 'org-macro)
 (require 'macher-agent-vfs-client)
@@ -120,7 +127,7 @@ Return the project root path string, or nil."
 CONTEXT is the active context structure.
 
 Return the project root path string, or nil."
-  (let ((workspace (when context (macher-agent--get-context-workspace context))))
+  (when-let* ((workspace (when context (macher-agent--get-context-workspace context))))
     (when workspace (macher-agent-root workspace))))
 
 (defun macher-normalise-preset-name (preset)
@@ -161,8 +168,8 @@ Return the canonical tool name string, or nil."
                ((and (listp tool) (plist-get tool :function))
                 (let ((fn (plist-get tool :function)))
                   (if (listp fn) (plist-get fn :name) fn)))
-               (t (format "%s" tool)))))
-         (if (symbolp raw-name) (symbol-name raw-name) raw-name))))
+               (t tool))))
+         (format "%s" (if (symbolp raw-name) (symbol-name raw-name) raw-name)))))
 
 (defun macher-agent--cache-tool (tool registry)
   "Cache the TOOL in REGISTRY using its canonical string name.
@@ -172,21 +179,21 @@ REGISTRY is the hash-table representing the registry.
 
 Return nil."
   (when (macher-tool-valid-p tool)
-    (let ((canonical-name (macher-agent-canonical-tool-name tool)))
-      (when canonical-name
-        (puthash canonical-name tool registry)))))
+    (when-let* ((canonical-name (macher-agent-canonical-tool-name tool)))
+      (puthash canonical-name tool registry))))
 
 (defun macher-agent-force-review ()
   "Manually trigger the diff review screen for any pending virtual edits.
 
 Return nil."
   (interactive)
-  (let ((context (macher-agent-resolve-context))
-        (fsm (macher-agent--get-fsm-latest)))
-    (if (not (and context (macher-agent--get-context-dirty-p context)))
-        (message "No pending edits to review.")
-      (macher--build-patch context fsm)
-      (message "SUCCESS: Patch review screen(s) generated for pending edits."))))
+  (if-let* ((context (macher-agent-resolve-context))
+            (fsm (macher-agent--get-fsm-latest)))
+      (if (not (macher-agent--get-context-dirty-p context))
+          (message "No pending edits to review.")
+        (macher--build-patch context fsm)
+        (message "SUCCESS: Patch review screen(s) generated for pending edits."))
+    (message "No active context or FSM found.")))
 
 (defun macher-agent--parse-frontmatter (text)
   "Parse a YAML frontmatter TEXT block into a hash table.
@@ -253,9 +260,9 @@ Return a property list containing skill properties."
       (let ((contents (macher-agent--get-context-contents resolved-ctx)))
         (cl-loop for cand in candidates
                  until vfs-content
-                 do (let ((entry (cl-find cand contents :key #'macher-agent-vfs-entry-path :test #'equal)))
+                 do (let ((entry (cl-find cand contents :key #'car :test #'equal)))
                       (when entry
-                        (setq vfs-content (macher-agent-vfs-entry-curr entry)))))))
+                        (setq vfs-content (if (consp (cdr entry)) (cddr entry) (cdr entry))))))))
     (when (and (not vfs-content) resolved-ctx)
       (let* ((workspace (macher-agent--get-context-workspace resolved-ctx))
              (vfs-buffers (when workspace (macher-agent-workspace-vfs-buffers workspace))))
@@ -396,31 +403,37 @@ Return non-nil if managed, otherwise nil."
            (string-match-p "skills/.*\\.el$" path)
            (string-match-p "scripts/.*\\.el$" path))))
 
-(defun macher-agent--mutation-dispatcher (&optional path &rest _)
+(defun macher-agent--mutation-dispatcher (&rest args)
   "Route file system events to appropriate invalidation or reload handlers.
 
-PATH is the optional mutated file path string.
-_ represents unused extra hook arguments.
-
-Return nil."
-  (when (macher-agent--is-managed-path-p path)
-    (let* ((workspace (when (bound-and-true-p macher-agent--persistent-context)
-                        (macher-agent--get-context-workspace macher-agent--persistent-context))))
-
-      (when (string-match "scripts/\\([^/]+\\)\\.el$" path)
-        (let* ((tool-name (match-string 1 path))
-               (registry (if workspace
-                             (macher-agent-workspace-tools-registry workspace)
-                           macher-agent-tools-registry))
-               (canonical-name (macher-agent-canonical-tool-name tool-name)))
+ARGS represents the list of event arguments passed by the hook."
+  (let* ((path (cl-find-if #'stringp args))
+         (context (or (cl-find-if (lambda (x) (and x (not (stringp x)) (fboundp 'macher-context-p) (macher-context-p x))) args)
+                      (bound-and-true-p macher-agent--persistent-context)))
+         (workspace (when context (macher-agent--get-context-workspace context))))
+    
+    (when (and path (string-match "scripts/\\([^/]+\\)\\.el$" path))
+      (let* ((tool-name (match-string 1 path))
+             (registry (if workspace
+                           (macher-agent-workspace-tools-registry workspace)
+                         macher-agent-tools-registry))
+             (canonical-name (if (fboundp 'macher-agent-canonical-tool-name)
+                                 (macher-agent-canonical-tool-name tool-name)
+                               tool-name)))
+        (when registry
           (remhash canonical-name registry)
           (remhash tool-name registry)
-          (remhash (intern tool-name) registry)))
+          (remhash (intern tool-name) registry))))
 
-      (when (and macher-agent--persistent-context workspace)
-        (let ((skills-dir (expand-file-name "skills" (macher-agent-root workspace))))
-          (when (and skills-dir (file-directory-p skills-dir))
-            (macher-agent-initialize-skills macher-agent--persistent-context skills-dir)))))))
+    (when (and context workspace
+               (or (null path)
+                   (string-match-p "skills/" path)
+                   (string-match-p "SKILL\\.md$" path)))
+      (let ((skills-dir (expand-file-name "skills" (macher-agent-workspace-project-root workspace))))
+        (macher-agent-initialize-skills context skills-dir)))
+
+    (when (and path (fboundp 'macher-agent--is-managed-path-p) (macher-agent--is-managed-path-p path))
+      nil)))
 
 (add-hook 'macher-agent-context-mutated-hook #'macher-agent--mutation-dispatcher)
 
@@ -434,37 +447,37 @@ SCRIPT-PATHS is a list of script candidate paths.
 WORKSPACE is the active workspace struct.
 
 Return the tool source content string, or nil."
-  (let ((vfs-content (when context
-                       (let* ((vfs-path (when dir-context (expand-file-name (format "scripts/%s.el" tool-name) dir-context)))
-                              (workspace-root (macher-context-workspace-root context))
-                              (rel-to-workspace (when (and workspace-root vfs-path)
-                                                  (file-relative-name vfs-path workspace-root)))
-                              (rel-to-dir (when (and dir-context vfs-path)
-                                            (file-relative-name vfs-path dir-context)))
-                              (visiting-buf (when vfs-path (find-buffer-visiting vfs-path)))
-                              (visiting-buf-name (when visiting-buf (buffer-name visiting-buf)))
-                              (std-name (format "scripts/%s.el" tool-name))
-                              (base-name (format "%s.el" tool-name))
-                              (candidates (delq nil (list vfs-path rel-to-workspace rel-to-dir visiting-buf-name std-name base-name)))
-                              (found-content nil))
-                         (cl-loop for cand in candidates
-                                  until found-content
-                                  do (setq found-content (ignore-errors (macher-agent--read-context-file context cand))))
-                         found-content))))
-    (if vfs-content
-        vfs-content
-      (let ((disk-content nil))
-        (catch 'found
-          (dolist (path script-paths)
-            (when (file-exists-p path)
-              (with-temp-buffer
-                (insert-file-contents path)
-                (setq disk-content (buffer-string))
-                (throw 'found t)))))
-        disk-content))))
+  (if-let* ((context context)
+            (vfs-content
+             (let* ((vfs-path (when dir-context (expand-file-name (format "scripts/%s.el" tool-name) dir-context)))
+                    (workspace-root (macher-context-workspace-root context))
+                    (rel-to-workspace (when (and workspace-root vfs-path)
+                                        (file-relative-name vfs-path workspace-root)))
+                    (rel-to-dir (when (and dir-context vfs-path)
+                                  (file-relative-name vfs-path dir-context)))
+                    (visiting-buf (when vfs-path (find-buffer-visiting vfs-path)))
+                    (visiting-buf-name (when visiting-buf (buffer-name visiting-buf)))
+                    (std-name (format "scripts/%s.el" tool-name))
+                    (base-name (format "%s.el" tool-name))
+                    (candidates (delq nil (list vfs-path rel-to-workspace rel-to-dir visiting-buf-name std-name base-name)))
+                    (found-content nil))
+               (cl-loop for cand in candidates
+                        until found-content
+                        do (setq found-content (ignore-errors (macher-agent--read-context-file context cand))))
+               found-content)))
+      vfs-content
+    (let ((disk-content nil))
+      (catch 'found
+        (dolist (path script-paths)
+          (when (file-exists-p path)
+            (with-temp-buffer
+              (insert-file-contents path)
+              (setq disk-content (buffer-string))
+              (throw 'found t)))))
+      disk-content)))
 
 (defun macher-agent--parse-and-validate-tool-ast (content tool-name)
-  "Parse CONTENT and validate the AST. Returns a list of trusted forms.
+  "Parse CONTENT and validate the AST.  Returns a list of trusted forms.
 
 CONTENT is the tool script content string.
 TOOL-NAME is the string name of the tool.
@@ -573,6 +586,8 @@ Return nil."
                      ((and (file-regular-p path)
                            (string-match-p "\\.md$" path))
                       path)
+                     ((string-match-p "SKILL\\.md$" path)
+                      path)
                      (t nil))))
     (when skill-file
       (let* ((parsed (macher-agent-parse-skill-file skill-file context))
@@ -660,6 +675,13 @@ Return nil."
              do (when (file-directory-p d)
                   (macher-agent-api-register-skills-in-directory d context)))
 
+    (when context
+      (let ((contents (macher-agent--get-context-contents context)))
+        (dolist (entry contents)
+          (let ((path (car entry)))
+            (when (and path (string-match-p "SKILL\.md$" path))
+              (macher-agent--load-skill-from-path path context))))))
+
     (let* ((workspace (when context (macher-agent--get-context-workspace context)))
            (ws-skills (when workspace (macher-agent-workspace-skills-alist workspace)))
            (global-skills macher-agent-global-skills-alist)
@@ -738,19 +760,24 @@ Return a list of resolved gptel-tool structs, or nil."
       (let ((native (macher-agent--find-native-tool item)))
         (if native
             (list native)
-          (and resolved (list resolved)))))))
+          (when (macher-tool-valid-p resolved)
+            (list resolved)))))))
 
 (cl-defgeneric macher-agent-resolve-item (item)
-  "Resolve an ITEM of any type into a list of gptel-tool structs."
-  nil)
+  "Resolve an ITEM of any type into a list of gptel-tool structs.
+
+ITEM is the item symbol, string, structure, or list to resolve.")
 
 (cl-defmethod macher-agent-resolve-item ((item cl-structure-object))
+  "Resolve ITEM when it is a structure object."
   (when (macher-tool-valid-p item) (list item)))
 
 (cl-defmethod macher-agent-resolve-item ((item string))
+  "Resolve ITEM when it is a string."
   (macher-agent--resolve-tool-in-env item))
 
 (cl-defmethod macher-agent-resolve-item ((item symbol))
+  "Resolve ITEM when it is a symbol."
   (if (fboundp item)
       (let ((res (ignore-errors (funcall item))))
         (if res
@@ -759,6 +786,7 @@ Return a list of resolved gptel-tool structs, or nil."
     (macher-agent--resolve-tool-in-env item)))
 
 (cl-defmethod macher-agent-resolve-item ((item list))
+  "Resolve ITEM when it is a list."
   (cl-mapcan #'macher-agent-resolve-item item))
 
 (defun macher-agent-normalize-tools (tools)
@@ -774,11 +802,12 @@ Return a list of unique resolved gptel-tool structures."
         (seen (make-hash-table :test 'equal))
         (unique nil))
     (dolist (tool flat-resolved)
-      (let* ((raw-name (macher-agent-canonical-tool-name tool))
-             (canon-name (if (stringp raw-name) (substring-no-properties raw-name) raw-name)))
-        (when (and canon-name (not (gethash canon-name seen)))
-          (puthash canon-name t seen)
-          (push tool unique))))
+      (when (macher-tool-valid-p tool)
+        (let* ((raw-name (macher-agent-canonical-tool-name tool))
+               (canon-name (if (stringp raw-name) (substring-no-properties raw-name) raw-name)))
+          (when (and canon-name (not (gethash canon-name seen)))
+            (puthash canon-name t seen)
+            (push tool unique)))))
     (nreverse unique)))
 
 (defun macher-agent-resolve-to-struct (t-item)
@@ -903,3 +932,4 @@ Return the evaluated result."
   (macher-agent--sandbox-run expression extra-operations))
 
 (provide 'macher-agent-api)
+;;; macher-agent-api.el ends here
