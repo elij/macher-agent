@@ -18,7 +18,7 @@ Please review the [wiki](https://github.com/elij/macher-agent/wiki) for advanced
 ## Changes in gptel/macher when enabled
 
 gptel
-- No longer able to change global state (to avoid race conditions), use mode hooks for defaults.
+- No longer able to change global state (to avoid race conditions), use mode hooks or `setq-default`.
 - Prompt level presets are composed by default using [#905](https://github.com/karthink/gptel/commit/3cf7bd0c850f6f72249d08d3f749dd4d04efa0f9).
 - If an inline preset is used without further text the preset prompt becomes a user prompt rather than a system prompt (similar to a command rather than a skill)
 - As media in gptel is based on absolute paths and gptel can't access the macher vfs an additional media reading method is added based on base64 payloads (this is also important for agents with computer use use-cases).
@@ -77,7 +77,7 @@ graph TD
 - `macher-agent` (harness) sits in the middle. It parses agent tools, orchestrates sub-agents, and bridges the LLM UI with the file system.
 - `macher` (ephemeral context) serves as the Virtual File System (VFS) engine. It tracks all edits in hidden memory buffers and strictly bounds all agent actions.
 
-The agent interacts with a `macher` context rather than live files. This environment records file and buffer modifications. These changes are presented as a diff patch (through ediff) for your review before any disk modifications occur. If the agent needs to use an external CLI tool (like `rg` or `cargo`), `macher-agent` automatically overlays the context onto a temporary directory to allow safe execution.
+The agent interacts with a `macher` context rather than live files. This environment records file and buffer modifications. These changes are presented as a diff patch (through `diff-mode`) for your review before any disk modifications occur. If the agent needs to use an external CLI tool (like `rg` or `cargo`), `macher-agent` automatically overlays the context onto a temporary directory to allow safe execution.
 
 ## Quick Start and Installation
 
