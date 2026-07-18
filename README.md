@@ -12,7 +12,7 @@ Please review the [wiki](https://github.com/elij/macher-agent/wiki) for advanced
 ## Another emacs agent harness?
 
 - Strict sandboxes
-- No terminal paradigm
+- Multiplex within emacs buffers without the terminal paradigm
 - No non elisp dependencies or other runtimes (every aspect is hackable)
 
 ## Changes in gptel/macher when enabled
