@@ -7,7 +7,7 @@ https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 macher-agent integrates with gptel and macher. Please review their respective repositories for further video examples of what can be done when all are used in tandem.
 
 Please review the [wiki](https://github.com/elij/macher-agent/wiki) for advanced use cases:
-[Self evolving]() agents, subagent [recursion](https://github.com/elij/macher-agent/wiki/Example-subagent-recursion-(Kimi-Agent-Swarm-Pattern)), [deterministic pipelines](https://github.com/elij/macher-agent/wiki/Example-Graph%E2%80%90Based-Agent-Workflows-(LangGraph-Pattern)) and [more](https://github.com/elij/macher-agent/wiki).
+[Self evolving](https://github.com/elij/macher-agent/wiki/Example-Self%E2%80%90Evolving-Agent-(Voyager-Pattern)) agents, subagent [recursion](https://github.com/elij/macher-agent/wiki/Example-subagent-recursion-(Kimi-Agent-Swarm-Pattern)), [deterministic pipelines](https://github.com/elij/macher-agent/wiki/Example-Graph%E2%80%90Based-Agent-Workflows-(LangGraph-Pattern)) and [more](https://github.com/elij/macher-agent/wiki).
 
 ## Another emacs agent harness?
 
