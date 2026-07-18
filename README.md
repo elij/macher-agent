@@ -26,6 +26,7 @@ gptel
 macher
 - Tools execute against the VFS
 - VFS persists until cleared or applied.
+- `search_in_workspace` can use rg from hydrated vfs
 
 ## Table of Contents
 1. [Core Concepts and Architecture](#core-concepts-and-architecture)
