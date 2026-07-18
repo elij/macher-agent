@@ -217,7 +217,7 @@ You are an expert quality assurance engineer. When asked to verify code, use the
 
 You can use `org-mode` macros for prompt templating within your `SKILL.md` files. This is useful for maintaining standardised version numbers, sharing common prompt snippets across multiple skills, or injecting context dynamically without duplicating text.
 
-`macher-agent` evaluates the `#+MACRO:` definitions and expands them in the markdown body before setting the final `gptel` system prompt.
+`macher-agent` evaluates the `#+MACRO:` definitions and expands them in the markdown body before setting the final `gptel` system prompt. The macro is evaluated before each tool call.
 
 **Example:**
 ```markdown
