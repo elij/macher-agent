@@ -1,5 +1,11 @@
 ;;; macher-agent-gptel-bridge.el --- Clean gptel boundary -*- lexical-binding: t; -*-
 
+;;; Commentary:
+
+;; Clean gptel boundary implementation for Macher Agent.
+
+;;; Code:
+
 (require 'cl-lib)
 (require 'gptel)
 (require 'macher)
@@ -17,14 +23,14 @@
 (defvar gptel-system-prompt)
 
 (defun macher-agent-sync-prompt-transformer (async-fn fsm)
-  "Synchronise the virtual file system, normalise the active tools list,
-and compose skill profiles securely.
+  "Synchronise the VFS and normalise the active tools list.
+Compose skill profiles securely.
 
-This function acts exclusively as a pre-wire transformer. It executes
+This function acts exclusively as a pre-wire transformer.  It executes
 within the temporary transmission buffer managed by the system.
 
 It parses and strips inline skill tags locally, preventing destructive
-side effects to the user's source buffer. It then invokes the
+side effects to the user's source buffer.  It then invokes the
 composition engine to merge the base state with the inline presets,
 applying the resulting transmission state ephemerally before network dispatch.
 
@@ -95,7 +101,7 @@ Return the result of ASYNC-FN."
                           :known-presets (bound-and-true-p gptel--known-presets))))
                  (remaining-skills (nreverse matched-skills))
                  (all-skills (if redirected-skill
-                                 (append remaining-skills (list redirected-skill)) 
+                                 (append remaining-skills (list redirected-skill))
                                remaining-skills))
                  (payload (when all-skills
                             (macher-agent-compose-payload base-state all-skills))))
@@ -375,7 +381,11 @@ Return nil."
 (add-hook 'gptel-mode-hook #'macher-agent-setup-gptel-buffer)
 
 (defun macher--transform-setup-tools (callback fsm)
-  "A gptel prompt transform to set up macher tools and behavior, modified for macher-agent."
+  "A gptel prompt transform to set up macher tools and behaviour.
+Modified for macher-agent.
+
+CALLBACK is the function to invoke next.
+FSM is the finite-state machine."
   (let* ((prompt (buffer-string))
          (process-request-function macher-process-request-function)
          (context-or-t nil)
@@ -400,7 +410,7 @@ Return nil."
                                   (setq info (plist-put info :macher--context agent-ctx))
                                   (setf (gptel-fsm-info fsm) info)
                                   agent-ctx)
-                              (if-let ((workspace (with-current-buffer buffer (macher-workspace buffer))))
+                              (if-let* ((workspace (with-current-buffer buffer (macher-workspace buffer))))
                                   (let ((context (macher--make-context :workspace workspace
                                                                        :prompt prompt
                                                                        :process-request-function process-request-function)))
@@ -433,3 +443,4 @@ Return nil."
   (funcall callback))
 
 (provide 'macher-agent-gptel-bridge)
+;;; macher-agent-gptel-bridge.el ends here

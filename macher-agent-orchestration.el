@@ -1,9 +1,17 @@
 ;;; macher-agent-orchestration.el --- Interactive sub-agent commands -*- lexical-binding: t; -*-
 
+;;; Commentary:
+
+;; Interactive orchestration commands for Macher Agent.  This file provides
+;; functions to coordinate and execute tasks.
+
+;;; Code:
+
 (require 'macher)
 (require 'macher-agent-macher-bridge)
 (require 'gptel nil t)
 (require 'macher-agent-vfs-client)
+(require 'subr-x)
 
 (declare-function macher-agent-gptel-transmit "macher-agent-gptel-bridge" (task-context callbacks))
 (declare-function macher-agent-sync-prompt-transformer "macher-agent-gptel-bridge" (async-fn fsm))
@@ -12,8 +20,6 @@
 (declare-function macher-agent--inject-context-state "macher-agent-vfs-client" (context &optional directives))
 (declare-function macher-agent--init-workspace-state "macher-agent-vfs-client")
 (declare-function macher-agent--auto-sync-context "macher-agent-vfs-client" (&optional ctx fsm))
-(declare-function macher-agent-vfs-entry-path "macher-agent-vfs-client")
-(declare-function macher-agent-vfs-entry-curr "macher-agent-vfs-client")
 
 (defvar macher-agent-submit-task-result-tool)
 
@@ -103,7 +109,7 @@ Merges BASE-STATE with the resolved configuration of INLINE-PRESETS
 using native gptel modification values.
 
 The function clones the initial base state and processes each preset or
-standalone tool sequentially. For each preset, it recursively resolves
+standalone tool sequentially.  For each preset, it recursively resolves
 any declared parent dependencies first.
 
 If a preset declares the `:exclusive' flag, it completely clears the
@@ -113,7 +119,7 @@ preventing base environment bleed.
 System prompts and tools are merged using gptel's declarative modifier logic.
 Legacy string-based system prompts are automatically wrapped in native
 append operations, and the original `\n---\n' delimiter is dynamically
-injected if a preceding system prompt exists. Flat properties like model,
+injected if a preceding system prompt exists.  Flat properties like model,
 temperature, and token limits are applied as direct overrides.
 
 Finally, if available, `macher-agent-normalize-tools' is invoked on the
@@ -138,19 +144,24 @@ Return the unified state property list."
              (setq state (plist-put state :tools nil)))
 
            (when-let* ((sys-spec (or (plist-get spec :system) (plist-get spec :system-message))))
-             (when (stringp sys-spec)
-               (let ((current-sys (plist-get state :system)))
-                 (setq sys-spec `(:append ,(concat (if current-sys "\n---\n" "")
-                                                   (format "### Skill: %s\n%s\n" sym sys-spec))))))
-             (setq state (plist-put state :system
-                                    (gptel--modify-value (plist-get state :system) sys-spec))))
+             (if (stringp sys-spec)
+                 (let ((current-sys (plist-get state :system)))
+                   ;; Safely flatten any existing list into a string
+                   (setq current-sys (if (listp current-sys) (string-join current-sys "\n---\n") (or current-sys "")))
+                   (setq state (plist-put state :system
+                                          (concat current-sys
+                                                  (if (string-empty-p current-sys) "" "\n---\n")
+                                                  (format "### Skill: %s\n%s\n" sym sys-spec)))))
+               ;; Fallback for non-string modifiers
+               (setq state (plist-put state :system
+                                      (gptel--modify-value (plist-get state :system) sys-spec)))))
 
            (when-let* ((tools-spec (or (plist-get spec :tools) (plist-get spec :allowed-tools))))
              (let ((merged-tools (gptel--modify-value (plist-get state :tools) tools-spec)))
                (setq state (plist-put state :tools
                                       (cl-loop for t-obj in (if (listp merged-tools) merged-tools (list merged-tools))
                                                collect (if (stringp t-obj)
-                                                           (or (ignore-errors (gptel-get-tool t-obj)) t-obj) 
+                                                           (or (ignore-errors (gptel-get-tool t-obj)) t-obj)
                                                          t-obj))))))
 
            (dolist (key '(:model :temperature :max-tokens))
@@ -242,54 +253,53 @@ Return nil."
          (instructions (if (listp task) (plist-get task :instructions) ""))
          (presets (if (listp task) (or (plist-get task :presets) (plist-get task :preset)) nil))
          (is-background (and (listp task) (plist-get task :background)))
-         (buf (get-buffer buf-name))
          (callback-fired nil))
-    (if (not buf)
-        (funcall callback (make-macher-agent-delegate-response :status 'error :error (format "ERROR: Sub-agent buffer '%s' not found." buf-name) :buffer-name buf-name))
-      (let* ((parent-active-presets (with-current-buffer parent-buf (bound-and-true-p macher-agent-presets)))
-             (target-active-presets (with-current-buffer buf (bound-and-true-p macher-agent-presets)))
-             (resolved-presets (or presets target-active-presets parent-active-presets '("macher-agent-worker"))))
-        (macher-agent--prepare-subagent-instructions buf instructions resolved-presets)
-        (with-current-buffer buf
-          (unless is-background
-            (macher-agent--show-ui buf))
+    (if-let* ((buf (get-buffer buf-name)))
+        (let* ((parent-active-presets (with-current-buffer parent-buf (bound-and-true-p macher-agent-presets)))
+               (target-active-presets (with-current-buffer buf (bound-and-true-p macher-agent-presets)))
+               (resolved-presets (or presets target-active-presets parent-active-presets '("macher-agent-worker"))))
+          (macher-agent--prepare-subagent-instructions buf instructions resolved-presets)
+          (with-current-buffer buf
+            (unless is-background
+              (macher-agent--show-ui buf))
 
-          (setq-local macher-agent--is-subagent t)
-          (setq-local macher-agent--parent-buffer parent-buf)
+            (setq-local macher-agent--is-subagent t)
+            (setq-local macher-agent--parent-buffer parent-buf)
 
-          (setq-local macher-agent--parent-callback
-                      (lambda (res)
-                        (when (buffer-live-p buf)
-                          (with-current-buffer buf
-                            (unless is-background
-                              (setq-local macher-agent--ready-to-reap t))))
-
-                        (unless callback-fired
-                          (setq callback-fired t)
+            (setq-local macher-agent--parent-callback
+                        (lambda (res)
                           (when (buffer-live-p buf)
                             (with-current-buffer buf
                               (unless is-background
                                 (setq-local macher-agent--ready-to-reap t))))
-                          (funcall callback res))))
 
-          (let* ((first-preset (cond ((stringp resolved-presets) resolved-presets)
-                                     ((symbolp resolved-presets) (symbol-name resolved-presets))
-                                     ((and (listp resolved-presets) (stringp (car resolved-presets))) (car resolved-presets))
-                                     ((and (vectorp resolved-presets) (> (length resolved-presets) 0) (stringp (aref resolved-presets 0))) (aref resolved-presets 0))
-                                     (t nil)))
-                 (clean-sym (when first-preset (intern (replace-regexp-in-string "^@+" "" first-preset))))
-                 (task-ctx (make-macher-agent-task-context
-                            :workspace nil
-                            :target-buffer buf
-                            :skill-sym clean-sym
-                            :system-message gptel-system-prompt)))
+                          (unless callback-fired
+                            (setq callback-fired t)
+                            (when (buffer-live-p buf)
+                              (with-current-buffer buf
+                                (unless is-background
+                                  (setq-local macher-agent--ready-to-reap t))))
+                            (funcall callback res))))
 
-            (macher-agent-gptel-transmit
-             task-ctx
-             (list :on-success (lambda (res)
-                                 (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'success :data res :buffer-name buf-name)))
-                   :on-error (lambda (err)
-                               (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'error :error (format "ERROR: %s" err) :buffer-name buf-name)))))))))))
+            (let* ((first-preset (cond ((stringp resolved-presets) resolved-presets)
+                                       ((symbolp resolved-presets) (symbol-name resolved-presets))
+                                       ((and (listp resolved-presets) (stringp (car resolved-presets))) (car resolved-presets))
+                                       ((and (vectorp resolved-presets) (> (length resolved-presets) 0) (stringp (aref resolved-presets 0))) (aref resolved-presets 0))
+                                       (t nil)))
+                   (clean-sym (when first-preset (intern (replace-regexp-in-string "^@+" "" first-preset))))
+                   (task-ctx (make-macher-agent-task-context
+                              :workspace nil
+                              :target-buffer buf
+                              :skill-sym clean-sym
+                              :system-message gptel-system-prompt)))
+
+              (macher-agent-gptel-transmit
+               task-ctx
+               (list :on-success (lambda (res)
+                                   (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'success :data res :buffer-name buf-name)))
+                     :on-error (lambda (err)
+                                 (funcall macher-agent--parent-callback (make-macher-agent-delegate-response :status 'error :error (format "ERROR: %s" err) :buffer-name buf-name))))))))
+      (funcall callback (make-macher-agent-delegate-response :status 'error :error (format "ERROR: Sub-agent buffer '%s' not found." buf-name) :buffer-name buf-name)))))
 
 (defvar macher-agent-subagent-setup-hook nil)
 
@@ -303,11 +313,11 @@ Return nil."
   (get-buffer-create buf-name)
   (when persistent-context
     (let* ((contents (macher-agent--get-context-contents persistent-context))
-           (entry (cl-find buf-name contents :key #'macher-agent-vfs-entry-path :test #'equal)))
+           (entry (cl-find buf-name contents :key #'car :test #'equal)))
       (unless entry
         (let ((orig (with-current-buffer buf-name (buffer-substring-no-properties (point-min) (point-max)))))
           (macher-agent--set-context-contents persistent-context
-                                              (cons (macher-agent-vfs-make-entry buf-name orig orig) contents))))))
+                                              (cons (cons buf-name (cons orig orig)) contents))))))
   (run-hooks 'macher-agent-context-mutated-hook))
 
 ;;;###autoload
@@ -318,12 +328,12 @@ BUFFER is the buffer object or string name.
 
 Return nil."
   (interactive "BAdd buffer to current agent's scope: ")
-  (let* ((buf-name (if (stringp buffer) buffer (buffer-name buffer)))
-         (ctx (macher-agent-resolve-context)))
-    (unless ctx
-      (error "No active agent session found"))
-    (macher-agent--add-buffer-to-scope-headless buf-name ctx)
-    (message "SUCCESS: Added '%s' to the agent's restricted scope." buf-name)))
+  (let ((buf-name (if (stringp buffer) buffer (buffer-name buffer))))
+    (if-let* ((ctx (macher-agent-resolve-context)))
+        (progn
+          (macher-agent--add-buffer-to-scope-headless buf-name ctx)
+          (message "SUCCESS: Added '%s' to the agent's restricted scope." buf-name))
+      (error "No active agent session found"))))
 
 (defun macher-agent--resolve-buffer-name (name)
   "Coerce NAME into a string name.
@@ -405,6 +415,8 @@ CONTEXT is the optional active context structure.
 PRESETS represents optional requested presets.
 
 Return the newly created subagent buffer."
+  (when (and context (fboundp 'macher-agent-initialize-skills))
+    (macher-agent-initialize-skills context))
   (let* ((parent-buf (current-buffer))
          (parent-tools (bound-and-true-p gptel-tools))
          (parent-model (bound-and-true-p gptel-model))
@@ -459,16 +471,15 @@ Return nil."
 
 Return nil."
   (interactive)
-  (let* ((ctx (macher-agent-resolve-context))
-         (contents (and ctx (macher-agent--get-context-contents ctx))))
-    (when contents
-      (dolist (entry contents)
-        (let* ((path-or-buf (macher-agent-vfs-entry-path entry))
-               (new-content (macher-agent-vfs-entry-curr entry)))
-          (when (and new-content (get-buffer path-or-buf))
-            (with-current-buffer (get-buffer path-or-buf)
-              (erase-buffer)
-              (insert new-content))))))
+  (when-let* ((ctx (macher-agent-resolve-context))
+              (contents (macher-agent--get-context-contents ctx)))
+    (dolist (entry contents)
+      (let* ((path-or-buf (car entry))
+             (new-content (if (consp (cdr entry)) (cddr entry) (cdr entry))))
+        (when (and new-content (get-buffer path-or-buf))
+          (with-current-buffer (get-buffer path-or-buf)
+            (erase-buffer)
+            (insert new-content)))))
     (macher-agent--auto-sync-context ctx)
     (message "Virtual buffers applied successfully.")))
 
@@ -500,3 +511,4 @@ Return nil."
                                    :buffer-name (buffer-name parent-buf))))))))))
 
 (provide 'macher-agent-orchestration)
+;;; macher-agent-orchestration.el ends here

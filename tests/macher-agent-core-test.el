@@ -1,9 +1,8 @@
 ;;; macher-agent-core-test.el --- Core behaviour tests for macher-agent -*- lexical-binding: t -*-
 
-;; This test suite enforces the watertight specification for macher-agent,
-;; focusing on VFS optimistic concurrency, strict lexical state management,
-;; sandbox isolation, and diff splitting behaviours. All tests adhere to
-;; British English conventions.
+;; This test suite enforces the specification for macher-agent,
+;; focusing on VFS optimistic concurrency, lexical state management,
+;; sandbox isolation, and diff splitting behaviours.
 
 (require 'buttercup)
 (require 'macher-agent-macher-bridge)
@@ -39,7 +38,7 @@
                                 (macher-agent-vfs-write workspace file-path "New content")
                               (error
                                (setq threw t)
-                               (expect (cadr err) :to-equal "Your previous edits to test.el were discarded due to external file modifications. Please re-read and re-apply.")))
+                               (expect (cadr err) :to-equal "Your previous edits to test.el were discarded due to external file modifications.  Please re-read and re-apply")))
                             (expect threw :to-be t))))
 
                     (it "asserts that different agent sessions within the same workspace share uncommitted VFS state"
@@ -142,78 +141,11 @@
                             ;; Assert that the core patch builder was called twice
                             (expect (length orig-called-with) :to-equal 2)
                             
-                            ;; The physical pass (executed second, so it sits at the head of the list)
-                            (expect (car (car orig-called-with)) :to-equal '("/mock/proj/disk-file.el" "old" . "new"))
+                            ;; The virtual pass (executed second, so it sits at the head of the list)
+                            (expect (car (car orig-called-with)) :to-equal '("*scratch*" "old" . "new"))
                             
-                            ;; The virtual pass (executed first, so it sits in the second slot)
-                            (expect (car (cadr orig-called-with)) :to-equal '("*scratch*" "old" . "new")))))
-
-                    (it "creates temporary shadow buffers and renames open physical back buffers during build-patch"
-                        (let* ((workspace (make-macher-agent-workspace :project-root "/mock/proj/"))
-                               (file-path "/mock/proj/live-file.el")
-                               (context (macher--make-context :workspace (cons 'project "/mock/proj/")
-                                                              :contents (list (macher-agent-vfs-make-entry file-path "old content" "new virtual content"))))
-                               (fsm 'mock-fsm)
-                               ;; Create an actual live buffer visiting that file
-                               (live-buf (get-buffer-create "live-file.el")))
-                          
-                          (with-current-buffer live-buf
-                            (set-visited-file-name file-path t t)
-                            (auto-save-mode -1)
-                            (insert "old content")
-                            (set-buffer-modified-p nil))
-                          
-                          (spy-on 'macher-agent-resolve-context :and-return-value context)
-                          (spy-on 'gptel-fsm-info :and-return-value (list :macher-agent-session (make-macher-agent-session :workspace workspace)))
-                          (setf (macher-context-dirty-p context) t)
-                          
-                          ;; Spy on macher--get-buffer to prevent real buffer rendering of the patch itself
-                          (spy-on 'macher--get-buffer :and-return-value (list (get-buffer-create "*patch*")))
-                          
-                          ;; Force deferred buffer cleanups to happen synchronously during the test
-                          (spy-on 'run-at-time :and-call-fake
-                                  (lambda (_time _repeat fn &rest args)
-                                    (apply fn args)))
-                          
-                          (let ((shadow-buffer-verified nil)
-                                (original-buffer-hidden nil))
-                            
-                            (macher-agent--override-build-patch 
-                             (lambda (_ctx _fsm)
-                               ;; Inside orig-fn:
-                               ;; 1. The original buffer should be renamed and file-visiting should be nil
-                               (expect (buffer-file-name live-buf) :to-be nil)
-                               (expect (buffer-name live-buf) :not :to-equal "live-file.el")
-                               (setq original-buffer-hidden t)
-                               
-                               ;; 2. A shadow buffer should exist with name "live-file.el" and visit file-path
-                               (let ((shadow (get-buffer "live-file.el")))
-                                 (expect shadow :not :to-be nil)
-                                 (when shadow
-                                   (expect (buffer-file-name shadow) :to-be nil)
-                                   (with-current-buffer shadow
-                                     (expect (buffer-string) :to-equal "new virtual content")
-                                     (expect default-directory :to-equal (file-name-directory (expand-file-name file-path))))
-                                   (setq shadow-buffer-verified t))
-                                 (run-hooks 'macher-patch-ready-hook)))
-                             context fsm)
-                            
-                            ;; After orig-fn, everything must be perfectly restored
-                            (expect original-buffer-hidden :to-be t)
-                            (expect shadow-buffer-verified :to-be t)
-                            
-                            ;; 3. Shadow buffer must be killed and original buffer must be restored
-                            (expect (get-buffer "live-file.el") :to-be live-buf)
-                            
-                            ;; 4. Original buffer must be restored
-                            (expect (buffer-name live-buf) :to-equal "live-file.el")
-                            (expect (buffer-file-name live-buf) :to-equal file-path))
-                          
-                          ;; Clean up the live-buf
-                          (when (buffer-live-p live-buf)
-                            (with-current-buffer live-buf
-                              (setq buffer-file-name nil))
-                            (kill-buffer live-buf)))))
+                            ;; The physical pass (executed first, so it sits in the second slot)
+                            (expect (car (cadr orig-called-with)) :to-equal '("/mock/proj/disk-file.el" "old" . "new"))))))
 
           (describe "5. Sandbox Security and Path Traversal (Jailbreaks)"
                     

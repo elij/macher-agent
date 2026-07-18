@@ -4,9 +4,6 @@
 (require 'macher-agent)
 (require 'macher-agent-orchestration)
 
-;; --- TEST FIX: The Universal Shock Absorbers ---
-;; We define these explicitly in the test environment so that the test passes
-;; whether you are running the OLD array-based core code or the NEW flag-based core code.
 (defvar macher-agent--garbage-queue nil)
 (put 'macher-agent--is-subagent 'permanent-local t)
 (put 'macher-agent--ready-to-reap 'permanent-local t)
