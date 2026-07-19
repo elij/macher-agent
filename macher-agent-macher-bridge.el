@@ -191,8 +191,17 @@ Return nil."
   (let* ((payloads (macher-agent-prepare-upstream-payloads context))
          (p-ctx (car payloads))
          (v-ctx (cdr payloads))
-         (generated-buffers nil))
-    (when (and p-ctx (macher-agent--get-context-dirty-p p-ctx))
+         (generated-buffers nil)
+         
+         (has-changes-p (lambda (ctx)
+                          (and ctx
+                               (cl-some (lambda (entry)
+                                          (let ((orig (if (consp (cdr entry)) (cadr entry) nil))
+                                                (curr (if (consp (cdr entry)) (cddr entry) (cdr entry))))
+                                            (not (equal (or orig "") (or curr "")))))
+                                        (macher-agent--get-context-contents ctx))))))
+    
+    (when (funcall has-changes-p p-ctx)
       (funcall orig-fn p-ctx fsm)
       (when-let* ((buf (macher-patch-buffer (macher-context-workspace p-ctx)))
                   (name (buffer-name buf)))
@@ -202,7 +211,8 @@ Return nil."
           (with-current-buffer buf
             (rename-buffer new-name t)
             (push (current-buffer) generated-buffers)))))
-    (when (and v-ctx (macher-agent--get-context-dirty-p v-ctx))
+    
+    (when (funcall has-changes-p v-ctx)
       (funcall orig-fn v-ctx fsm)
       (when-let* ((buf (macher-patch-buffer (macher-context-workspace v-ctx)))
                   (name (buffer-name buf)))
@@ -212,6 +222,7 @@ Return nil."
           (with-current-buffer buf
             (rename-buffer new-name t)
             (push (current-buffer) generated-buffers)))))
+    
     (unless generated-buffers
       (message "Macher-Agent: No pending physical or virtual edits to review."))))
 

@@ -283,8 +283,12 @@ OUTPUT-FILTER-FN is the optional function filtering tool output."
   (funcall on-success res))
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-lisp-result-response) _context on-success _on-error)
-  "Complete execution of RES and call ON-SUCCESS directly."
-  (funcall on-success res))
+  "Execute Lisp payload asynchronously in a dedicated buffer, then invoke ON-SUCCESS."
+  (macher-agent-execute-lisp-task
+   (macher-agent-tool-response-payload res)
+   (lambda (lisp-result)
+     (setf (macher-agent-tool-response-payload res) lisp-result)
+     (funcall on-success res))))
 
 (defun macher-agent--run-async-cmd (name cmd dir callback)
   "Executes a command using explicit lexical capture for background safety.

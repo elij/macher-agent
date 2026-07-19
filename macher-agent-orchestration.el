@@ -241,6 +241,35 @@ Return nil."
 (put 'macher-agent--child-results 'permanent-local t)
 (put 'macher-agent--resume-callback 'permanent-local t)
 
+(defun macher-agent-execute-lisp-task (payload callback)
+  "Execute an async Lisp PAYLOAD in a dedicated, isolated buffer.
+
+PAYLOAD is a function that takes a single callback argument.
+CALLBACK is the function to run with the final result."
+  (let* ((parent-buf (current-buffer))
+         (buf-name (generate-new-buffer-name " *macher-agent-lisp-task*"))
+         (buf (get-buffer-create buf-name))
+         (callback-fired nil))
+    (with-current-buffer buf
+      (setq-local macher-agent--is-subagent t)
+      (setq-local macher-agent--parent-buffer parent-buf)
+      
+      (setq-local macher-agent--parent-callback
+                  (lambda (res)
+                    (unless callback-fired
+                      (setq callback-fired t)
+                      (when (buffer-live-p buf)
+                        (with-current-buffer buf
+                          (setq-local macher-agent--ready-to-reap t)))
+                      (funcall callback res))))
+      
+      (condition-case err
+          (if (functionp payload)
+              (funcall payload macher-agent--parent-callback)
+            (funcall macher-agent--parent-callback payload))
+        (error
+         (funcall macher-agent--parent-callback (format "LISP EXECUTION ERROR: %s" err)))))))
+
 (defun macher-agent-spawn-task (task callback)
   "Spawn a task inside a target subagent.
 
