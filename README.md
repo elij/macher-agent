@@ -4,21 +4,21 @@ An Emacs-native LLM agent harness with isolated sandboxing, asynchronous sub-age
 
 https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 
-macher-agent integrates with gptel and macher. Please review their respective repositories for further video examples of what can be done when all are used in tandem.
+macher-agent is driven by [gptel](https://github.com/karthink/gptel) (meaning you still have access to all of the gptel ecosystem) and integrates with [macher](https://github.com/kmontag/macher). Please review their respective repositories for further video examples of what can be done when all are used in tandem.
 
 Please review the [wiki](https://github.com/elij/macher-agent/wiki) for advanced use cases:
-[Self evolving]() agents, subagent [recursion](https://github.com/elij/macher-agent/wiki/Example-subagent-recursion-(Kimi-Agent-Swarm-Pattern)), [deterministic pipelines](https://github.com/elij/macher-agent/wiki/Example-Graph%E2%80%90Based-Agent-Workflows-(LangGraph-Pattern)) and [more](https://github.com/elij/macher-agent/wiki).
+[Self evolving](https://github.com/elij/macher-agent/wiki/Example-Self%E2%80%90Evolving-Agent-(Voyager-Pattern)) agents, subagent [recursion](https://github.com/elij/macher-agent/wiki/Example-subagent-recursion-(Kimi-Agent-Swarm-Pattern)), [deterministic pipelines](https://github.com/elij/macher-agent/wiki/Example-Graph%E2%80%90Based-Agent-Workflows-(LangGraph-Pattern)) and [more](https://github.com/elij/macher-agent/wiki).
 
 ## Another emacs agent harness?
 
 - Strict sandboxes
-- No terminal paradigm
+- Multiplex within emacs buffers without the terminal paradigm
 - No non elisp dependencies or other runtimes (every aspect is hackable)
 
 ## Changes in gptel/macher when enabled
 
 gptel
-- No longer able to change global state (to avoid race conditions), use mode hooks for defaults.
+- No longer able to change global state (to avoid race conditions), use mode hooks or `setq-default`.
 - Prompt level presets are composed by default using [#905](https://github.com/karthink/gptel/commit/3cf7bd0c850f6f72249d08d3f749dd4d04efa0f9).
 - If an inline preset is used without further text the preset prompt becomes a user prompt rather than a system prompt (similar to a command rather than a skill)
 - As media in gptel is based on absolute paths and gptel can't access the macher vfs an additional media reading method is added based on base64 payloads (this is also important for agents with computer use use-cases).
@@ -26,6 +26,7 @@ gptel
 macher
 - Tools execute against the VFS
 - VFS persists until cleared or applied.
+- `search_in_workspace` can use rg from hydrated vfs
 
 ## Table of Contents
 1. [Core Concepts and Architecture](#core-concepts-and-architecture)
@@ -77,7 +78,7 @@ graph TD
 - `macher-agent` (harness) sits in the middle. It parses agent tools, orchestrates sub-agents, and bridges the LLM UI with the file system.
 - `macher` (ephemeral context) serves as the Virtual File System (VFS) engine. It tracks all edits in hidden memory buffers and strictly bounds all agent actions.
 
-The agent interacts with a `macher` context rather than live files. This environment records file and buffer modifications. These changes are presented as a diff patch (through ediff) for your review before any disk modifications occur. If the agent needs to use an external CLI tool (like `rg` or `cargo`), `macher-agent` automatically overlays the context onto a temporary directory to allow safe execution.
+The agent interacts with a `macher` context rather than live files. This environment records file and buffer modifications. These changes are presented as a diff patch (through `diff-mode`) for your review before any disk modifications occur. If the agent needs to use an external CLI tool (like `rg` or `cargo`), `macher-agent` automatically overlays the context onto a temporary directory to allow safe execution.
 
 ## Quick Start and Installation
 
@@ -216,7 +217,7 @@ You are an expert quality assurance engineer. When asked to verify code, use the
 
 You can use `org-mode` macros for prompt templating within your `SKILL.md` files. This is useful for maintaining standardised version numbers, sharing common prompt snippets across multiple skills, or injecting context dynamically without duplicating text.
 
-`macher-agent` evaluates the `#+MACRO:` definitions and expands them in the markdown body before setting the final `gptel` system prompt.
+`macher-agent` evaluates the `#+MACRO:` definitions and expands them in the markdown body before setting the final `gptel` system prompt. The macro is evaluated before each tool call.
 
 **Example:**
 ```markdown
