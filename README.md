@@ -1,45 +1,52 @@
 # macher-agent
 
-An Emacs-native LLM agent harness with isolated sandboxing, asynchronous sub-agent orchestration, and a strict 3-tier virtual file system.
+An Emacs-native LLM agent harness with isolated sandboxing, asynchronous sub-agent orchestration, and a strict three-tier virtual file system.
 
 https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 
-macher-agent is driven by [gptel](https://github.com/karthink/gptel) (meaning you still have access to all of the gptel ecosystem) and integrates with [macher](https://github.com/kmontag/macher). Please review their respective repositories for further video examples of what can be done when all are used in tandem.
+macher-agent is driven by [gptel](https://www.google.com/search?q=https://github.com/karthink/gptel) (meaning you still have access to all of the gptel ecosystem) and integrates with [macher](https://www.google.com/search?q=https://github.com/kmontag/macher). Please review their respective repositories for further video examples of what can be done when all are used in tandem.
 
-Please review the [wiki](https://github.com/elij/macher-agent/wiki) for advanced use cases:
-[Self evolving](https://github.com/elij/macher-agent/wiki/Example-Self%E2%80%90Evolving-Agent-(Voyager-Pattern)) agents, subagent [recursion](https://github.com/elij/macher-agent/wiki/Example-subagent-recursion-(Kimi-Agent-Swarm-Pattern)), [deterministic pipelines](https://github.com/elij/macher-agent/wiki/Example-Graph%E2%80%90Based-Agent-Workflows-(LangGraph-Pattern)) and [more](https://github.com/elij/macher-agent/wiki).
+Please review the [wiki](https://www.google.com/search?q=https://github.com/elij/macher-agent/wiki) for advanced use cases:
+[Self-evolving](https://www.google.com/search?q=https://github.com/elij/macher-agent/wiki/Example-Self%25E2%2580%2590Evolving-Agent-(Voyager-Pattern)) agents, sub-agent [recursion](https://www.google.com/search?q=https://github.com/elij/macher-agent/wiki/Example-subagent-recursion-(Kimi-Agent-Swarm-Pattern)), [deterministic pipelines](https://www.google.com/search?q=https://github.com/elij/macher-agent/wiki/Example-Graph%25E2%2580%2590Based-Agent-Workflows-(LangGraph-Pattern)), and [more](https://www.google.com/search?q=https://github.com/elij/macher-agent/wiki).
 
-## Another emacs agent harness?
+## Emacs-native LLM orchestration
 
-- Strict sandboxes
-- Multiplex within emacs buffers without the terminal paradigm
-- No non elisp dependencies or other runtimes (every aspect is hackable)
+* The harness provides strict sandboxing, allowing you to run untrusted code or commands inside secure, ephemeral directory and Emacs Lisp environments.
+* Non-blocking multiplexing lets you orchestrate multiple sub-agents and operations concurrently without leaving your Emacs session or resorting to a terminal interface.
+* Because there are no non-elisp dependencies, the core harness is built purely in Emacs Lisp, making every hook, FSM transition, and tool call completely hackable and customisable.
 
-## Changes in gptel/macher when enabled
+## Changes in gptel and macher when enabled
 
-gptel
-- No longer able to change global state (to avoid race conditions), use mode hooks or `setq-default`.
-- Prompt level presets are composed by default using [#905](https://github.com/karthink/gptel/commit/3cf7bd0c850f6f72249d08d3f749dd4d04efa0f9).
-- If an inline preset is used without further text the preset prompt becomes a user prompt rather than a system prompt (similar to a command rather than a skill)
-- As media in gptel is based on absolute paths and gptel can't access the macher vfs an additional media reading method is added based on base64 payloads (this is also important for agents with computer use use-cases).
+### gptel
 
-macher
-- Tools execute against the VFS
-- VFS persists until cleared or applied.
-- `search_in_workspace` can use rg from hydrated vfs
+* State isolation restricts the gptel from modifying global setting state to prevent race conditions during parallel execution, managing all customisations via buffer-local parameters or system defaults.
+* Automatic preset composition transparently aggregates system prompts and binds specified models to local execution contexts.
+* Tag conversion transforms inline preset tokens (for example, `@compact`) submitted without further prompt text directly into user directives.
+* Base64 media transfer in addition to  physical-disk absolute path reading.  With a base64 string reader to inject images or files directly into the active session's pending media queue without polluting the Emacs interface.
 
-## Table of Contents
-1. [Core Concepts and Architecture](#core-concepts-and-architecture)
-2. [Quick Start and Installation](#quick-start-and-installation)
-3. [Tool Creation and The Sandbox](#tool-creation-and-the-sandbox)
-4. [Runtime sandboxing](#runtime-sandboxing)
-5. [Agent Skills and Registration](#agent-skills-and-registration)
-6. [Advanced Context (Media and Instructions)](#advanced-context-media-and-instructions)
-7. [Orchestrating Workflows](#orchestrating-workflows)
-8. [Lifecycle Hook Mapping Matrix](#lifecycle-hook-mapping-matrix)
-9. [Command Reference](#command-reference)
+### macher
 
-## Core Concepts and Architecture
+* VFS targeting ensures workspace modification tools operate directly on the memory-based Virtual File System (VFS).
+* VFS persistence caches edits in virtual memory so they persist across agent turns until they are explicitly cleared or committed by the user.
+* Asynchronous querying enables search and directory utilities to automatically query hydrated virtual structures, overlaying memory edits seamlessly.
+* Sub agent in the same workspace  get a sub workspace VFS that is merged after edits are completed. Tools like `wait_for_vfs_semaphore` are needed to operate at the global VFS level.
+* The VFS can support file and buffers edits including `macher` generating patches for buffers.
+
+## Table of contents
+
+1. [Core concepts and architecture](https://www.google.com/search?q=%23core-concepts-and-architecture)
+2. [Typical harness users transitioning to Emacs](https://www.google.com/search?q=%23typical-harness-users-transitioning-to-emacs)
+3. [Asynchronous execution of processes, Lisp, and sub-agents](https://www.google.com/search?q=%23asynchronous-execution-of-processes-lisp-and-sub-agents)
+4. [Quick start and installation](https://www.google.com/search?q=%23quick-start-and-installation)
+5. [Tool creation and the sandbox](https://www.google.com/search?q=%23tool-creation-and-the-sandbox)
+6. [Runtime sandboxing](https://www.google.com/search?q=%23runtime-sandboxing)
+7. [Agent skills and registration](https://www.google.com/search?q=%23agent-skills-and-registration)
+8. [Advanced context](https://www.google.com/search?q=%23advanced-context)
+9. [Orchestrating workflows](https://www.google.com/search?q=%23orchestrating-workflows)
+10. [Lifecycle hook mapping matrix](https://www.google.com/search?q=%23lifecycle-hook-mapping-matrix)
+11. [Command and tool reference](https://www.google.com/search?q=%23command-and-tool-reference)
+
+## Core concepts and architecture
 
 ```mermaid
 graph TD
@@ -74,18 +81,53 @@ graph TD
 
 ```
 
-- `gptel` (LLM/UI) provides the chat interface, API communication, and tool-call parsing. `gptel` is treated as a complete black box.
-- `macher-agent` (harness) sits in the middle. It parses agent tools, orchestrates sub-agents, and bridges the LLM UI with the file system.
-- `macher` (ephemeral context) serves as the Virtual File System (VFS) engine. It tracks all edits in hidden memory buffers and strictly bounds all agent actions.
+* The LLM and interface layer (`gptel`) manages the conversational buffers, stream parsing, and finite state machine transitions.
+* The agent orchestrator (`macher-agent`) intercepts LLM outputs, validates tool calls, manages sandboxed code execution, and coordinates background sub-agents.
+* The virtual file system (`macher`) tracks edits in hidden memory buffers as VFS tuples, acting as an isolated buffer overlay.
 
-The agent interacts with a `macher` context rather than live files. This environment records file and buffer modifications. These changes are presented as a diff patch (through `diff-mode`) for your review before any disk modifications occur. If the agent needs to use an external CLI tool (like `rg` or `cargo`), `macher-agent` automatically overlays the context onto a temporary directory to allow safe execution.
+The agent never modifies physical files on disk directly. Instead, all file modifications are applied to the memory-based VFS. At the end of a turn, `macher`  is responsible for the  patch-building process, separating edits into virtual and physical contexts. These are formatted as clean patches in `diff-mode` buffers, allowing you to review and partially or fully apply changes to your physical files.
 
-## Quick Start and Installation
+## Typical harness users transitioning to Emacs
 
-`macher-agent` requires `macher` and `gptel`. It also requires `rsync` on your system path.
+If you are transitioning from CLI-based agent tools like Claude Code, `macher-agent` offers a native, and integrated alternative directly inside Emacs.
+
+### Terminal prompts vs native buffers
+
+Instead of running an agent inside an isolated terminal window, `macher-agent` turns any Emacs buffer into an interactive conversation. You can write code, run compilers, and converse with the agent in parallel (including many agents across many workspaces operating at the same time).
+
+### Interactive diffs over automatic file modification
+
+Typical harness modifies your disk files directly (with permission gates), which often requires you to manually undo undesirable modifications using Git. `macher-agent` utilises the Macher VFS to queue modifications in memory. This allwos for the patch you're eventually presented to have gone through several cycles of validation. You are presented with interactive, editable diffs that you can modify, accept, or reject hunk-by-hunk before a single byte touches your disk (diff-mode can easily changed to your preferred workflow including using magit-diff-wash-diffs).
+
+### Slash commands mapping
+
+The interactive slash commands used in typical harnesses map directly to Emacs functions and tool interactions:
+
+| Command | Emacs / Macher-agent equivalent | Description |
+| --- | --- | --- |
+| `/btw` | `M-x macher-agent-inject-thought` | Inject manual guiding instructions mid-flight while the agent is running. |
+| `/rewind` | `M-x macher-agent-branch-chat` | Branch the conversation from a selected point to explore an alternative path. |
+| `/compact` | Prompt-level skill selection | Prune the active conversation state to optimise token usage. |
+| `/plan` or `/goal` | presets (gptel or SKILL.md-based) | Leverage a structured planning skill to coordinate task implementation. |
+| `/statusline` | gptel header-line | Native, real-time visual tracking of active LLM and sub-agent processes. |
+
+### Execution harness scope and evaluations
+
+For users transitioning from comprehensive enterprise systems, the boundary of this framework is clearly defined. The `macher-agent` package is strictly a runtime execution harness. While it provides the environment state (via the virtual file system) and the execution tools, it does not include automated evaluation environments, benchmark datasets, LLM-as-a-judge scoring rubrics, or metrics tracking (such as Pass@k). While the package runs the execution loop and manages agent turns, you will need to construct your own custom Emacs Lisp testing harness if you require automated benchmark evaluations.
+
+## Asynchronous execution of processes, Lisp, and sub-agents
+
+The orchestrator utilises non-blocking execution models across all tool families. Scaling up to dozens of subagents over a number of isolated workspaces.
+
+* Operating system processes that return a process response (such as compilers, test runners, or sandboxed shell executors) run asynchronously using background process sentinels. You can continue editing other files, navigating directories, or conversing with other buffers while the background process completes.
+* Asynchronous Lisp and callbacks handle operations that require conditional waiting. The evaluator suspends the agent's turn, scheduling a callback closure on a timer or hooking into a specific event (such as `macher-agent-context-mutated-hook`), and resumes the agent continuation only when the condition is satisfied.
+* Parallel sub-agents are spawned and executed by a background event-bus orchestrator. A parent agent can dispatch independent tasks to multiple sub-agents in parallel and continue its turn immediately, accumulating sub-agent outputs as they finish.
+
+## Quick start and installation
+
+`macher-agent` requires `macher`, `gptel`, and the system-level utility `rsync`.
 
 ```elisp
-;; lazy load on first gptel rather than startup
 (use-package gptel
   :defer t
   :config (require 'macher))
@@ -97,60 +139,74 @@ The agent interacts with a `macher` context rather than live files. This environ
   :after (gptel macher)
   :bind (("C-c m" . macher-agent-inject-thought))
   :custom
-  ;; You can place custom SKILL.md and .el scripts in this directory:
+  ;; Configure your custom skills and tool scripts directory:
   (macher-agent-skill-directories (list (expand-file-name "skills" user-emacs-directory)))
   :config
-  ;; Initialise skills to populate gptel-directives and macher-agent-tools-registry
+  ;; Initialise skills and tools into registries
   (macher-agent-initialize-skills))
 
-;; If you want to use the default skill pack:
+;; If you want to leverage the optional default skill pack:
 (use-package macher-agent-skills
   :after macher-agent)
+
 ```
 
-## Tool Creation and The Sandbox
+Initialise your workspace
 
-`macher-agent` provides a declarative DSL for defining tools: `macher-agent-make-tool`. This macro handles `condition-case` errors automatically, and bridges directly into the `macher` context middleware.
+```console
+git init
+```
 
-Your `:command-fn` receives the tool payload. If your function accepts three arguments, it will also receive the active `context` struct and the workspace `root` path. It must return a `macher-agent-tool-response` struct. For shell commands, set the type to `'process`. For synchronous Emacs Lisp results, set the type to `'lisp-result`.
+And run `gptel` within this new workspace.
+
+
+## Tool creation and the sandbox
+
+Define custom tools declaratively using the `macher-agent-make-tool` macro. This DSL handles errors, formats responses, and automatically extracts the asynchronous callback function from either the front or the back of the argument list depending on the caller environment.
+
+Your `:command-fn` receives the parsed argument payload. If the function is configured to accept more parameters, it will receive the active VFS `context` and the workspace `root` path.
 
 ### Examples
 
-**Shell Execution Tool:**
+An asynchronous process execution tool can be set up to run tasks in the background:
+
 ```elisp
 (macher-agent-make-tool macher-agent-cargo-check-tool
-  "Run 'cargo check' to compile the project."
+  "Run 'cargo check' in the background to verify the project."
   :category "rust"
   :args nil
   :command-fn (lambda (_payload)
-                (make-macher-agent-process-response :payload "rtk cargo check </dev/null 2>&1"))
+                (make-macher-agent-process-response :payload "cargo check </dev/null 2>&1"))
   :success-fn (lambda (output)
                 (if (string-match-p "error\\[" output)
                     output
                   (concat "SUCCESS: The code compiled perfectly with no errors.\n\n=== COMPILER OUTPUT ===\n" output))))
+
 ```
 
-**Emacs Lisp VFS Tool:**
-By accepting `payload`, `context`, and `root`, you can utilise the virtual file system accessors (`macher-agent-context-read` and `macher-agent-context-update`) to interact directly with the agent's virtual memory.
+An Emacs Lisp VFS tool can be created to interact with the virtual file system memory directly:
 
 ```elisp
 (macher-agent-make-tool macher-agent-custom-read-tool
-  "Read a file from the virtual file system."
+  "Read a file from the virtual file system memory."
   :category "workspace"
-  :args '((:name "path" :type string :description "File path"))
+  :args '((:name "path" :type string :description "File path relative to root"))
   :command-fn (lambda (payload context _root)
                 (let* ((path (plist-get payload :path))
                        (content (macher-agent-context-read context path)))
                   (if content
                       (make-macher-agent-lisp-result-response :payload content)
                     (error "File not found in the virtual file system: %s" path)))))
+
 ```
 
 ## Runtime sandboxing
 
-To protect host environments from unintended side effects during code evaluation, the package includes an isolated, safe Emacs Lisp evaluator. This evaluator executes untrusted or dynamically generated Lisp code without exposing your local files or configuration to risk.
+`macher-agent` enforces security boundaries and halts unauthorised actions before execution occurs.
 
-The sandbox executes programs inside a restricted environment with limited primitives. You must explicitly declare any additional host operations that the program is permitted to call.
+The Emacs Lisp sandbox executes LLM generated Lisp code without exposing your local file system or global Emacs variables to risk.
+
+Only pure functional primitives as safe by default. Any host operations or external commands must be explicitly declared and authorised.
 
 ### Safe block
 
@@ -159,16 +215,13 @@ This example defines and calls a local volume calculation function while safely 
 ```elisp
 (let ((safe-program
        '(progn
-
           (defun calculate-volume (width height depth)
             (* width height depth))
-            
-          ;; variable same name
           (let ((calculate-volume 999))
             (message (concat "Volume is: " 
                     (number-to-string (calculate-volume 5 10 2))))))))
-                    
   (macher-agent-sandbox-run safe-program '(number-to-string message)))
+
 ```
 
 ### Unsafe block
@@ -178,123 +231,102 @@ In this example, trying to call a restricted host primitive results in an error,
 ```elisp
 (let ((malicious-program
        '(insert-file-contents "/etc/passwd")))
-       
   (condition-case err
       (macher-agent-sandbox-run malicious-program nil)
     (error (message "Execution halted: %S" err))))
+
 ```
 
-## Agent Skills and Registration
+## Agent skills and registration
 
-Agent Skills are defined via folders containing a `SKILL.md` file. 
+Skills are organised as directories containing a `SKILL.md` markdown file. Each skill has YAML or JSON frontmatter specifying a name, description, an optional target model, and a list of authorised tools (`allowed-tools`). The rest of the markdown file serves as the system instruction prompt.
 
-A skill includes YAML or JSON frontmatter specifying a name, description, an optional model override, and an array of required tools (`allowed-tools`). The Markdown body provides the system prompt. 
+To prevent bloating the system prompt with thousands of tokens of redundant tool descriptions, the framework implements progressive disclosure for agent capabilities. Instead of registering every tool globally at session start, `macher-agent` parses the `SKILL.md` frontmatter to dynamically load metadata and inject allowed tools only when requested. 
 
-### Custom User Skills
-You can build custom skills and Emacs Lisp tools inside your global skills directory (for example `~/.config/emacs/skills/`). 
-- If a skill specifies `allowed-tools: ["my_tool"]`, `macher-agent` will automatically search for `~/.config/emacs/skills/scripts/my_tool.el`.
-- Script files must contain exactly one `macher-agent-make-tool` call and are dynamically evaluated with strict lexical scoping.
-- If a `model` property is provided (for example, `model: "Qwen3.6-35B-A3B"`), it is extracted and bound locally to `gptel-model` for that specific agent, ensuring requests are automatically routed to the correct LLM backend.
+* Tool auto-loading triggers if a skill requests a tool name (for example, `allowed-tools: ["run_pytest"]`), prompting `macher-agent` to look for `scripts/run_pytest.el` inside your skill directories and dynamically register it. Tools and their org macros are refreshed before every tool use.
+* Model binding occurs if a skill specifies a model (for example, `model: "Qwen3.6-35B-A3B"`), binding it to `gptel-model` whenever that agent is active, routing queries to the correct backend automatically.
+* Dynamic composition uses `@skill_name` tokens inside your chat buffer to dynamically merge that skill's system instructions, models, and authorised tools into the current session.
 
-### Example Skill
+## Advanced context
 
-Below is an example of a `SKILL.md` file that overrides the default model and references a custom tool:
+* Interactive steering allows for injecting thoughts mid-flight. If the agent is executing a long-running process in the background, you can use `M-x macher-agent-inject-thought`. Your guidance will be queued and automatically bundled into the next turn once the active process finishes.
+* Multi-modal media context means the agent can call media reading tools to read images or visual resources. 
 
-```markdown
----
-name: "python-test-runner"
-description: "Runs unit tests and analyses failures. Trigger this when asked to verify Python code or run tests."
-model: "Qwen3.6-35B-A3B"
-allowed-tools:
-  - "run_pytest"
----
-# Python Test Runner
+## Orchestrating workflows
 
-You are an expert quality assurance engineer. When asked to verify code, use the `run_pytest` tool to execute the test suite in the virtual workspace. If tests fail, analyse the output and propose fixes.
-```
+Workflows can be driven interactively, programmatically, or autonomously. Typical execution harnesses conceptualise these operations as specific multi-agent topologies and architectural patterns.
 
-### Skill Templating
+### Hub-and-spoke (Kimi agent swarm pattern)
 
-You can use `org-mode` macros for prompt templating within your `SKILL.md` files. This is useful for maintaining standardised version numbers, sharing common prompt snippets across multiple skills, or injecting context dynamically without duplicating text.
+By utilising the `spawn_subagent` and `submit_task_result` tools, a primary agent can construct deeply nested trees of sub-agents. This encapsulating topology delegates granular work downstream and aggregates the results back up, preventing root-layer context window saturation and preserving general focus.
 
-`macher-agent` evaluates the `#+MACRO:` definitions and expands them in the markdown body before setting the final `gptel` system prompt. The macro is evaluated before each tool call.
+### Dependency waves
 
-**Example:**
-```markdown
-#+MACRO: version 0.1.0
----
-name: macro-skill
-description: A skill with macro support
-allowed-tools: []
----
+Parallel and staged pipeline execution can be structured around file-based triggers. Using the `wait_for_vfs_semaphore` tool, sub-agents can autonomously suspend their processing until prerequisite datasets or outputs are written to the virtual file system by other concurrent workers, resuming only when the required virtual files are successfully created or modified.
 
-This is a test of macro expansion. Version: {{{version}}}
-```
+### Self-evolving agents (Voyager pattern)
 
-## Advanced Context (Media and Instructions)
+To facilitate open-ended problem solving and dynamic capability accretion, an agent can autonomously author and acquire its own skills. The agent writes a new `SKILL.md` file containing the YAML frontmatter and instructional payload to the skill directory using `write_file_in_workspace`, and immediately spawns a fresh sub-agent equipped with that newly engineered capability.
 
-`macher-agent` can safely steer the LLM and pass multi-modal media without polluting the Emacs UI:
+## Lifecycle hook mapping matrix
 
-### Interactive Steering (Injecting Thoughts)
+This matrix defines how the conceptual lifecycle events of an agentic process map technically down into the `macher-agent` implementation:
 
-Because the architecture relies on asynchronous Emacs process sentinels for execution (like sandboxed shell commands), the Emacs command loop remains completely responsive while the agent is "processing" a long-running tool.
-
-If an agent is busy running a background task, you can interactively push instructions to the queue. When the background tool finishes, the middleware will dequeue your manually injected instructions and bundle them into the next LLM request.
-
-- `M-x macher-agent-inject-thought` allows injecting thoughts and steering the agent mid-flight.
-- `macher-agent` dynamically reads agent skills allowing agents to iteratively build and reload `.el` tools from the virtual file system before their payload hits the network.
-- The `macher` context intercepts images generated or downloaded by tools. The agent injects the media directly into the LLM's pre-flight payload letting agents read images as needed.
-
-## Orchestrating Workflows
-
-You can run workflows autonomously (agent driven), programmatically (as macher-agent is a native Emacs implementation) or interactively.
-
-In an autonomous setup, a planner agent creates sub-agents, delegates tasks, and waits for a response via tool calls. The parent agent can run these sub-agents in the background using the event-bus orchestrator (`macher-agent-execute-parallel`), guaranteeing the sub-agents share the parent's uncommitted VFS memory.
-
-Alternatively, you can create sub-agents manually using interactive commands. You type instructions into the sub-agent buffer and trigger it. The sub-agent runs asynchronously and generates a patch.
-
-## Lifecycle Hook Mapping Matrix
-
-This matrix defines how the Claude Code specification maps conceptually and technically through the Emacs ecosystem down into the `macher-agent` implementation.
-
-| Claude Code Event | gptel Integration | Macher VFS Concept | Macher-Agent Tool Hook |
+| Conceptual event | gptel integration | Macher VFS concept | Macher-agent hook / mechanism |
 | --- | --- | --- | --- |
-| **`SessionStart`** | `gptel-mode-hook` | `macher-init-session-hook` | N/A (Handled at workspace init) |
-| **`UserPromptSubmit`** | `gptel-pre-response-functions` | `macher-before-send-hook` | N/A (Handled at request dispatch) |
-| **`PreToolUse`** | Intercept via tool wrapper | `macher-pre-execute-tool-hook` | **`macher-agent-pre-tool-use-hook`** |
-| **`PermissionRequest`** | Interactive custom wrappers | `macher-diff-review-hook` | **`macher-agent-permission-request-hook`** |
-| **`PostToolUse`** | Callback return structure | `macher-post-execute-tool-hook` | **`macher-agent-post-tool-use-hook`** |
-| **`PostToolUseFailure`** | Callback error handling | `macher-error-recovery-hook` | **`macher-agent-post-tool-use-failure-hook`** |
-| **`Stop` / `SubagentStop**` | `gptel-post-response-functions` | `macher-post-response-hook` | N/A (Handled at completion) |
+| `SessionStart` | `gptel-mode-hook` | `macher-init-session-hook` | Handled at workspace initialisation. |
+| `UserPromptSubmit` | `gptel-pre-response-functions` | `macher-before-send-hook` | Handled at request dispatch. |
+| `PreToolUse` | Intercept via tool wrapper | `macher-pre-execute-tool-hook` | `macher-agent-pre-tool-use-hook` |
+| `PermissionRequest` | Interactive custom wrappers | `macher-diff-review-hook` | `macher-agent-permission-request-hook` |
+| `PostToolUse` | Callback return structure | `macher-post-execute-tool-hook` | `macher-agent-post-tool-use-hook` |
+| `PostToolUseFailure` | Callback error handling | `macher-error-recovery-hook` | `macher-agent-post-tool-use-failure-hook` |
+| `Stop` / `SubagentStop` | `gptel-post-response-functions` | `macher-post-response-hook` | Handled at task completion. |
 
-## Command Reference
+## Command and tool reference
 
-### Interactive Commands
+### Interactive commands
 
-| Command                                  | Description                                                              |
-|------------------------------------------|--------------------------------------------------------------------------|
-| `M-x macher-agent-add-buffer-to-scope`   | Adds an existing Emacs buffer to the agent's context.                    |
-| `M-x macher-agent-clear-context`         | Clears the virtual memory and pending edits.                             |
-| `M-x macher-agent-branch-chat`           | Branch chat in new buffer.                                               |
-| `M-x macher-agent-inject-thought`        | Inject thought into next agent continuation (queues additions)           |
-| `M-x macher-agent-apply-patch`           | Evaluates and applies the patch buffer.                                  |
-| `M-x macher-agent-insert-patch`          | Inserts the workspace patch into the chat buffer.                        |
-| `M-x macher-agent-apply-virtual-buffers` | Applies the virtual edits directly.                                      |
-| `M-x macher-agent-initialize-skills`     | Scans the skills directory, compiling presets and tools into memory.     |
+| Command | Description |
+| --- | --- |
+| `M-x macher-agent-add-buffer-to-scope` | Adds an existing Emacs buffer to the agent's active tracking list. |
+| `M-x macher-agent-clear-context` | Clears all pending virtual memory and unsaved edits in the active workspace. |
+| `M-x macher-agent-branch-chat` | Branches the current conversation into a new buffer, preserving prior context. |
+| `M-x macher-agent-inject-thought` | Queues manual instructions to steer the agent during background executions. |
+| `M-x macher-agent-apply-patch` | Evaluates and applies the proposed patch buffer to the physical disk. |
+| `M-x macher-agent-insert-patch` | Inserts the workspace patch directly into the chat buffer. |
+| `M-x macher-agent-apply-virtual-buffers` | Directly applies virtual edits to active Emacs buffers. |
+| `M-x macher-agent-initialize-skills` | Scans directories and compiles all skills, presets, and tools into memory. |
 
+### LLM tools reference
 
+The system relies on two classes of tools: `macher` VFS Tools (the primary vehicle for workspace and file modification) and `macher-agent` Tools (for orchestration, parallel sub-agents, and advanced evaluations).
 
-### LLM Tools
+#### Macher VFS tools (primary file modification)
 
-| Tool                                   | Description                                                     |
-|----------------------------------------|-----------------------------------------------------------------|
-| `spawn_subagent`                       | Creates a sub-agent inheriting the parent's virtual state.      |
-| `delegate_tasks_to_subagents`          | Dispatches instructions to sub-agents and waits for a response. |
-| `execute_subagents`                    | Starts sub-agent processing.                                    |
-| `submit_task_result`                   | Submits final output from a worker to the parent.               |
-| `write_buffer_in_workspace`            | Modifies a buffer via the virtual context.                      |
-| `multi_edit_buffer_in_workspace`       | Performs string replacements in a buffer.                       |
-| `read_buffer_in_workspace`             | Retrieves buffer contents from the persistent context.          |
-| `read_media_in_workspace`              | Reads an image into the agent's context.                        |
-| `list_buffers_in_workspace`            | Lists active agent buffers in scope.                            |
-| `search_in_workspace`                  | Searches across accessible agent workspace.                     |
+| Tool Name | Description |
+| --- | --- |
+| `read_file_in_workspace` | Retrieves the content of any file in the workspace. |
+| `search_in_workspace` | Executes a regular expression search across all files in the workspace. |
+| `list_directory_in_workspace` | Lists directory contents, showing files and structures recursively. |
+| `edit_file_in_workspace` | Makes exact, bounded string replacements inside a workspace file. |
+| `multi_edit_file_in_workspace` | Performs multiple exact string replacements sequentially inside a single file. |
+| `write_file_in_workspace` | Creates a new file or overwrites an existing file in the workspace. |
+| `move_file_in_workspace` | Moves, renames, or restructures files. |
+| `delete_file_in_workspace` | Deletes a file from the virtual file system. |
+
+#### Macher-agent tools (orchestration and auxiliary)
+
+| Tool Name | Description |
+| --- | --- |
+| `spawn_subagent` | Spawns a new sub-agent buffer inheriting LLM configurations and the parent's virtual state. |
+| `delegate_tasks_to_subagents` | Dispatches specific instructions to multiple sub-agents asynchronously and gathers their results. |
+| `execute_subagents` | Initiates sub-agent task loops in a fire-and-forget, non-blocking background process. |
+| `submit_task_result` | Submits final outputs from a sub-agent worker back to the parent orchestrator. |
+| `mark_self_for_reap` | Flags the current sub-agent buffer for automatic termination once its tasks are complete (only sub agents can self reap). |
+| `wait_for_vfs_semaphore` | Suspends agent processing asynchronously until a specified file is created or modified on the VFS (operates at the global VFS level). |
+| `read_media_in_workspace` | Reads a media resource (for example, an image) and packages it as base64 for pre-flight injection. |
+| `list_buffers_in_workspace` | Lists all active buffers in the agent's current scope. |
+| `read_buffer_in_workspace` | Retrieves lines or regions from active, scoped Emacs buffers with optional line numbering. |
+| `write_buffer_in_workspace` | Proposes new contents for a live Emacs buffer, creating a review patch. |
+| `multi_edit_buffer_in_workspace` | Sequentially applies multiple string replacements to a live Emacs buffer. |
+| `commit_buffer` | Bypasses patch review to append or overwrite a live Emacs buffer and synchronise VFS memory immediately. |
