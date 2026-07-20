@@ -34,17 +34,17 @@ Please review the [wiki](https://www.google.com/search?q=https://github.com/elij
 
 ## Table of contents
 
-1. [Core concepts and architecture](https://www.google.com/search?q=%23core-concepts-and-architecture)
-2. [Typical harness users transitioning to Emacs](https://www.google.com/search?q=%23typical-harness-users-transitioning-to-emacs)
-3. [Asynchronous execution of processes, Lisp, and sub-agents](https://www.google.com/search?q=%23asynchronous-execution-of-processes-lisp-and-sub-agents)
-4. [Quick start and installation](https://www.google.com/search?q=%23quick-start-and-installation)
-5. [Tool creation and the sandbox](https://www.google.com/search?q=%23tool-creation-and-the-sandbox)
-6. [Runtime sandboxing](https://www.google.com/search?q=%23runtime-sandboxing)
-7. [Agent skills and registration](https://www.google.com/search?q=%23agent-skills-and-registration)
-8. [Advanced context](https://www.google.com/search?q=%23advanced-context)
-9. [Orchestrating workflows](https://www.google.com/search?q=%23orchestrating-workflows)
-10. [Lifecycle hook mapping matrix](https://www.google.com/search?q=%23lifecycle-hook-mapping-matrix)
-11. [Command and tool reference](https://www.google.com/search?q=%23command-and-tool-reference)
+1. [Core concepts and architecture](#core-concepts-and-architecture)
+2. [Typical harness users transitioning to Emacs](#typical-harness-users-transitioning-to-emacs)
+3. [Asynchronous execution of processes, Lisp, and sub-agents](#asynchronous-execution-of-processes-lisp-and-sub-agents)
+4. [Quick start and installation](#quick-start-and-installation)
+5. [Tool creation and the sandbox](#tool-creation-and-the-sandbox)
+6. [Runtime sandboxing](#runtime-sandboxing)
+7. [Agent skills and registration](#agent-skills-and-registration)
+8. [Advanced context](#advanced-context)
+9. [Orchestrating workflows](#orchestrating-workflows)
+10. [Lifecycle hook mapping matrix](#lifecycle-hook-mapping-matrix)
+11. [Command and tool reference](#command-and-tool-reference)
 
 ## Core concepts and architecture
 
@@ -243,7 +243,7 @@ Skills are organised as directories containing a `SKILL.md` markdown file. Each 
 
 To prevent bloating the system prompt with thousands of tokens of redundant tool descriptions, the framework implements progressive disclosure for agent capabilities. Instead of registering every tool globally at session start, `macher-agent` parses the `SKILL.md` frontmatter to dynamically load metadata and inject allowed tools only when requested. 
 
-* Tool auto-loading triggers if a skill requests a tool name (for example, `allowed-tools: ["run_pytest"]`), prompting `macher-agent` to look for `scripts/run_pytest.el` inside your skill directories and dynamically register it. Tools and their org macros are refreshed before every tool use.
+* Tool auto-loading triggers if a skill requests a `gptel-tool-name` tool name (for example, `allowed-tools: ["run_pytest"]`), prompting `macher-agent` to look for `scripts/run_pytest.el` inside your skill directories and dynamically register it. Tools and their org macros are refreshed before every tool use.
 * Model binding occurs if a skill specifies a model (for example, `model: "Qwen3.6-35B-A3B"`), binding it to `gptel-model` whenever that agent is active, routing queries to the correct backend automatically.
 * Dynamic composition uses `@skill_name` tokens inside your chat buffer to dynamically merge that skill's system instructions, models, and authorised tools into the current session.
 
