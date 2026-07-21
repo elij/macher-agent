@@ -11,6 +11,7 @@ Please review the [wiki](https://www.google.com/search?q=https://github.com/elij
 
 ## Emacs-native LLM orchestration
 
+* The harness allows agents to solve problems in a sanbdox uninterrupted prior to providing a unified diff. In contrast to per tool permission dialogues.
 * The harness provides strict sandboxing, allowing you to run untrusted code or commands inside secure, ephemeral directory and Emacs Lisp environments.
 * Non-blocking multiplexing lets you orchestrate multiple sub-agents and operations concurrently without leaving your Emacs session or resorting to a terminal interface.
 * Because there are no non-elisp dependencies, the core harness is built purely in Emacs Lisp, making every hook, FSM transition, and tool call completely hackable and customisable.

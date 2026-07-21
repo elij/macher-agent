@@ -149,7 +149,7 @@ Developers MUST expect the following upstream data structures when intercepting 
 
 1. **`gptel-fsm` (Finite State Machine):** An upstream struct tracking the LLM request.  `macher-agent` MUST interact with it primarily via `(gptel-fsm-info fsm)`, which returns a Lisp property list (plist).
 * *Expected keys:* `:buffer`, `:backend`, `:data`, `:tools`.
-* *Injected keys:* `macher-agent` MUST safely inject `:macher-agent-session` and `:macher--context` into this plist.
+* *Injected keys:* `macher-agent` MUST safely inject `:macher-agent-session` and `:macher-agent-context` into this plist.
 
 2. **`gptel-tool`:** An upstream struct.  `macher-agent` relies on `gptel-tool-name` (returns a string or symbol) and `gptel-tool-function` (returns a Lisp closure).
 - The extraction and comparison MUST be wrapped in a canonical tool name handler:
@@ -174,10 +174,10 @@ The system MUST intercept `gptel`'s private networking and stream insertion func
 
 #### 6.2.2 Media and prompt injection
 
-* **Target:** `gptel--fsm-transition`
-* **Interception:** `advice-add :around` (`#'macher-agent--inject-media-fsm-advice`)
-* **Inputs received:** `(machine &optional new-state &rest args)`
-* **Behaviour:** Before transitioning to the WAIT state, the advice MUST extract the session via `(plist-get (gptel-fsm-info machine) :macher-agent-session)`.  If `pending-media` is present in the session, the advice MUST invoke `gptel--inject-media` and `gptel--inject-prompt`, then set `pending-media` strictly to nil.
+* **Target:** `gptel-prompt-transform-functions`
+* **Processor:** `#'macher-agent-sync-prompt-transformer`
+* **Inputs received:** `(async-fn fsm)`
+* **Behaviour:** During the prompt construction phase before network transmission, if `pending-media` is present in the active context, `macher-agent-sync-prompt-transformer` invokes `macher-agent-inject-pending-media`, injecting media into the payload via `gptel--inject-media` and `gptel--inject-prompt`, then clearing `pending-media`.
 
 #### 6.2.3 Base64 virtual file system override
 
@@ -217,21 +217,19 @@ Because `macher` relies on Emacs physical buffers and `macher-agent` uses pure-m
 #### 6.3.2 Context singleton intercept
 
 * **Target:** `macher--make-context`
-* **Interception:** `advice-add :around` (`#'macher-agent--override-make-context`)
-* **Inputs received:** `(&rest kwargs)` expecting plists: `:prompt`, `:process-request-function`, `:contents`, `:workspace`.
-* **Behaviour:** The upstream function creates a new `macher-context` struct.  The advice MUST block this creation and instead return the buffer-local `macher-agent--persistent-context` singleton.
-* **Data mutation:** The advice MUST parse `:contents` (where upstream provides a list of `(path orig-string . new-string)`) and hydrate them into the VFS entries via `macher-agent--update-context-file` before returning the singleton.
+* **Interception:** `advice-add :around` (`#'macher-agent--around-make-context`)
+* **Inputs received:** `(orig-fun &rest args)`
+* **Behaviour:** Intercepts `macher--make-context` to check whether `macher-agent--persistent-context` is bound locally. If bound and non-nil, it returns the persistent context structure, ensuring the native setup transformer reuses the existing context state rather than instantiating a blank context.
 
 #### 6.3.3 The double-pass patch generation
 
-* **Target:** `macher--build-patch`
-* **Interception:** `advice-add :around` (`#'macher-agent--override-build-patch`)
-* **Inputs received:** `(context &optional fsm)`
+* **Target:** `macher-process-request-function`
+* **Processor:** `#'macher-agent-process-request`
+* **Inputs received:** `(&optional status context fsm)`
 * **Behaviour and invariants:**
-  1. **Partitioning:** The advice MUST partition active workspace edits into standard physical and virtual contexts using `macher-agent-prepare-upstream-payloads`.
-  2. **Delegate formatting:** Instead of using shadow buffers, the advice delegates formatting back to the native `macher` engine by calling the original patch building function with each partitioned context.
+  1. **Partitioning:** The function MUST partition active workspace edits into standard physical and virtual contexts using `macher-agent-prepare-upstream-payloads`.
+  2. **Delegate formatting:** Instead of using shadow buffers, the function delegates formatting back to the native `macher` engine by calling `macher--build-patch` with each partitioned context.
   3. **Unique suffixes:** It extracts the original workspace buffer using `macher-patch-buffer` and dynamically applies a physical (`*macher-physical-patch...*`) or virtual (`*macher-virtual-patch...*`) buffer name prefix while retaining unique workspace suffixes.
-  4. **Avoid automatic sync race conditions:** During the build process, the advice prevents automatic synchronisation from executing concurrently by using the `macher-agent--pause-auto-sync` sentinel or managing individual pass separation.
 
 ---
 
@@ -240,7 +238,7 @@ Because `macher` relies on Emacs physical buffers and `macher-agent` uses pure-m
 ### 7.1 The gptel bridge
 
 1. **Nil response protection**: `gptel--insert-response` is advised to gracefully handle empty (nil) streaming chunks without throwing Emacs type errors.
-2. **Media injection**: `gptel--fsm-transition` is advised.  If the VFS session contains `pending-media` (where the tool itself performs the read and base64 serialisation), the raw base64 data is injected directly into the LLM request FSM immediately before transitioning to the WAIT state.
+2. **Media injection**: Handled during prompt construction via `gptel-prompt-transform-functions` in `macher-agent-sync-prompt-transformer`. If the context contains `pending-media`, raw base64 data is injected directly into the prompt payload before transmission and cleared from the queue.
 3. **Base64 override**: The native `gptel--base64-encode` is intercepted to check the VFS first.  If the file exists in the agent's memory, it encodes the virtual string instead of reading the physical disk.
 
 ### 7.2 The macher bridge for patch generation
@@ -249,5 +247,5 @@ Because `macher` expects separate updates and `macher-agent` uses both physical 
 
 1. **Context intercept:** `macher--make-context` is intercepted to return the global `macher-agent--persistent-context` singleton, ensuring the patch generator sees all virtual and physical edits in the active workspace.
 2. **Context splitting:** The context preprocessor `macher-agent-prepare-upstream-payloads` partitions active workspace edits into standard physical and virtual contexts.
-3. **Double-pass routing:** `macher-agent--override-build-patch` delegates the formatting of each partitioned context back to the native `macher` engine.
+3. **Double-pass routing:** `macher-agent-process-request` delegates the formatting of each partitioned context back to the native `macher` engine via `macher--build-patch`.
 4. **Buffer separation:** Unique, isolated buffers are produced for physical and virtual updates with preserved workspace hashes and suffixes.

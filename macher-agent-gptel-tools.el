@@ -84,8 +84,7 @@ Return the resolved context structure, or nil."
       (when-let* (((boundp 'macher-agent--active-fsm))
                   (fsm macher-agent--active-fsm)
                   (info (macher-agent--extract-fsm-info fsm)))
-        (or (plist-get info :macher-agent-context)
-            (plist-get info :macher--context)))))
+        (plist-get info :macher-agent-context))))
 
 (defun macher-agent--format-directives (result-data)
   "Append pending system instructions to RESULT-DATA if any exist.
@@ -154,7 +153,7 @@ NAME-SYMBOL is the symbol naming the tool variable.
 DESCRIPTION is the string describing the tool's purpose.
 CATEGORY is the optional classification category of the tool.
 ARGS is the list of argument specifications for the tool.
-COMMAND-FN is the function running the tool logic.
+COMMAND-FN is the function running the tool logic. Must accept (PAYLOAD CONTEXT ROOT).
 SUCCESS-FN is the function processing success results.
 OUTPUT-FILTER-FN is the optional function filtering tool output."
   (declare (indent 2))
@@ -165,99 +164,70 @@ OUTPUT-FILTER-FN is the optional function filtering tool output."
        (setq ,name-symbol
              (gptel-make-tool
               :name ,name
-              :description ,description :category ,(or category "macher-agent") :args ,args :async t
+              :description ,description 
+              :category ,(or category "macher-agent") 
+              :args ,args 
+              :async t
               :function
-              (lambda (&rest all-args)
-                (let* ((first-arg (car all-args))
-                       (last-arg (car (last all-args)))
-                       (is-async-cb-first (and first-arg (functionp first-arg) (not (keywordp first-arg))))
-                       (is-async-cb-last (and last-arg (functionp last-arg) (not (keywordp last-arg))))
-                       (callback (cond (is-async-cb-first first-arg)
-                                       (is-async-cb-last last-arg)
-                                       (t nil)))
-                       (raw-payload (cond (is-async-cb-first (cdr all-args))
-                                          (is-async-cb-last (butlast all-args))
-                                          (t all-args)))
-                       (payload
-                        (if (and raw-payload (keywordp (car raw-payload)))
-                            raw-payload
-                          (let ((pl nil)
-                                (idx 0)
-                                (tool-args-spec ,args))
-                            (dolist (arg raw-payload)
-                              (when-let* ((spec (nth idx tool-args-spec))
-                                          (arg-name (plist-get spec :name))
-                                          (key-sym (intern (concat ":" (if (symbolp arg-name)
-                                                                           (symbol-name arg-name)
-                                                                         arg-name)))))
-                                (setq pl (plist-put pl key-sym arg)))
-                              (setq idx (1+ idx)))
-                            pl)))
+              (lambda (callback &rest tool-args)
+                ;; 1. gptel guarantees `callback` is ALWAYS arg 1 for async tools.
+                ;; 2. `tool-args` are ALWAYS positional, mapped perfectly to the `args` spec.
+                
+                ;; Zip the positional args into a plist deterministically
+                (let* ((payload (cl-loop for arg in tool-args
+                                         for spec in ,args
+                                         for arg-name = (plist-get spec :name)
+                                         for key = (intern (concat ":" (if (symbolp arg-name) 
+                                                                           (symbol-name arg-name) 
+                                                                         arg-name)))
+                                         append (list key arg)))
                        (context (or (ignore-errors (macher-agent-resolve-context))
                                     (bound-and-true-p macher-agent--persistent-context)))
                        (root (if context (macher-agent-context-root context) default-directory))
-                       (cmd-eval ,command-fn)
-                       (succ-eval ,success-fn)
-                       (filter-eval ,output-filter-fn)
                        (wrap-cb (macher-agent--wrap-callback callback)))
                   
-                  (let ((pre-ok t)
-                        (pre-err nil))
-                    (condition-case hook-err
-                        (unless (run-hook-with-args-until-failure 'macher-agent-pre-tool-use-hook ',name-symbol payload)
-                          (setq pre-ok nil))
-                      (error
-                       (setq pre-ok nil
-                             pre-err (error-message-string hook-err))))
-                    (if (not pre-ok)
-                        (let ((err-msg (if pre-err
-                                           (format "Execution blocked by error in macher-agent-pre-tool-use-hook: %s" pre-err)
-                                         "Execution blocked by macher-agent-pre-tool-use-hook")))
-                          (funcall wrap-cb (list :status 'error :error err-msg)))
-                      
-                      (let ((perm-ok t)
-                            (perm-err nil))
-                        (condition-case hook-err
-                            (unless (run-hook-with-args-until-failure 'macher-agent-permission-request-hook ',name-symbol payload)
-                              (setq perm-ok nil))
+                  ;; Run pre-flight hooks with support for aborting on nil or errors.
+                  (condition-case pre-err
+                      (if (and macher-agent-pre-tool-use-hook
+                               (not (run-hook-with-args-until-failure 'macher-agent-pre-tool-use-hook ',name-symbol payload)))
+                          (funcall wrap-cb (list :status 'error :error "Execution blocked by macher-agent-pre-tool-use-hook"))
+                        (condition-case perm-err
+                            (if (and macher-agent-permission-request-hook
+                                     (not (run-hook-with-args-until-failure 'macher-agent-permission-request-hook ',name-symbol payload)))
+                                (funcall wrap-cb (list :status 'error :error "Permission denied by macher-agent-permission-request-hook"))
+                              (condition-case err
+                                  (let* ((action (funcall ,command-fn payload context root)))
+                                    
+                                    (unless (macher-agent-tool-response-p action)
+                                      (setq action (make-macher-agent-lisp-result-response
+                                                    :payload (if (stringp action) action (format "%S" action)))))
+                                    
+                                    (let ((on-success
+                                           (lambda (res-obj)
+                                             (condition-case cb-err
+                                                 (let* ((raw-payload (if (macher-agent-tool-response-p res-obj)
+                                                                         (macher-agent-tool-response-payload res-obj)
+                                                                       res-obj))
+                                                        (success-data (if ,success-fn (funcall ,success-fn raw-payload) raw-payload))
+                                                        (final-data (if ,output-filter-fn (funcall ,output-filter-fn success-data) success-data)))
+                                                   
+                                                   (run-hook-with-args 'macher-agent-post-tool-use-hook ',name-symbol payload final-data)
+                                                   (funcall wrap-cb (list :status 'success :data final-data)))
+                                               (error
+                                                (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ',name-symbol payload cb-err)
+                                                (funcall wrap-cb (list :status 'error :error (error-message-string cb-err))))))))
+                                      
+                                      (macher-agent-execute-response action context on-success wrap-cb)))
+                                (error
+                                 (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ',name-symbol payload err)
+                                 (funcall wrap-cb (list :status 'error :error (error-message-string err))))))
                           (error
-                           (setq perm-ok nil
-                                 perm-err (error-message-string hook-err))))
-                        (if (not perm-ok)
-                            (let ((err-msg (if perm-err
-                                               (format "Permission denied by error in macher-agent-permission-request-hook: %s" perm-err)
-                                             "Permission denied by macher-agent-permission-request-hook")))
-                              (funcall wrap-cb (list :status 'error :error err-msg)))
-                          
-                          (condition-case err
-                              (let* ((action (let* ((arity (func-arity cmd-eval))
-                                                    (max-args (cdr arity)))
-                                               (if (or (eq max-args 'many) (>= max-args 3))
-                                                   (funcall cmd-eval payload context root)
-                                                 (funcall cmd-eval payload)))))
-                                (unless (macher-agent-tool-response-p action)
-                                  (setq action (make-macher-agent-lisp-result-response
-                                                :payload (if (stringp action) action (format "%S" action)))))
-                                (let ((on-success
-                                       (lambda (res-obj)
-                                         (condition-case cb-err
-                                             (let* ((raw-payload (if (macher-agent-tool-response-p res-obj)
-                                                                     (macher-agent-tool-response-payload res-obj)
-                                                                   res-obj))
-                                                    (success-data (if succ-eval (funcall succ-eval raw-payload) raw-payload))
-                                                    (final-data (if filter-eval (funcall filter-eval success-data) success-data)))
-                                               (run-hook-with-args 'macher-agent-post-tool-use-hook ',name-symbol payload final-data)
-                                               (funcall wrap-cb (list :status 'success :data final-data)))
-                                           (error
-                                            (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ',name-symbol payload cb-err)
-                                            (funcall wrap-cb (list :status 'error :error (error-message-string cb-err))))))))
-                                  (macher-agent-execute-response action context on-success wrap-cb)))
-                            (error
-                             (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ',name-symbol payload err)
-                             (funcall wrap-cb (list :status 'error :error (error-message-string err))))))))))))))))
+                           (funcall wrap-cb (list :status 'error :error (format "Execution blocked by error in macher-agent-permission-request-hook: %s" (error-message-string perm-err)))))))
+                    (error
+                     (funcall wrap-cb (list :status 'error :error (format "Execution blocked by error in macher-agent-pre-tool-use-hook: %s" (error-message-string pre-err)))))))))))))
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-process-response) context on-success on-error)
-  "Execute RES in a sandbox, then invoke ON-SUCCESS or ON-ERROR."
+  "Execute response RES within CONTEXT in a sandbox, then invoke ON-SUCCESS or ON-ERROR."
   (let ((payload (macher-agent-tool-response-payload res)))
     (if (stringp payload)
         (macher-agent--run-in-persistent-sandbox
@@ -283,7 +253,7 @@ OUTPUT-FILTER-FN is the optional function filtering tool output."
   (funcall on-success res))
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-lisp-result-response) _context on-success _on-error)
-  "Execute Lisp payload asynchronously in a dedicated buffer, then invoke ON-SUCCESS."
+  "Execute Lisp payload for response RES asynchronously, then invoke ON-SUCCESS."
   (macher-agent-execute-lisp-task
    (macher-agent-tool-response-payload res)
    (lambda (lisp-result)
@@ -415,8 +385,8 @@ Return the base64-encoded representation string."
                      (and (boundp 'macher--fsm-latest) (symbol-value 'macher--fsm-latest))
                      (and (boundp 'gptel--fsm-last) (symbol-value 'gptel--fsm-last))))
             (info (ignore-errors (gptel-fsm-info fsm)))
-            (session (plist-get info :macher-agent-session))
-            (pending (macher-agent-session-pending-media session))
+            (ctx (plist-get info :macher-agent-context))
+            (pending (when ctx (macher-agent--get-context-data ctx :pending-media)))
             ((cl-some (lambda (item) (string= file (car item))) pending)))
       file
     (if-let* ((ctx (ignore-errors (macher-agent-current-context)))

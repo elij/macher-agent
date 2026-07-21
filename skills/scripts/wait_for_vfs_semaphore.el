@@ -1,5 +1,6 @@
 (macher-agent-make-tool macher-agent-wait-for-vfs-semaphore
-    "Suspends the agent until the specified file is created or modified in the virtual file system."
+    "Suspends the agent until the specified file is created or modified in the virtual \
+file system."
   :category "worker"
   :args '((:name "path" :type string :description "File path to monitor"))
   :command-fn (lambda (payload context _root)

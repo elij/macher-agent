@@ -20,7 +20,7 @@
 WS is the workspace object.
 
 Return the absolute path string."
-  (macher-agent-root ws))
+  (macher-agent-workspace-project-root ws))
 
 (defun macher-agent--get-workspace-name (ws)
   "Retrieve a human-readable name for WS.
@@ -73,65 +73,35 @@ Return the MD5 hash string."
 
 (advice-add 'macher--workspace-hash :override #'macher-agent--safe-workspace-hash)
 
-(defvar macher-agent--bypass-context-override nil
-  "Internal flag to prevent intercepting our own ephemeral diff contexts.")
+(defvar-local macher-agent--persistent-context nil)
 
-(defun macher-agent--override-make-context (orig-fn &rest kwargs)
-  "Intercept the upstream constructor to natively enforce the VFS singleton.
+(defun macher-agent--around-make-context (orig-fun &rest args)
+  "Intercept `macher--make-context` to return `macher-agent--persistent-context` if bound locally.
 
-ORIG-FN is the original constructor function.
-KWARGS represents keyword arguments passed to the constructor.
+ORIG-FUN is the original `macher--make-context` constructor function.
+ARGS represents keyword arguments passed to the constructor.
 
-Return the context struct."
+Return the persistent context if bound and non-nil, otherwise call ORIG-FUN."
   (let ((persistent-ctx (bound-and-true-p macher-agent--persistent-context)))
-    (if (and persistent-ctx (not macher-agent--bypass-context-override))
+    (if persistent-ctx
         (progn
-          (when (plist-member kwargs :prompt)
-            (setf (macher-context-prompt persistent-ctx) (plist-get kwargs :prompt)))
-          (when (plist-member kwargs :process-request-function)
-            (setf (macher-context-process-request-function persistent-ctx) (plist-get kwargs :process-request-function)))
-
-          (when-let* ((contents (plist-get kwargs :contents)))
-            (dolist (e contents)
-              (let ((path (car e))
-                    (curr (if (consp (cdr e)) (cddr e) (cdr e))))
-                (macher-agent--update-context-file persistent-ctx path curr))))
-
+          (when (plist-member args :prompt)
+            (setf (macher-context-prompt persistent-ctx) (plist-get args :prompt)))
+          (when (plist-member args :process-request-function)
+            (setf (macher-context-process-request-function persistent-ctx) (plist-get args :process-request-function)))
           persistent-ctx)
+      (apply orig-fun args))))
 
-      (apply orig-fn kwargs))))
-
-(advice-add 'macher--make-context :around #'macher-agent--override-make-context)
-
-(defun macher-agent--propagate-vfs-to-gptel-target (orig-fn prompt &rest kwargs)
-  "Ensure that temporary buffers spawned for async requests inherit the live VFS context.
-This prevents data loss when external packages (like macher) evaluate LLM responses
-in temporary buffers that lack the agent's buffer-local state.
-
-ORIG-FN is the original request function.
-PROMPT is the prompt string.
-KWARGS represents extra keyword arguments.
-
-Return the result of ORIG-FN."
-  (when-let* ((live-ctx (bound-and-true-p macher-agent--persistent-context))
-              (raw-buf (plist-get kwargs :buffer))
-              (target-buf (when raw-buf (get-buffer raw-buf)))
-              ((not (eq target-buf (current-buffer)))))
-    (with-current-buffer target-buf
-      (setq-local macher-agent--persistent-context live-ctx)))
-
-  (apply orig-fn prompt kwargs))
-
-(advice-add 'gptel-request :around #'macher-agent--propagate-vfs-to-gptel-target)
+(advice-add 'macher--make-context :around #'macher-agent--around-make-context)
 
 (cl-defun macher-agent--make-vfs-context (&key workspace contents)
-  "Create an ephemeral context, safely bypassing the singleton constructor interceptor.
+  "Create a native `macher-context` struct using `macher--make-context`.
 
 WORKSPACE is the workspace object.
 CONTENTS is the list of VFS entries.
 
 Return the context struct."
-  (let ((macher-agent--bypass-context-override t))
+  (let ((macher-agent--persistent-context nil))
     (macher--make-context :workspace workspace :contents contents)))
 
 (defun macher-agent--prepare-patch-contexts (context fsm project-root)
@@ -174,59 +144,59 @@ CONTEXT is the active context structure.
 
 Return a cons cell of (PHYSICAL-CONTEXT . VIRTUAL-CONTEXT)."
   (let* ((ws (macher-agent--get-context-workspace context))
-         (project-root (macher-agent-root ws))
+         (project-root (macher-agent-workspace-project-root ws))
          (prepared (macher-agent--prepare-patch-contexts context nil project-root))
          (v-ctx (nth 0 prepared))
          (p-ctx (nth 1 prepared)))
     (cons p-ctx v-ctx)))
 
-(defun macher-agent--override-build-patch (orig-fn context &optional fsm)
-  "Intercept automated patch trigger, split contexts, and route back to core.
+(defun macher-agent-process-request (&optional status context fsm)
+  "Process request STATUS for CONTEXT and optional FSM.
+Split the context into physical and virtual parts and call `macher--build-patch` natively on both."
+  (let* ((ctx (cond
+               ((and status (fboundp 'macher-context-p) (macher-context-p status)) status)
+               (context context)
+               (t (ignore-errors (macher-agent-resolve-context)))))
+         (fsm-obj (cond
+                   ((and context (not (fboundp 'macher-context-p))) context)
+                   (fsm fsm)
+                   (t nil))))
+    (when ctx
+      (let* ((payloads (macher-agent-prepare-upstream-payloads ctx))
+             (p-ctx (car payloads))
+             (v-ctx (cdr payloads))
+             (generated-buffers nil)
+             (has-changes-p (lambda (c)
+                              (and c
+                                   (cl-some (lambda (entry)
+                                              (let ((orig (if (consp (cdr entry)) (cadr entry) nil))
+                                                    (curr (if (consp (cdr entry)) (cddr entry) (cdr entry))))
+                                                (not (equal (or orig "") (or curr "")))))
+                                            (macher-agent--get-context-contents c))))))
+        (when (funcall has-changes-p p-ctx)
+          (macher--build-patch p-ctx fsm-obj)
+          (when-let* ((buf (macher-patch-buffer (macher-context-workspace p-ctx)))
+                      (name (buffer-name buf)))
+            (let ((new-name (if (string-match "^\\*macher-patch\\(.*\\)\\*$" name)
+                                (concat "*macher-physical-patch" (match-string 1 name) "*")
+                              "*macher-physical-patch*")))
+              (with-current-buffer buf
+                (rename-buffer new-name t)
+                (push (current-buffer) generated-buffers)))))
+        (when (funcall has-changes-p v-ctx)
+          (macher--build-patch v-ctx fsm-obj)
+          (when-let* ((buf (macher-patch-buffer (macher-context-workspace v-ctx)))
+                      (name (buffer-name buf)))
+            (let ((new-name (if (string-match "^\\*macher-patch\\(.*\\)\\*$" name)
+                                (concat "*macher-virtual-patch" (match-string 1 name) "*")
+                              "*macher-virtual-patch*")))
+              (with-current-buffer buf
+                (rename-buffer new-name t)
+                (push (current-buffer) generated-buffers)))))
+        (unless generated-buffers
+          (message "Macher-Agent: No pending physical or virtual edits to review."))))))
 
-ORIG-FN is the original patch building function.
-CONTEXT is the active context structure.
-FSM is the optional finite-state machine.
-
-Return nil."
-  (let* ((payloads (macher-agent-prepare-upstream-payloads context))
-         (p-ctx (car payloads))
-         (v-ctx (cdr payloads))
-         (generated-buffers nil)
-         
-         (has-changes-p (lambda (ctx)
-                          (and ctx
-                               (cl-some (lambda (entry)
-                                          (let ((orig (if (consp (cdr entry)) (cadr entry) nil))
-                                                (curr (if (consp (cdr entry)) (cddr entry) (cdr entry))))
-                                            (not (equal (or orig "") (or curr "")))))
-                                        (macher-agent--get-context-contents ctx))))))
-    
-    (when (funcall has-changes-p p-ctx)
-      (funcall orig-fn p-ctx fsm)
-      (when-let* ((buf (macher-patch-buffer (macher-context-workspace p-ctx)))
-                  (name (buffer-name buf)))
-        (let ((new-name (if (string-match "^\\*macher-patch\\(.*\\)\\*$" name)
-                            (concat "*macher-physical-patch" (match-string 1 name) "*")
-                          "*macher-physical-patch*")))
-          (with-current-buffer buf
-            (rename-buffer new-name t)
-            (push (current-buffer) generated-buffers)))))
-    
-    (when (funcall has-changes-p v-ctx)
-      (funcall orig-fn v-ctx fsm)
-      (when-let* ((buf (macher-patch-buffer (macher-context-workspace v-ctx)))
-                  (name (buffer-name buf)))
-        (let ((new-name (if (string-match "^\\*macher-patch\\(.*\\)\\*$" name)
-                            (concat "*macher-virtual-patch" (match-string 1 name) "*")
-                          "*macher-virtual-patch*")))
-          (with-current-buffer buf
-            (rename-buffer new-name t)
-            (push (current-buffer) generated-buffers)))))
-    
-    (unless generated-buffers
-      (message "Macher-Agent: No pending physical or virtual edits to review."))))
-
-(advice-add 'macher--build-patch :around #'macher-agent--override-build-patch)
+(setq macher-process-request-function #'macher-agent-process-request)
 
 (defun macher-agent--get-context-workspace (ctx)
   "Retrieve the workspace from context CTX.
