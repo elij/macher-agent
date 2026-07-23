@@ -205,27 +205,23 @@ Return nil."
       (when (fboundp 'macher-agent--auto-sync-context)
         (macher-agent--auto-sync-context ctx))
       (when fsm
-        (let ((session (or (plist-get info :macher-agent-session)
-                           (let* ((ws (macher-agent--get-context-workspace ctx))
-                                  (proj-root (if ws (macher-agent-root ws) default-directory))
-                                  (agent-ws (make-macher-agent-workspace :project-root proj-root)))
-                             (make-macher-agent-session :id (buffer-name) :workspace agent-ws)))))
-          (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-session session)))))))
+        (let* ((info (gptel-fsm-info fsm))
+               (has-ctx (plist-get info :macher-agent-context)))
+          (unless has-ctx
+            (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-context ctx))))))))
 
 (defun macher-agent--inject-media-fsm-advice (orig-fun fsm &rest args)
   "Inject pending tool media into the FSM payload right before transitioning to WAIT.
 
 ORIG-FUN is the original transition function.
-FSM is the finite-state machine struct.
-ARGS represents the arguments passed to ORIG-FUN.
-
-Return the result of ORIG-FUN."
+FSM is the finite-state machine object.
+ARGS represents additional arguments passed to ORIG-FUN."
   (let* ((new-state (car args))
          (target-state (or new-state (ignore-errors (gptel--fsm-next fsm)))))
     (when (or (eq target-state 'WAIT) (null target-state))
       (let* ((info (macher-agent--extract-fsm-info fsm))
-             (session (plist-get info :macher-agent-session))
-             (pending (when session (macher-agent-session-pending-media session))))
+             (ctx (plist-get info :macher-agent-context))
+             (pending (when ctx (macher-agent--get-context-data ctx :pending-media))))
 
         (when pending
           (let* ((msg-plist (list :role "user"
@@ -241,7 +237,7 @@ Return the result of ORIG-FUN."
                                     (plist-get info :data)
                                     (car prompts)))
 
-            (setf (macher-agent-session-pending-media session) nil))))))
+            (macher-agent--set-context-data ctx :pending-media nil))))))
   (apply orig-fun fsm args))
 
 (advice-add 'gptel--fsm-transition :around #'macher-agent--inject-media-fsm-advice)
@@ -287,7 +283,7 @@ ARGS represents the arguments passed to ORIG-FUN.
 Return the result of ORIG-FUN."
   (when macher-agent--allow-gptel-restore
     (setq-local macher-agent--is-restored-session t)
-    (let ((current-root (macher-agent-root nil)))
+    (let ((current-root (macher-agent-root default-directory)))
       (when (and current-root (fboundp 'macher-agent--init-workspace-state))
         (macher-agent--init-workspace-state current-root)))
     (let ((ctx (when (fboundp 'macher-agent-resolve-context)
@@ -323,13 +319,11 @@ Return a cons cell (BACKEND . MODEL-FORMAT) if found, otherwise nil."
   "Dynamically bound to the active FSM during tool execution hooks.")
 
 (defun macher-agent--bind-active-fsm-advice (orig-fn fsm &rest args)
-  "Capture the current FSM dynamically so tool validators do not rely on lagging state variables.
+  "Capture FSM dynamically so tool validators do not rely on lagging state variables.
 
 ORIG-FN is the original function being advised.
-FSM is the active finite-state machine.
-ARGS represents the arguments passed to ORIG-FN.
-
-Return the result of ORIG-FN."
+FSM is the active finite-state machine object.
+ARGS represents additional arguments passed to ORIG-FN."
   (let ((macher-agent--active-fsm fsm))
     (apply orig-fn fsm args)))
 
@@ -337,30 +331,22 @@ Return the result of ORIG-FN."
 (advice-add 'gptel--handle-tool-use :around #'macher-agent--bind-active-fsm-advice)
 (advice-add 'gptel--handle-post-tool :around #'macher-agent--bind-active-fsm-advice)
 
-(defun macher-agent--enforce-tool-scope (tool &rest _args)
+(defun macher-agent--enforce-tool-scope (tool &optional fsm &rest _args)
   "Enforce that TOOL is explicitly within the authorised scope.
 If not, block execution to prevent hallucinated or globally-leaked tools.
 
-To robustly validate the tool across execution boundaries (including
-asynchronous callbacks and temporary buffer switches), the function
-retrieves the active finite state machine (FSM) or fallback references
-and compares the incoming tool against the authorised toolset.
-
-It reads the tool names exclusively from the finite state machine snapshot,
-ignoring buffer-local variables to avoid race conditions.
-
 TOOL is the tool object or name to be verified.
+FSM is the optional finite-state machine object.
 _ARGS represents unused arguments passed from the hook.
 
 Return a block list if the tool is out of scope, otherwise nil."
   (let* ((canonical-name (macher-agent-canonical-tool-name tool))
-         (fsm (or macher-agent--active-fsm
-                  (bound-and-true-p macher--fsm-latest)
-                  (bound-and-true-p gptel--fsm-last)))
-         (info (when fsm (gptel-fsm-info fsm)))
+         (fsm-obj (or macher-agent--active-fsm
+                      (bound-and-true-p macher--fsm-latest)
+                      (bound-and-true-p gptel--fsm-last)))
+         (info (when fsm-obj (gptel-fsm-info fsm-obj)))
          (fsm-tools (when info (plist-get info :tools)))
-         (authorised-names
-          (mapcar #'macher-agent-canonical-tool-name fsm-tools)))
+         (authorised-names (mapcar #'macher-agent-canonical-tool-name fsm-tools)))
     (unless (and canonical-name (member canonical-name authorised-names))
       (list :block (format "ERROR: Tool '%s' is out of scope. It was not provided to this sub-agent." (or canonical-name tool))))))
 
@@ -379,68 +365,6 @@ Return nil."
       (add-hook 'gptel-pre-tool-call-functions #'macher-agent--setup-tools-pre-hook nil t))))
 
 (add-hook 'gptel-mode-hook #'macher-agent-setup-gptel-buffer)
-
-(defun macher--transform-setup-tools (callback fsm)
-  "A gptel prompt transform to set up macher tools and behaviour.
-Modified for macher-agent.
-
-CALLBACK is the function to invoke next.
-FSM is the finite-state machine."
-  (let* ((prompt (buffer-string))
-         (process-request-function macher-process-request-function)
-         (context-or-t nil)
-         (get-context
-          (lambda ()
-            (unless context-or-t
-              (let* ((info (gptel-fsm-info fsm))
-                     (buffer (plist-get info :buffer)))
-                (when (plist-get info :macher--context)
-                  (error "Macher context already present on FSM during setup"))
-                (unless buffer
-                  (error "Trying to set up macher tools, but coudn't determine request buffer"))
-                (setq context-or-t
-                      (if (buffer-live-p buffer)
-                          (let ((agent-ctx (buffer-local-value 'macher-agent--persistent-context buffer)))
-                            (if agent-ctx
-                                (progn
-                                  (when (fboundp 'macher-context-prompt)
-                                    (setf (macher-context-prompt agent-ctx) prompt))
-                                  (when (fboundp 'macher-context-process-request-function)
-                                    (setf (macher-context-process-request-function agent-ctx) process-request-function))
-                                  (setq info (plist-put info :macher--context agent-ctx))
-                                  (setf (gptel-fsm-info fsm) info)
-                                  agent-ctx)
-                              (if-let* ((workspace (with-current-buffer buffer (macher-workspace buffer))))
-                                  (let ((context (macher--make-context :workspace workspace
-                                                                       :prompt prompt
-                                                                       :process-request-function process-request-function)))
-                                    (setq info (plist-put info :macher--context context))
-                                    (setf (gptel-fsm-info fsm) info)
-                                    (with-current-buffer buffer (setq macher--fsm-latest fsm))
-                                    context)
-                                t)))
-                        t))))
-            (if (eq context-or-t t) nil context-or-t)))
-         (init-handler-invoked nil)
-         (init-handler
-          (lambda (fsm)
-            (unless init-handler-invoked
-              (setq init-handler-invoked t)
-              (macher--setup-tools fsm get-context))))
-         (termination-handler
-          (lambda (fsm)
-            (when (and context-or-t (funcall get-context))
-              (let* ((ctx (funcall get-context))
-                     (info (gptel-fsm-info fsm))
-                     (buffer (plist-get info :buffer)))
-                (when (and buffer (buffer-live-p buffer) (fboundp 'macher-agent--capture-pending-edits))
-                  (macher-agent--capture-pending-edits ctx buffer))
-                (let ((protected-contents (copy-sequence (macher-agent--get-context-contents ctx))))
-                  (funcall process-request-function 'complete ctx fsm)
-                  (macher-agent--set-context-contents ctx protected-contents)))))))
-    (macher--add-transition-handler fsm init-handler)
-    (macher--add-termination-handler fsm termination-handler))
-  (funcall callback))
 
 (provide 'macher-agent-gptel-bridge)
 ;;; macher-agent-gptel-bridge.el ends here

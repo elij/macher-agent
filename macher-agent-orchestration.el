@@ -253,7 +253,7 @@ CALLBACK is the function to run with the final result."
     (with-current-buffer buf
       (setq-local macher-agent--is-subagent t)
       (setq-local macher-agent--parent-buffer parent-buf)
-      
+
       (setq-local macher-agent--parent-callback
                   (lambda (res)
                     (unless callback-fired
@@ -262,7 +262,7 @@ CALLBACK is the function to run with the final result."
                         (with-current-buffer buf
                           (setq-local macher-agent--ready-to-reap t)))
                       (funcall callback res))))
-      
+
       (condition-case err
           (if (functionp payload)
               (funcall payload macher-agent--parent-callback)

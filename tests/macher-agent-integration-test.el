@@ -1,4 +1,5 @@
 ;;; macher-agent-integration-test.el --- Tests for macher-agent-skills -*- lexical-binding: t -*-
+
 (require 'buttercup)
 (require 'macher-agent-macher-bridge)
 (require 'macher-agent)
@@ -21,7 +22,9 @@
           (before-each
            (setq macher-agent--garbage-queue nil)
            (spy-on 'macher-agent-resolve-context :and-return-value
-                   (let ((ctx (macher-agent--make-vfs-context :workspace (cons 'agent (make-macher-agent-workspace :project-root "/mock/proj")) :contents nil)))
+                   (let* ((ws (make-macher-agent-workspace :project-root "/mock/proj"))
+                          (ctx (macher-agent--make-vfs-context :workspace ws :contents nil)))
+                     (puthash (expand-file-name "/mock/proj") ctx macher-agent-active-workspaces)
                      (macher-agent-initialize-skills ctx (or (bound-and-true-p macher-agent--bundled-skills-dir) macher-agent-bundled-skills-directory))
                      ctx))
            
@@ -68,10 +71,10 @@
                       (let ((spawn-fn (gptel-tool-function spawn-tool)))
                         (if (gptel-tool-async spawn-tool)
                             (progn
-                              (funcall spawn-fn "agent-france" (lambda (res) (setq final-result (cons 'spawn1 res))))
-                              (funcall spawn-fn "agent-spain" (lambda (res) (setq final-result (cons 'spawn2 res)))))
-                          (funcall spawn-fn "agent-france")
-                          (funcall spawn-fn "agent-spain")))
+                              (funcall spawn-fn (lambda (res) (setq final-result (cons 'spawn1 res))) "agent-france")
+                              (funcall spawn-fn (lambda (res) (setq final-result (cons 'spawn2 res))) "agent-spain"))
+                          (funcall spawn-fn nil "agent-france")
+                          (funcall spawn-fn nil "agent-spain")))
 
                       (unless (buffer-live-p (get-buffer "agent-france"))
                         (error "SPAWN FAILED! final-result=%S spawn-tool=%S" final-result spawn-tool))
@@ -90,9 +93,9 @@
                             (delegate-fn (gptel-tool-function delegate-tool)))
                         
                         (funcall delegate-fn
-                                 tasks
                                  (lambda (result)
-                                   (setq final-result result))))
+                                   (setq final-result result))
+                                 tasks))
 
                       ;; --- D. Assertions ---
                       (expect final-result :to-be-truthy)

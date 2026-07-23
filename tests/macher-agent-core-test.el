@@ -19,9 +19,11 @@
           (describe "1. VFS and Optimistic Concurrency"
                     (it "asserts that a VFS write is rejected if the underlying file has drifted"
                         (let* ((workspace (make-macher-agent-workspace :project-root "/mock/proj/"))
+                               (ctx (macher--make-context :workspace workspace :contents nil))
                                (file-path "/mock/proj/test.el")
                                (original-mtime '(25000 12345))
                                (drifted-mtime '(25000 99999)))
+                          (puthash (expand-file-name "/mock/proj/") ctx macher-agent-active-workspaces)
                           
                           ;; Initialise tracking
                           (puthash file-path original-mtime (macher-agent-workspace-mtime-tracker workspace))
@@ -43,23 +45,24 @@
 
                     (it "asserts that different agent sessions within the same workspace share uncommitted VFS state"
                         (let* ((workspace (make-macher-agent-workspace :project-root "/mock/proj/"))
-                               (session-a (make-macher-agent-session :id "Agent-A" :workspace workspace))
-                               (session-b (make-macher-agent-session :id "Agent-B" :workspace workspace))
+                               (ctx-a (macher--make-context :workspace workspace :contents nil))
+                               (ctx-b (macher--make-context :workspace workspace :contents nil))
                                (file-path "/mock/proj/shared.el"))
+                          (puthash (expand-file-name "/mock/proj/") ctx-a macher-agent-active-workspaces)
                           
                           ;; Agent A writes to the shared VFS
-                          (macher-agent-vfs-write (macher-agent-session-workspace session-a) file-path "Agent A changes")
+                          (macher-agent-vfs-write workspace file-path "Agent A changes")
                           
                           ;; Agent B reads from the shared VFS
-                          (let ((read-content (macher-agent-vfs-read (macher-agent-session-workspace session-b) file-path)))
+                          (let ((read-content (macher-agent-vfs-read workspace file-path)))
                             (expect read-content :to-equal "Agent A changes")))))
 
           (describe "2. Execution Environments (Sandbox)"
                     (it "asserts that sandbox inflation overlays the uncommitted VFS changes"
                         (let* ((workspace (make-macher-agent-workspace :project-root "/mock/proj/"))
-                               (session (make-macher-agent-session :id "Agent-A" 
-                                                                   :workspace workspace
-                                                                   :sandbox-path "/tmp/macher-sandbox/")))
+                               (ctx (macher--make-context :workspace workspace :contents nil)))
+                          (macher-agent--set-context-data ctx :sandbox-path "/tmp/macher-sandbox/")
+                          (puthash (expand-file-name "/mock/proj/") ctx macher-agent-active-workspaces)
                           
                           (puthash "/mock/proj/overlay.el" "VFS Overlay Content" (macher-agent-workspace-vfs-buffers workspace))
                           
@@ -70,18 +73,18 @@
                                       (when (string-suffix-p "overlay.el" filename)
                                         (setq written-to-sandbox (substring-no-properties start end)))))
                             
-                            (macher-agent-sandbox-inflate session)
+                            (macher-agent-sandbox-inflate ctx)
                             
                             (expect written-to-sandbox :to-equal "VFS Overlay Content")))))
 
           (describe "3. Context and Isolation (Lexical Survival)"
                     (it "asserts that lexical context survives async gptel callbacks without buffer bleeding"
                         (let* ((workspace (make-macher-agent-workspace :project-root "/mock/proj/"))
-                               (session (make-macher-agent-session :id "Agent-A" :workspace workspace))
-                               (fsm 'mock-fsm)
+                               (ctx (macher--make-context :workspace workspace :contents nil))
+                               (fsm (gptel-make-fsm))
                                (executed-workspace nil))
                           
-                          (spy-on 'gptel-fsm-info :and-return-value (list :macher-agent-session session))
+                          (setf (gptel-fsm-info fsm) (list :macher-agent-context ctx))
                           
                           ;; Mock the behaviour where current-buffer changes asynchronously
                           (with-temp-buffer
@@ -90,21 +93,21 @@
                               ;; Execute a mock async tool callback
                               (with-temp-buffer ;; "Wandering" buffer context
                                 (let* ((info (macher-agent--extract-fsm-info fsm))
-                                       (fsm-session (plist-get info :macher-agent-session)))
-                                  (when fsm-session
-                                    (setq executed-workspace (macher-agent-session-workspace fsm-session)))))
+                                       (fsm-ctx (plist-get info :macher-agent-context)))
+                                  (when fsm-ctx
+                                    (setq executed-workspace (macher-agent--get-context-workspace fsm-ctx)))))
                               
                               (expect executed-workspace :to-be workspace))))))
 
           (describe "4. Media Injection Isolation"
                     (it "asserts that media injection strictly checks FSM properties"
                         (let* ((workspace (make-macher-agent-workspace :project-root "/mock/proj/"))
-                               (session (make-macher-agent-session :workspace workspace))
-                               (fsm 'mock-fsm)
+                               (ctx (macher--make-context :workspace workspace :contents nil))
+                               (fsm (gptel-make-fsm))
                                (macher-agent--active-fsm fsm))
                           
-                          (spy-on 'gptel-fsm-info :and-return-value (list :macher-agent-session session))
-                          (setf (macher-agent-session-pending-media session) (list (list "mockbase64" :mime "image/png")))
+                          (setf (gptel-fsm-info fsm) (list :macher-agent-context ctx))
+                          (macher-agent--set-context-data ctx :pending-media (list (list "mockbase64" :mime "image/png")))
                           
                           (spy-on 'gptel--inject-media :and-return-value nil)
                           (spy-on 'gptel--inject-prompt :and-return-value nil)
@@ -112,7 +115,7 @@
                           (macher-agent--inject-media-fsm-advice (lambda (f) f) fsm)
                           
                           (expect 'gptel--inject-media :to-have-been-called)
-                          (expect (macher-agent-session-pending-media session) :to-be nil))))
+                          (expect (macher-agent--get-context-data ctx :pending-media) :to-be nil))))
 
           (describe "5. Diff Splitting Behaviour"
                     (it "asserts that virtual buffer modifications are split from physical file modifications"
@@ -120,10 +123,10 @@
                                (context (macher--make-context :workspace (cons 'project "/mock/proj/")
                                                               :contents (list (macher-agent-vfs-make-entry "/mock/proj/disk-file.el" "old" "new")
                                                                               (macher-agent-vfs-make-entry "*scratch*" "old" "new"))))
-                               (fsm 'mock-fsm))
+                               (fsm (gptel-make-fsm)))
                           
                           (spy-on 'macher-agent-resolve-context :and-return-value context)
-                          (spy-on 'gptel-fsm-info :and-return-value (list :macher-agent-session (make-macher-agent-session :workspace workspace)))
+                          (setf (gptel-fsm-info fsm) (list :macher-agent-context context))
                           (setf (macher-context-dirty-p context) t)
                           
                           ;; Spy on upstream Emacs UI commands to prevent actual buffers from rendering
@@ -131,12 +134,11 @@
                           (spy-on 'macher--get-buffer :and-return-value (list (get-buffer-create "*patch*")))
                           
                           (let ((orig-called-with nil))
-                            ;; Execute our bridge interceptor, mocking the core function to capture the splits
-                            (macher-agent--override-build-patch 
-                             (lambda (ctx _fsm) 
-                               (push (macher-context-contents ctx) orig-called-with)
-                               (run-hooks 'macher-patch-ready-hook))
-                             context fsm)
+                            (spy-on 'macher--build-patch :and-call-fake
+                                    (lambda (ctx _fsm)
+                                      (push (macher-context-contents ctx) orig-called-with)
+                                      (run-hooks 'macher-patch-ready-hook)))
+                            (macher-agent-process-request context fsm)
                             
                             ;; Assert that the core patch builder was called twice
                             (expect (length orig-called-with) :to-equal 2)

@@ -78,39 +78,39 @@
                                   (let* ((test-dir (make-temp-file "macher-test-dir" t))
                                          (test-file (expand-file-name "test.txt" test-dir))
                                          (ctx (macher--make-context :dirty-p t)))
-                                    
-                                    (setf (macher-context-contents ctx) 
+
+                                    (setf (macher-context-contents ctx)
                                           (list (macher-agent-vfs-make-entry test-file "v1" "v2-local")))
-                                    
+
                                     (with-temp-file test-file (insert "v2-remote"))
-                                    
+
                                     (macher-agent--auto-sync-context ctx)
-                                    
+
                                     (let ((entry (cl-find test-file (macher-context-contents ctx) :key #'macher-agent-vfs-entry-path :test #'equal)))
                                       (expect (macher-agent-vfs-entry-orig entry) :to-equal "v2-remote")
                                       (expect (macher-agent-vfs-entry-curr entry) :to-equal "v2-remote"))
-                                    
+
                                     (delete-directory test-dir t)))
 
                               (it "preserves unapplied virtual edits across tool calls if the physical state has not mutated"
                                   (let* ((entry (macher-agent-vfs-make-entry "test-file.el" "original state" "proposed ghost state")))
-                                    
+
                                     ;; Mock the disk returning the exact same original state
                                     (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value "original state")
-                                    
+
                                     (macher-agent--sync-context-entry entry)
-                                    
+
                                     ;; The agent's unapplied virtual edit MUST survive!
                                     (expect (macher-agent-vfs-entry-curr entry) :to-equal "proposed ghost state")))
 
                               (it "invalidates edits and prevents ghost diffs if the underlying buffer or file is destroyed"
                                   (let* ((entry (macher-agent-vfs-make-entry "test-file.el" "original state" "proposed ghost state")))
-                                    
+
                                     ;; Mock the buffer being killed or file being deleted (returns nil)
                                     (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value nil)
-                                    
+
                                     (macher-agent--sync-context-entry entry)
-                                    
+
                                     ;; The concurrency control detects the change and wipes the ghost edits
                                     (expect (macher-agent-vfs-entry-orig entry) :to-be nil)
                                     (expect (macher-agent-vfs-entry-curr entry) :to-be nil)))
@@ -121,26 +121,26 @@
                                          (pure-name "*macher-dummy-buf*")
                                          (file-buf (find-file-noselect file-path))
                                          (pure-buf (get-buffer-create pure-name)))
-                                    
+
                                     ;; 1. Add one physical file and one pure buffer to the context
                                     (push (macher-agent-vfs-make-entry file-path "a" "b") (macher-context-contents ctx))
                                     (push (macher-agent-vfs-make-entry pure-name "x" "y") (macher-context-contents ctx))
                                     (expect (length (macher-context-contents ctx)) :to-equal 2)
-                                    
+
                                     ;; 2. Run the splitter
                                     (let* ((split (macher-agent--split-context ctx))
                                            (file-ctx (car split))
                                            (buf-ctx (cdr split)))
-                                      
+
                                       ;; 3. Verify physical files went to the left (car)
                                       (expect (length (macher-context-contents file-ctx)) :to-equal 1)
                                       (expect (cl-find file-path (macher-context-contents file-ctx) :key #'macher-agent-vfs-entry-path :test #'equal) :to-be-truthy)
                                       (expect (cl-find pure-name (macher-context-contents file-ctx) :key #'macher-agent-vfs-entry-path :test #'equal) :to-be nil)
-                                      
+
                                       ;; 4. Verify pure buffers went to the right (cdr)
                                       (expect (cl-find pure-name (macher-context-contents buf-ctx) :key #'macher-agent-vfs-entry-path :test #'equal) :to-be-truthy)
                                       (expect (cl-find file-path (macher-context-contents buf-ctx) :key #'macher-agent-vfs-entry-path :test #'equal) :to-be nil))
-                                    
+
                                     (kill-buffer file-buf)
                                     (kill-buffer pure-buf)))
 
@@ -149,12 +149,12 @@
                                          (ctx (macher--make-context :dirty-p t))
                                          (file-path (expand-file-name "test.txt")))
                                     (push (macher-agent-vfs-make-entry file-path "old" "new") (macher-context-contents ctx))
-                                    
+
                                     (with-current-buffer buf
                                       (setq-local macher-agent--is-workspace t)
                                       (setq-local macher-agent--persistent-context ctx)
                                       (setq-local macher-agent--active-fsm nil))
-                                    
+
                                     (with-current-buffer buf
                                       (macher-agent-apply-virtual-buffers))
                                     (kill-buffer buf))))
@@ -167,15 +167,15 @@
                                          ;; Register a skill with a specific model
                                          (skill-data '(:description "Test" :model gpt-4o :has-tools nil :context-dir nil :system "test"))
                                          (execution (macher--make-action-execution :action skill-name)))
-                                    
+
                                     (let ((workspace (macher-agent--get-context-workspace (macher-agent-resolve-context))))
                                       (setf (alist-get skill-name (macher-agent-workspace-skills-alist workspace)) skill-data))
-                                    
+
                                     ;; Execute the initialisation
                                     (with-temp-buffer
                                       (let ((gptel--known-presets nil))
                                         (macher-agent-initialize-skills (macher-agent-resolve-context))
-                                        
+
                                         (let ((preset-def (alist-get skill-name gptel--known-presets)))
                                           (expect preset-def :not :to-be nil)
                                           (expect (plist-get preset-def :model) :to-equal 'gpt-4o))))))
@@ -188,28 +188,28 @@
                                          (skill-data '(:description "Test" :model nil :has-tools nil :context-dir nil :system "test"))
                                          (execution (macher--make-action-execution :action skill-name))
                                          (original-model gptel-model))
-                                    
+
                                     (let ((workspace (macher-agent--get-context-workspace (macher-agent-resolve-context))))
                                       (setf (alist-get skill-name (macher-agent-workspace-skills-alist workspace)) skill-data))
-                                    
+
                                     (with-temp-buffer
                                       (let ((gptel--known-presets nil))
                                         (macher-agent-initialize-skills (macher-agent-resolve-context))
-                                        
+
                                         (let ((preset-def (alist-get skill-name gptel--known-presets)))
                                           (expect preset-def :not :to-be nil)
                                           ;; plist-member returns the tail if found, nil if not. Since model is not present, it should not exist in the plist.
                                           (expect (plist-member preset-def :model) :to-be nil)))))))
                     (describe "Virtual File System (VFS) Concurrency Control"
-                              
+
                               (describe "macher-agent--sync-context-entry"
-                                        
+
                                         (it "preserves unapplied virtual edits if the physical disk has NOT mutated"
                                             (let* ((entry (macher-agent-vfs-make-entry "test.el" "original state" "agent edit")))
-                                              
+
                                               ;; Mock the disk returning the exact same original state
                                               (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value "original state")
-                                              
+
                                               (let ((mutated (macher-agent--sync-context-entry entry)))
                                                 (expect mutated :to-be nil)
                                                 (expect (macher-agent-vfs-entry-orig entry) :to-equal "original state")
@@ -217,10 +217,10 @@
 
                                         (it "fast-forwards a clean virtual memory if the physical disk mutates naturally"
                                             (let* ((entry (macher-agent-vfs-make-entry "test.el" "original state" "original state")))
-                                              
+
                                               ;; Mock a physical edit happening while the agent had NO pending edits
                                               (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value "new physical state")
-                                              
+
                                               (let ((mutated (macher-agent--sync-context-entry entry)))
                                                 (expect mutated :to-be t)
                                                 (expect (macher-agent-vfs-entry-orig entry) :to-equal "new physical state")
@@ -228,10 +228,10 @@
 
                                         (it "OPTIMISTIC CONCURRENCY: invalidates virtual edits if a hostile physical mutation occurs"
                                             (let* ((entry (macher-agent-vfs-make-entry "test.el" "original state" "agent edit")))
-                                              
+
                                               ;; Mock the user manually editing the file while the agent was thinking
                                               (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value "user physical edit")
-                                              
+
                                               (let ((mutated (macher-agent--sync-context-entry entry)))
                                                 ;; The system MUST detect the conflict and aggressively drop the agent's delta
                                                 (expect mutated :to-be t)
@@ -240,11 +240,11 @@
 
                                         (it "fast-forwards virtual memory if the physical mutation perfectly matches the virtual delta (patch applied)"
                                             (let* ((entry (macher-agent-vfs-make-entry "test.el" "original state" "agent edit")))
-                                              
+
                                               ;; Mock the state immediately after the user applies the patch.
                                               ;; The disk now matches the agent's unapplied edit perfectly.
                                               (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value "agent edit")
-                                              
+
                                               (let ((mutated (macher-agent--sync-context-entry entry)))
                                                 ;; The system MUST recognise the patch was applied and fast-forward the baseline.
                                                 ;; It returns t (mutated) and updates orig to match new, preventing duplicate patches.
@@ -254,42 +254,42 @@
 
                               )
                     (describe "Macher-Agent Tool Registry Resilience"
-                              
+
                               (it "ensures custom tools survive the preset purge and retain correct category"
                                   (let* (;; 1. Define a tool mimicking your agent tools
-                                         (custom-tool (gptel-make-tool 
-                                                       :name "cargo_check_tool" 
-                                                       :function #'ignore 
-                                                       :category "macher-agent-rust" 
-                                                       :description "Test tool" 
+                                         (custom-tool (gptel-make-tool
+                                                       :name "cargo_check_tool"
+                                                       :function #'ignore
+                                                       :category "macher-agent-rust"
+                                                       :description "Test tool"
                                                        :args nil))
                                          ;; 2. Simulate the clearing function used by presets like macher-ro
                                          (clear-fn (plist-get (plist-get macher--preset-clear-tools :tools) :function))
                                          ;; 3. Simulate a scenario where a preset attempts to purge everything but 'macher' category tools
-                                         (tools-list (list custom-tool 
+                                         (tools-list (list custom-tool
                                                            (gptel-make-tool :name "native_tool" :function #'ignore :category "macher" :description "native" :args nil)))
                                          (filtered-tools (funcall clear-fn tools-list)))
-                                    
+
                                     ;; PROOF: The custom tool MUST survive because it does not match the 'macher' category purge
                                     (expect (seq-find (lambda (tool) (string= (gptel-tool-name tool) "cargo_check_tool")) filtered-tools) :not :to-be nil)
                                     (expect (gptel-tool-category custom-tool) :to-equal "macher-agent-rust")))
 
                               (it "verifies that tools identified as 'macher' category get context injected"
                                   (let* ((mock-fsm (gptel-make-fsm))
-                                         (mock-tool (gptel-make-tool :name "test_tool" 
-                                                                     :function (lambda (ctx) ctx) 
-                                                                     :category "macher" 
+                                         (mock-tool (gptel-make-tool :name "test_tool"
+                                                                     :function (lambda (ctx) ctx)
+                                                                     :category "macher"
                                                                      :description "test" :args nil))
                                          (mock-context 'injected-context))
-                                    
+
                                     (setf (gptel-fsm-info mock-fsm) (list :tools (list mock-tool) :buffer (current-buffer)))
-                                    
+
                                     ;; Run the macher setup logic
                                     (macher--setup-tools mock-fsm (lambda () mock-context))
-                                    
+
                                     (let* ((processed-tools (plist-get (gptel-fsm-info mock-fsm) :tools))
                                            (processed-tool (car processed-tools)))
-                                      
+
                                       ;; PROOF: The tool has been wrapped and is now expecting the context
                                       (expect (funcall (gptel-tool-function processed-tool)) :to-equal 'injected-context))))
 
@@ -301,33 +301,33 @@
                                          (macher-agent--allow-gptel-restore t)
                                          (orig-called nil)
                                          (orig-fun (lambda (&rest _args) (setq orig-called t))))
-                                    
+
                                     (unwind-protect
                                         (progn
                                           ;; 1. Set up the other buffer to simulate an active workspace that could be leaked
                                           (with-current-buffer other-buf
                                             (setq-local default-directory other-dir)
                                             (macher-agent--init-workspace-state other-dir))
-                                          
+
                                           ;; 2. Set up the restored buffer with its correct default-directory
                                           (with-current-buffer restore-buf
                                             (setq-local default-directory restore-dir)
-                                            
+
                                             ;; Verify that prior to restore advice, persistent-context is nil
                                             (expect (bound-and-true-p macher-agent--persistent-context) :to-be nil)
-                                            
+
                                             ;; Execute the restore advice
                                             (macher-agent--gptel-restore-advice orig-fun)
-                                            
+
                                             ;; Verify the original restore function was called
                                             (expect orig-called :to-be t)
-                                            
+
                                             ;; Verify that the correct workspace context was created and bound
                                             (let ((local-ctx (bound-and-true-p macher-agent--persistent-context)))
                                               (expect local-ctx :not :to-be nil)
                                               (let ((workspace (macher-agent--get-context-workspace local-ctx)))
-                                                (expect (macher-agent-root workspace) :to-equal (expand-file-name restore-dir))))))
-                                      
+                                                (expect (macher-agent-workspace-project-root workspace) :to-equal (expand-file-name restore-dir))))))
+
                                       ;; Clean up temp buffers
                                       (when (buffer-live-p other-buf) (kill-buffer other-buf))
                                       (when (buffer-live-p restore-buf) (kill-buffer restore-buf))))))
@@ -338,22 +338,21 @@
                                                    (ctx (macher--make-context :contents (list (macher-agent-vfs-make-entry "test.png" "" "img-data"))))
                                                    (tool-fn (gptel-tool-function macher-agent-read-media-in-workspace-tool)))
                                               (spy-on 'macher-agent-resolve-context :and-return-value ctx)
-                                              (let ((result (funcall tool-fn "test.png")))
+                                              (let ((result (funcall tool-fn nil "test.png")))
                                                 (expect result :to-match "gptel media send option is off"))))
                                         (it "permits access to valid media files inside the workspace without triggering VFS text security locks"
                                             (let* ((gptel-track-media t)
-                                                   (session (make-macher-agent-session :id "test"))
-                                                   (macher-agent--active-fsm 'mock-fsm)
-                                                   (mock-info (list :macher-agent-session session))
                                                    (ctx (macher--make-context :contents nil))
+                                                   (macher-agent--active-fsm (gptel-make-fsm))
+                                                   (mock-info (list :macher-agent-context ctx))
                                                    (tool-fn (gptel-tool-function macher-agent-read-media-in-workspace-tool)))
-                                              (spy-on 'gptel-fsm-info :and-return-value mock-info)
+                                              (setf (gptel-fsm-info macher-agent--active-fsm) mock-info)
                                               (spy-on 'macher-agent-resolve-context :and-return-value ctx)
                                               (spy-on 'macher-agent-context-classify-entry :and-return-value 'media)
                                               (spy-on 'file-exists-p :and-return-value t)
                                               (spy-on 'mailcap-file-name-to-mime-type :and-return-value "image/png")
                                               (spy-on 'insert-file-contents-literally :and-call-fake (lambda (&rest _args) (insert "mock-image-data")))
-                                              (let ((result (funcall tool-fn "test_workspace_image.png")))
+                                              (let ((result (funcall tool-fn nil "test_workspace_image.png")))
                                                 (expect result :to-match "SUCCESS: Media 'test_workspace_image.png'"))))
                                         (it "throws an error if the tool cannot determine MIME type"
                                             (let* ((gptel-track-media t)
@@ -362,86 +361,85 @@
                                               (spy-on 'macher-agent-resolve-context :and-return-value ctx)
                                               (spy-on 'file-exists-p :and-return-value t)
                                               (spy-on 'mailcap-file-name-to-mime-type :and-return-value nil)
-                                              (let ((result (funcall tool-fn "unauthorized_script.sh")))
+                                              (let ((result (funcall tool-fn nil "unauthorized_script.sh")))
                                                 (expect result :to-match "Could not determine MIME type"))))
                                         (it "stages media in the session pending-media instead of polluting gptel-context"
                                             (let* ((gptel-track-media t)
                                                    (gptel-context nil)
-                                                   (session (make-macher-agent-session :id "test"))
-                                                   (macher-agent--active-fsm 'mock-fsm)
-                                                   (mock-info (list :macher-agent-session session))
                                                    (ctx (macher--make-context :contents (list (macher-agent-vfs-make-entry "test.png" "" "img-data"))))
+                                                   (macher-agent--active-fsm (gptel-make-fsm))
+                                                   (mock-info (list :macher-agent-context ctx))
                                                    (tool-fn (gptel-tool-function macher-agent-read-media-in-workspace-tool)))
-                                              (spy-on 'gptel-fsm-info :and-return-value mock-info)
+                                              (setf (gptel-fsm-info macher-agent--active-fsm) mock-info)
                                               (spy-on 'macher-agent-resolve-context :and-return-value ctx)
                                               (spy-on 'mailcap-file-name-to-mime-type :and-return-value "image/png")
                                               (spy-on 'file-exists-p :and-return-value t)
-                                              (let ((result (funcall tool-fn "test.png")))
+                                              (let ((result (funcall tool-fn nil "test.png")))
                                                 (expect result :to-match "SUCCESS: Media")
                                                 (expect gptel-context :to-be nil)
-                                                (expect (car (car (macher-agent-session-pending-media session))) :to-equal "aW1nLWRhdGE="))))
+                                                (expect (car (car (macher-agent--get-context-data ctx :pending-media))) :to-equal "aW1nLWRhdGE="))))
 
                                         (it "injects pending media into FSM payload and clears the queue pre-flight"
                                             (let* ((buf (current-buffer))
                                                    (mock-backend 'mock-backend)
                                                    (mock-data '((:role "system" :content "sys")))
-                                                   (session (make-macher-agent-session :id "test" :pending-media '(("mockbase64" :mime "image/png"))))
-                                                   (mock-info (list :buffer buf :backend mock-backend :data mock-data :macher-agent-session session))
-                                                   
+                                                   (ctx (macher--make-context :contents nil))
+                                                   (mock-info (list :buffer buf :backend mock-backend :data mock-data :macher-agent-context ctx))
+
                                                    ;; We can safely use a mock symbol again!
-                                                   (mock-fsm 'mock-fsm)
-                                                   
+                                                   (mock-fsm (gptel-make-fsm))
+
                                                    (orig-called nil)
                                                    (orig-fun (lambda (fsm &rest _) (setq orig-called fsm))))
-                                              
-                                              ;; Spy on the accessor to intercept the dynamic funcall
-                                              (spy-on 'gptel-fsm-info :and-return-value mock-info)
+
+                                              (macher-agent--set-context-data ctx :pending-media '(("mockbase64" :mime "image/png")))
+
+                                              (setf (gptel-fsm-info mock-fsm) mock-info)
                                               (spy-on 'gptel--inject-media)
                                               (spy-on 'gptel--inject-prompt)
-                                              
+
                                               ;; Execute the restored advice
                                               (macher-agent--inject-media-fsm-advice orig-fun mock-fsm)
-                                              
+
                                               ;; Verify injection lifecycle
-                                              (expect 'gptel-fsm-info :to-have-been-called-with mock-fsm)
                                               (expect 'gptel--inject-media :to-have-been-called)
                                               (expect 'gptel--inject-prompt :to-have-been-called)
                                               (expect orig-called :to-equal mock-fsm)
-                                              (expect (macher-agent-session-pending-media session) :to-be nil))))
+                                              (expect (macher-agent--get-context-data ctx :pending-media) :to-be nil))))
 
                               (describe "rsync command building"
-                                        
+
                                         (it "constructs a shell string using git ls-files"
                                             ;; Intercept call-process to return 0 (success).
                                             ;; This simulates a valid git repository and bypasses the physical directory check.
                                             (spy-on 'call-process :and-return-value 0)
-                                            
+
                                             (let* ((src "/my/project/")
                                                    (dest "/tmp/sandbox/")
                                                    (cmd (macher-agent--build-rsync-cmd src dest)))
-                                              
+
                                               (expect (stringp cmd) :to-be t)
-                                              (expect (string-match-p "git ls-files" cmd) :to-be-truthy)
-                                              (expect (string-match-p "rsync -aLC --delete --files-from=-" cmd) :to-be-truthy)
-                                              
+                                              (expect (string-match-p "git .*ls-files" cmd) :to-be-truthy)
+                                              (expect (string-match-p "rsync -aLC --delete --from0 --files-from=-" cmd) :to-be-truthy)
+
                                               ;; Optional but good practice: verify our mock was actually triggered
                                               (expect 'call-process :to-have-been-called-with
                                                       "git" nil nil nil "rev-parse" "--is-inside-work-tree")))))
 
                     (describe "Macher-Agent Tool Category Isolation"
-                              
+
                               (it "preserves the custom category to avoid being purged by upstream read-only presets"
-                                  (let ((mock-tool (gptel-make-tool :name "my_custom_tool" 
-                                                                    :function #'ignore 
-                                                                    :category "macher-agent-calendar" 
-                                                                    :description "test" 
+                                  (let ((mock-tool (gptel-make-tool :name "my_custom_tool"
+                                                                    :function #'ignore
+                                                                    :category "macher-agent-calendar"
+                                                                    :description "test"
                                                                     :args nil))
                                         ;; Extract the clearing function from the upstream preset definition
                                         (clear-fn (plist-get (plist-get macher--preset-clear-tools :tools) :function)))
-                                    
+
                                     ;; The custom tool MUST maintain its distinct category boundary
                                     (expect (gptel-tool-category mock-tool) :not :to-equal macher-tool-category)
-                                    
+
                                     ;; It MUST survive the upstream framework's aggressive tool purge
                                     (let ((filtered-tools (funcall clear-fn (list mock-tool))))
                                       (expect (length filtered-tools) :to-equal 1)
@@ -469,46 +467,46 @@
                                               (delete-directory sandbox-dir t))))
 
                               (describe "macher-agent--vfs-apply-overlay"
-                                        
+
                                         (it "reroutes virtual edits to the ephemeral sandbox, protecting the physical disk"
                                             (let* ((workspace-root "/my/project/")
                                                    (sandbox-dir "/tmp/sandbox-12345/")
                                                    ;; Create a mock context representing a dirty workspace
-                                                   (mock-ws (cons 'agent workspace-root))
-                                                   (mock-ctx (macher--make-context :dirty-p t 
+                                                   (mock-ws (make-macher-agent-workspace :project-root workspace-root))
+                                                   (mock-ctx (macher--make-context :dirty-p t
                                                                                    :workspace mock-ws
                                                                                    :contents (list (macher-agent-vfs-make-entry "/my/project/src/main.rs" "orig" "new content"))))
                                                    (write-region-called-with nil))
-                                              
+
                                               ;; Spy on file-in-directory-p to allow mock/non-existent sandbox directories
                                               (spy-on 'file-in-directory-p :and-return-value t)
 
                                               ;; Mock the context root provider (struct access)
                                               (spy-on 'macher--workspace-root :and-return-value workspace-root)
-                                              
+
                                               ;; Intercept the destructive write action
-                                              (spy-on 'write-region :and-call-fake 
+                                              (spy-on 'write-region :and-call-fake
                                                       (lambda (start _end filename &rest _)
                                                         (push (list start filename) write-region-called-with)))
-                                              
+
                                               (macher-agent--vfs-apply-overlay mock-ctx sandbox-dir)
-                                              
+
                                               ;; The orchestrator MUST execute a file write...
                                               (expect 'write-region :to-have-been-called)
-                                              
+
                                               ;; ...it MUST write the new virtual content...
                                               (expect (caar write-region-called-with) :to-equal "new content")
-                                              
+
                                               ;; ...and CRITICALLY, it MUST write it to the sandbox, NOT the physical /my/project/ path!
                                               (expect (cadar write-region-called-with) :to-equal "/tmp/sandbox-12345/src/main.rs")))
 
                                         (it "does not flush anything if the virtual memory is clean"
                                             (let* ((mock-ctx (macher--make-context :dirty-p nil :contents nil)))
-                                              
+
                                               (spy-on 'write-region)
-                                              
+
                                               (macher-agent--vfs-apply-overlay mock-ctx "/tmp/sandbox-12345/")
-                                              
+
                                               ;; Ensure no ghost files are created in the sandbox
                                               (expect 'write-region :not :to-have-been-called))))
 
@@ -518,34 +516,34 @@
                                               (spy-on 'macher-agent--vfs-verify-clean-merge :and-call-fake (lambda (&rest _) (push 'merge call-order)))
                                               (spy-on 'macher-agent--vfs-sync-baseline :and-call-fake (lambda (&rest _) (push 'sync call-order)))
                                               (spy-on 'macher-agent--vfs-apply-overlay :and-call-fake (lambda (&rest _) (push 'overlay call-order)))
-                                              
+
                                               ;; Execute a dummy tool
                                               (let ((mock-context (macher--make-context :workspace nil :contents nil)))
                                                 (spy-on 'macher-agent-context-root :and-return-value "/my/project/")
                                                 (spy-on 'make-temp-file :and-return-value "/tmp/sandbox-12345/")
                                                 (spy-on 'delete-directory)
                                                 (spy-on 'shell-command-to-string :and-return-value "running")
-                                                
+
                                                 (macher-agent-with-strict-vfs-pipeline mock-context
                                                                                        (shell-command-to-string "echo 'running'")))
-                                              
+
                                               ;; 1. Assert they were all called
                                               (expect 'macher-agent--vfs-verify-clean-merge :to-have-been-called)
                                               (expect 'macher-agent--vfs-sync-baseline :to-have-been-called)
                                               (expect 'macher-agent--vfs-apply-overlay :to-have-been-called)
-                                              
+
                                               ;; 2. Assert exact execution order
                                               (expect (reverse call-order) :to-equal '(merge sync overlay))))
-                                        
+
                                         (it "does not mangle OS-level absolute sandbox paths during rsync"
                                             ;; This specific test prevents the regression we just experienced
                                             (spy-on 'macher-agent--build-rsync-cmd :and-return-value "echo dummy")
                                             (spy-on 'delete-directory)
-                                            
+
                                             (let ((mock-context (macher--make-context :workspace nil :contents nil)))
                                               (spy-on 'macher-agent-context-root :and-return-value "/my/project/")
                                               (macher-agent-with-strict-vfs-pipeline mock-context nil))
-                                            
+
                                             ;; The destination argument to rsync MUST be an absolute path in /tmp or /var
                                             (let ((rsync-dest-arg (nth 1 (spy-calls-args-for 'macher-agent--build-rsync-cmd 0))))
                                               (expect (file-name-absolute-p rsync-dest-arg) :to-be t)))))
@@ -560,7 +558,8 @@
                                     (kill-buffer buf)))
                               (it "macher-agent-add-subagent creates a buffer and tracks it globally"
                                   (let* ((mock-workspace (make-macher-agent-workspace :project-root "/tmp/"))
-                                         (mock-context (macher-agent--make-vfs-context :workspace (cons 'agent mock-workspace) :contents nil)))
+                                         (mock-context (macher-agent--make-vfs-context :workspace mock-workspace :contents nil)))
+                                    (puthash (expand-file-name "/tmp/") mock-context macher-agent-active-workspaces)
                                     (spy-on 'macher-agent-resolve-context :and-return-value mock-context)
                                     (let ((buf (macher-agent-add-subagent "test-worker" "/tmp/" nil mock-context)))
                                       (expect (buffer-live-p buf) :to-be t)
@@ -571,12 +570,12 @@
                                   (let* ((buf (generate-new-buffer "live-target"))
                                          (ctx (macher--make-context :contents (list (macher-agent-vfs-make-entry (buffer-name buf) "old" "new text")))))
                                     (with-current-buffer buf (insert "old"))
-                                    
+
                                     (spy-on 'macher-agent-resolve-context :and-return-value ctx)
                                     (spy-on 'macher-agent--auto-sync-context)
-                                    
+
                                     (macher-agent-apply-virtual-buffers)
-                                    
+
                                     (with-current-buffer buf
                                       (expect (buffer-string) :to-equal "new text"))
                                     (kill-buffer buf)))
@@ -627,27 +626,26 @@
                                              "Mock async tool"
                                            :category "test"
                                            :args (list (list :name "arg1" :type 'string) (list :name "arg2" :type 'string))
-                                           :command-fn (lambda (payload)
+                                           :command-fn (lambda (payload _context _root)
                                                          (make-macher-agent-lisp-result-response :payload (format "Async %s %s" (plist-get payload :arg1) (plist-get payload :arg2)))))
 
                                          (macher-agent-make-tool mock-sync-contract-tool
                                              "Mock sync tool"
                                            :category "test"
                                            :args (list (list :name "arg1" :type 'string))
-                                           :command-fn (lambda (payload)
+                                           :command-fn (lambda (payload _context _root)
                                                          (make-macher-agent-lisp-result-response :payload (format "Sync %s" (plist-get payload :arg1))))))
 
                                         (it "generates variadic signatures for async tools to safely absorb FSM contexts"
                                             (let* ((tool-fn (gptel-tool-function mock-async-contract-tool))
                                                    (arity (func-arity tool-fn)))
-                                              ;; A variadic &rest signature always has a minimum of 0 and a maximum of 'many
-                                              (expect (car arity) :to-equal 0)
+                                              (expect (car arity) :to-equal 1)
                                               (expect (cdr arity) :to-equal 'many)))
 
                                         (it "generates variadic signatures for sync tools to safely absorb FSM contexts"
                                             (let* ((tool-fn (gptel-tool-function mock-sync-contract-tool))
                                                    (arity (func-arity tool-fn)))
-                                              (expect (car arity) :to-equal 0)
+                                              (expect (car arity) :to-equal 1)
                                               (expect (cdr arity) :to-equal 'many))))
 
                               (describe "Tool Lifecycle Hooks"
@@ -671,8 +669,8 @@
                                                           (setq pre-called (list name args))
                                                           nil))
                                               (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       "hello"
-                                                       (lambda (res) (setq callback-result res)))
+                                                       (lambda (res) (setq callback-result res))
+                                                       "hello")
                                               (expect pre-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "hello")))
                                               (expect callback-result :to-match "Execution blocked by macher-agent-pre-tool-use-hook")))
 
@@ -682,15 +680,15 @@
                                                         (lambda (_name _args)
                                                           (error "Custom pre error")))
                                               (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       "hello"
-                                                       (lambda (res) (setq callback-result res)))
+                                                       (lambda (res) (setq callback-result res))
+                                                       "hello")
                                               (expect callback-result :to-match "Execution blocked by error in macher-agent-pre-tool-use-hook: Custom pre error")))
 
                                         (it "runs permission-request-hook and succeeds by default if empty"
                                             (let ((callback-result nil))
                                               (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       "hello"
-                                                       (lambda (res) (setq callback-result res)))
+                                                       (lambda (res) (setq callback-result res))
+                                                       "hello")
                                               (expect callback-result :to-match "Sync hello")))
 
                                         (it "runs permission-request-hook and aborts if it returns nil"
@@ -701,8 +699,8 @@
                                                           (setq perm-called (list name args))
                                                           nil))
                                               (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       "hello"
-                                                       (lambda (res) (setq callback-result res)))
+                                                       (lambda (res) (setq callback-result res))
+                                                       "hello")
                                               (expect perm-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "hello")))
                                               (expect callback-result :to-match "Permission denied by macher-agent-permission-request-hook")))
 
@@ -713,8 +711,8 @@
                                                         (lambda (name args result)
                                                           (setq post-called (list name args result))))
                                               (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       "world"
-                                                       (lambda (res) (setq callback-result res)))
+                                                       (lambda (res) (setq callback-result res))
+                                                       "world")
                                               (expect callback-result :to-match "Sync world")
                                               (expect post-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "world") "Sync world"))))
 
@@ -723,7 +721,7 @@
                                                 "Mock error tool"
                                               :category "test"
                                               :args (list (list :name "arg1" :type 'string))
-                                              :command-fn (lambda (_payload)
+                                              :command-fn (lambda (_payload _context _root)
                                                             (error "Failing intentionally")))
                                             (let ((failure-called nil)
                                                   (callback-result nil))
@@ -731,13 +729,13 @@
                                                         (lambda (name args err)
                                                           (setq failure-called (list name args err))))
                                               (funcall (gptel-tool-function mock-error-tool)
-                                                       "fail"
-                                                       (lambda (res) (setq callback-result res)))
+                                                       (lambda (res) (setq callback-result res))
+                                                       "fail")
                                               (expect callback-result :to-match "Failing intentionally")
                                               (expect (car failure-called) :to-be 'mock-error-tool)
                                               (expect (cadr failure-called) :to-equal '(:arg1 "fail"))
                                               (expect (error-message-string (caddr failure-called)) :to-equal "Failing intentionally"))))
-                              
+
                               (describe "Agent Skills (macher-agent-skills.el)"
                                         (before-each
                                          (spy-on 'macher-agent-resolve-context :and-return-value
@@ -765,18 +763,18 @@
                                               (make-directory mock-script-dir t)
                                               (with-temp-file mock-script-path
                                                 (insert "(setq workspace-tool-1 'workspace-loaded)"))
-                                              
+
                                               ;; Test workspace parsing logic
                                               (macher-agent--load-skill-from-path "tests/fixtures/skills/workspace/" (macher-agent-resolve-context))
                                               (let* ((workspace (macher-agent--get-context-workspace (macher-agent-resolve-context)))
                                                      (skill-meta (alist-get 'workspace-skill (macher-agent-workspace-skills-alist workspace))))
                                                 (expect (plist-get skill-meta :context-dir) :to-be nil))
-                                              
+
                                               ;; Resolution should fail to load because context-dir is nil,
                                               ;; returning the raw string fallback instead of a loaded tool object.
                                               (let ((resolved (macher-agent-resolve-tool "workspace-tool-1" nil nil)))
                                                 (expect resolved :to-equal "workspace-tool-1"))
-                                              
+
                                               (delete-directory mock-script-dir t)))
 
                                         (it "verifies tool resolution hierarchy (workspace shadows package tools)"
@@ -795,21 +793,21 @@
                                               (with-temp-file (expand-file-name "tool-b.el" pkg-scripts) (insert "(setq tool-b mock-pkg-b-global)"))
                                               ;; Workspace overrides tool-a
                                               (with-temp-file (expand-file-name "tool-a.el" ws-scripts) (insert "(setq tool-a mock-ws-a-global)"))
-                                              
+
                                               ;; Clear registry
                                               (let* ((ctx (macher-agent-resolve-context))
                                                      (ws (macher-agent--get-context-workspace ctx)))
                                                 (clrhash (macher-agent-workspace-tools-registry ws)))
-                                              
+
                                               ;; Resolve pkg first, then workspace shadows
                                               (let* ((res-pkg-b (macher-agent-resolve-tool "tool-b" nil pkg-dir))
                                                      (res-ws-a (macher-agent-resolve-tool "tool-a" nil ws-dir)))
                                                 (expect res-pkg-b :to-equal pkg-b)
                                                 (expect res-ws-a :to-equal ws-a))
-                                              
+
                                               (delete-directory pkg-dir t)
                                               (delete-directory ws-dir t)))
-                                        
+
                                         (it "applies skill tools correctly into gptel-tools when selected"
                                             (let* ((gptel-tools nil)
                                                    (gptel--known-presets nil)
@@ -821,10 +819,10 @@
                                               (let* ((ctx (macher-agent-resolve-context))
                                                      (workspace (macher-agent--get-context-workspace ctx)))
                                                 (puthash "selected-tool" mock-tool-obj (macher-agent-workspace-tools-registry workspace))
-                                                
+
                                                 (setf (alist-get 'test-preset (macher-agent-workspace-skills-alist workspace))
                                                       (list :description "test" :system "Directive body" :tools (list mock-tool-obj) :context-dir nil))
-                                                
+
                                                 (with-temp-buffer
                                                   (let ((gptel--known-presets nil))
                                                     (macher-agent-initialize-skills ctx)
@@ -844,7 +842,7 @@
                                                 (let ((gptel-directives nil)
                                                       (gptel--known-presets nil))
                                                   (macher-agent-initialize-skills nil mock-dir)
-                                                  
+
                                                   (let ((preset-def (alist-get 'my-preset gptel--known-presets)))
                                                     (expect preset-def :not :to-be nil)
                                                     (expect (plist-get preset-def :system) :to-equal "Preset body")
