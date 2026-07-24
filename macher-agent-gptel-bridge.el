@@ -376,5 +376,63 @@ Return nil."
 
 (add-hook 'gptel-mode-hook #'macher-agent-setup-gptel-buffer)
 
+(defun macher--transform-setup-tools (callback fsm)
+  "A gptel prompt transform to set up macher tools and behaviour.
+Shadowed by macher-agent to bypass upstream's file-only buffer capture
+and securely inject the persistent VFS context."
+  (let* ((prompt (buffer-string))
+         (process-request-function macher-process-request-function)
+         (context-or-t nil)
+         (get-context
+          (lambda ()
+            (unless context-or-t
+              (let* ((info (gptel-fsm-info fsm))
+                     (buffer (plist-get info :buffer)))
+                (when (plist-get info :macher--context)
+                  (error "Macher context already present on FSM during setup"))
+                (unless buffer
+                  (error "Trying to set up macher tools, but could not determine request buffer"))
+                (setq context-or-t
+                      (if (buffer-live-p buffer)
+                          (let ((agent-ctx (buffer-local-value 'macher-agent--persistent-context buffer)))
+                            (if agent-ctx
+                                (progn
+                                  (setf (macher-context-prompt agent-ctx) prompt)
+                                  (setf (macher-context-process-request-function agent-ctx) process-request-function)
+                                  (setq info (plist-put info :macher--context agent-ctx))
+                                  (setq info (plist-put info :macher-agent-context agent-ctx))
+                                  (setf (gptel-fsm-info fsm) info)
+                                  agent-ctx)
+                              (if-let* ((workspace (with-current-buffer buffer (macher-workspace buffer))))
+                                  (let ((context (macher--make-context :workspace workspace
+                                                                       :prompt prompt
+                                                                       :process-request-function process-request-function)))
+                                    (setq info (plist-put info :macher--context context))
+                                    (setq info (plist-put info :macher-agent-context context))
+                                    (setf (gptel-fsm-info fsm) info)
+                                    (with-current-buffer buffer (setq macher--fsm-latest fsm))
+                                    context)
+                                t)))
+                        t))))
+            (if (eq context-or-t t) nil context-or-t)))
+         (init-handler-invoked nil)
+         (init-handler
+          (lambda (fsm)
+            (unless init-handler-invoked
+              (setq init-handler-invoked t)
+              (macher--setup-tools fsm get-context))))
+         (termination-handler
+          (lambda (fsm)
+            (when (and context-or-t (funcall get-context))
+              (let* ((ctx (funcall get-context))
+                     (info (gptel-fsm-info fsm))
+                     (buffer (plist-get info :buffer)))
+                (let ((protected-contents (copy-sequence (macher-agent--get-context-contents ctx))))
+                  (funcall process-request-function 'complete ctx fsm)
+                  (macher-agent--set-context-contents ctx protected-contents)))))))
+    (macher--add-transition-handler fsm init-handler)
+    (macher--add-termination-handler fsm termination-handler))
+  (funcall callback))
+
 (provide 'macher-agent-gptel-bridge)
 ;;; macher-agent-gptel-bridge.el ends here
