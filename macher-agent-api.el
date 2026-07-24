@@ -315,6 +315,7 @@ Return a property list containing skill properties."
                 :has-tools has-tools
                 :allowed-tools (gethash "allowed-tools" fm-hash)
                 :exclusive (gethash "exclusive" fm-hash)
+                :ptc-primitives (gethash "ptc-primitives" fm-hash)
                 :body body))))))
 
 (defun macher-agent--secure-ast-p (form)
@@ -629,6 +630,7 @@ Return nil."
              (model (plist-get parsed :model))
              (tool-names (plist-get parsed :allowed-tools))
              (exclusive (plist-get parsed :exclusive))
+             (ptc-primitives (plist-get parsed :ptc-primitives))
              (workspace (when context (macher-agent--get-context-workspace context)))
              (skill-base-dir (file-name-directory skill-file)))
 
@@ -644,7 +646,7 @@ Return nil."
                                                        (macher-agent-resolve-tool tname registry skill-base-dir context))
                                                      tool-names)))))
             (setf (alist-get sym alist)
-                  (list :system body :description desc :model (when model (intern model)) :tools resolved-tools :exclusive exclusive))
+                  (list :system body :description desc :model (when model (intern model)) :tools resolved-tools :exclusive exclusive :ptc-primitives ptc-primitives))
             (if workspace
                 (setf (macher-agent-workspace-skills-alist workspace) alist)
               (setq macher-agent-global-skills-alist alist))))))))
@@ -737,6 +739,7 @@ Return nil."
                for model = (plist-get meta :model)
                for tools = (plist-get meta :tools)
                for exclusive = (plist-get meta :exclusive)
+               for ptc-primitives = (plist-get meta :ptc-primitives)
                for tool-names = (mapcar #'macher-agent-canonical-tool-name tools)
                do (when system-prompt
                     (setf (alist-get sym gptel-directives) system-prompt)
@@ -746,6 +749,7 @@ Profile: %s" sym))
                       (when exclusive
                         (setq preset-spec (plist-put preset-spec :exclusive t)))
                       (when model (setq preset-spec (plist-put preset-spec :model model)))
+                      (when ptc-primitives (setq preset-spec (plist-put preset-spec :ptc-primitives ptc-primitives)))
                       (when tool-names
                         (setq preset-spec (plist-put preset-spec :tools
                                                      (if exclusive

@@ -23,6 +23,123 @@
 
 (defvar gptel-system-prompt)
 
+(defvar-local macher-agent--active-ptc-primitives nil
+  "List of active PTC primitives for the current buffer.")
+
+(defun macher-agent--format-tool-lisp-docstring (tool-obj)
+  "Infer a declarative Lisp signature for TOOL-OBJ using defun and cl-deftype compiler hints."
+  (let* ((name (gptel-tool-name tool-obj))
+         (lisp-name (intern (replace-regexp-in-string "_" "-" name)))
+         (desc (gptel-tool-description tool-obj))
+         (args (gptel-tool-args tool-obj))
+         (deftypes nil)
+         (arg-names nil)
+         (arg-types nil)
+         (is-delegate (string-match-p "delegate" name))
+         (return-type (if is-delegate '(list string) 'string))
+         (dummy-return (if is-delegate "(list \"\")" "\"\"")))
+
+    (dolist (arg args)
+      (let* ((raw-name (if (symbolp (plist-get arg :name))
+                           (symbol-name (plist-get arg :name))
+                         (plist-get arg :name)))
+             (lisp-arg-name (replace-regexp-in-string "_" "-" raw-name))
+             (arg-type (plist-get arg :type))
+             (items (plist-get arg :items))
+             (props (when items (plist-get items :properties)))
+             (type-spec nil))
+
+        (push lisp-arg-name arg-names)
+
+        (cond
+         ((and (member arg-type '(array "array")) props)
+          (let ((type-name (intern (format "%s-%s" lisp-name lisp-arg-name)))
+                (prop-strs nil))
+            (cl-loop for (p-key p-val) on props by #'cddr
+                     for p-type = (plist-get p-val :type)
+                     do (push (format ":%s %s"
+                                      p-key
+                                      (pcase p-type
+                                        ((or 'string "string") 'string)
+                                        ((or 'number "number") 'number)
+                                        ((or 'boolean "boolean") 'boolean)
+                                        ((or 'array "array") '(or null (list string)))
+                                        (_ 't)))
+                              prop-strs))
+            (push (format "(cl-deftype %s () \n  \"Property list for %s.\"\n  '(plist %s))"
+                          type-name lisp-arg-name
+                          (string-join (nreverse prop-strs) " "))
+                  deftypes)
+            (setq type-spec (list 'list type-name))))
+
+         ((member arg-type '(array "array"))
+          (setq type-spec '(or null (list string))))
+
+         ((member arg-type '(object "object"))
+          (setq type-spec 'plist))
+
+         (t
+          (setq type-spec (pcase arg-type
+                            ((or 'string "string") 'string)
+                            ((or 'number "number") 'number)
+                            ((or 'boolean "boolean") 'boolean)
+                            (_ 't)))))
+
+        (push type-spec arg-types)))
+
+    (let* ((formatted-arg-types (mapcar (lambda (t-spec)
+                                          (if (symbolp t-spec)
+                                              (symbol-name t-spec)
+                                            (prin1-to-string t-spec)))
+                                        (nreverse arg-types)))
+           (defun-str
+            (format "%s -> (defun %s (%s)\n  %S\n  (declare (type (function (%s) %s)))\n  %s)"
+                    name
+                    lisp-name
+                    (string-join (nreverse arg-names) " ")
+                    desc
+                    (string-join formatted-arg-types " ")
+                    (if (symbolp return-type)
+                        (symbol-name return-type) (prin1-to-string return-type))
+                    dummy-return)))
+      (if deftypes
+          (concat (string-join (nreverse deftypes) "\n\n") "\n\n" defun-str)
+        defun-str))))
+
+(defun macher-agent--inject-ptc-prompt
+    (existing-prompt &optional active-primitives available-tools)
+  "Dynamically append PTC instructions with compiler hints."
+  (let*
+      ((active (or active-primitives (bound-and-true-p macher-agent--active-ptc-primitives)))
+       (tools (or available-tools (bound-and-true-p gptel-tools)))
+       (matching-tools
+        (cl-loop for t-obj in tools
+                 when
+                 (and (gptel-tool-p t-obj)
+                      (cl-some
+                       (lambda (prim)
+                         (string=
+                          (replace-regexp-in-string "_" "-"
+                                                    (if
+                                                        (symbolp prim)
+                                                        (symbol-name prim) prim))
+                          (replace-regexp-in-string "_" "-" (gptel-tool-name t-obj))))
+                       active))
+                 collect t-obj)))
+    (if (null matching-tools)
+        existing-prompt
+      (concat (if-let* ((prompt existing-prompt)) prompt "")
+              "\n\n=== PROGRAMMATIC TOOL CALLING (PTC) ===
+You are equipped with a `ptc_execution` tool. Instead of outputting multiple sequential \
+JSON tool calls, you MUST use `ptc_execution` to orchestrate complex tasks via an Emacs \
+Lisp script.
+
+lisp tool aliases:\n"
+              (string-join
+               (mapcar #'macher-agent--format-tool-lisp-docstring matching-tools) "\n\n")
+              "\n\n;; EXPECTED SCRIPT RETURN TYPE:
+Keep everything within a let*. Return the output object without formatting.\n"))))
+
 (defun macher-agent-sync-prompt-transformer (async-fn fsm)
   "Synchronise the VFS and normalise the active tools list.
 Compose skill profiles securely.
@@ -106,13 +223,21 @@ Return the result of ASYNC-FN."
                                   (macher-agent-compose-payload base-state all-skills))))
 
                   (when payload
-                    (let* ((sys-payload (when remaining-skills
-                                          (macher-agent-compose-payload base-state remaining-skills)))
-                           (final-sys-prompt (if sys-payload
-                                                 (plist-get sys-payload :system)
-                                               (plist-get base-state :system))))
+                    (let*
+                        ((sys-payload
+                          (when remaining-skills
+                            (macher-agent-compose-payload base-state remaining-skills)))
+                         (final-sys-prompt (if sys-payload
+                                               (plist-get sys-payload :system)
+                                             (plist-get base-state :system)))
+                         (composed-active (plist-get payload :ptc-primitives))
+                         (composed-tools (plist-get payload :tools)))
 
-                      (setq payload (plist-put payload :system final-sys-prompt)))
+                      (setq payload
+                            (plist-put payload
+                                       :system
+                                       (macher-agent--inject-ptc-prompt
+                                        final-sys-prompt composed-active composed-tools))))
 
                     (macher-agent--apply-payload-locally payload)
 
@@ -125,7 +250,9 @@ Return the result of ASYNC-FN."
 
                   (when redirected-skill
                     (when-let* ((dummy-base (plist-put (copy-sequence base-state) :system ""))
-                                (dummy-payload (macher-agent-compose-payload dummy-base (list redirected-skill)))
+                                (dummy-payload
+                                 (macher-agent-compose-payload dummy-base
+                                                               (list redirected-skill)))
                                 (sys-prompt (plist-get dummy-payload :system))
                                 ((stringp sys-prompt))
                                 ((not (string-empty-p sys-prompt))))
@@ -167,22 +294,21 @@ Return nil."
          (error-cb (plist-get callbacks :on-error)))
 
     (with-current-buffer target-buffer
-      (setq-local gptel-system-prompt sys-msg)
+      (setq-local gptel-system-prompt (macher-agent--inject-ptc-prompt sys-msg))
 
       (let ((response-hook nil))
         (setq response-hook
               (lambda (_beg _end)
-                (let ((res (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
+                (let
+                    ((res
+                      (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
 
-                  (if (and (macher-agent-subagent-p)
-                           (not (string-empty-p res)))
-                      (message "DEBUG BRIDGE: Stream ended for sub-agent. Deferring to tool execution...")
-
-                    (if (not (string-empty-p res))
-                        (when success-cb (funcall success-cb res))
-                      (when error-cb (funcall error-cb "Buffer stopped silently or returned empty.")))
-
-                    (remove-hook 'gptel-post-response-functions response-hook t)))))
+                  (if (macher-agent-subagent-p)
+                      (if (not (string-empty-p res))
+                          (when success-cb (funcall success-cb res))
+                        (when error-cb
+                          (funcall error-cb "Buffer stopped silently or returned empty."))))
+                  (remove-hook 'gptel-post-response-functions response-hook t))))
 
         (add-hook 'gptel-post-response-functions response-hook nil t))
 
@@ -203,10 +329,10 @@ Return nil."
                (pending (when ctx (macher-agent--get-context-data ctx :pending-media))))
 
           (when pending
-            ;; Use let* so subsequent bindings can reference earlier ones sequentially
             (let* ((macher-agent--in-media-injection t)
                    (msg-plist (list :role "user"
-                                    :content "Tool execution complete. Here is the requested visual data:"))
+                                    :content "Tool execution complete. \
+Here is the requested visual data:"))
                    (prompts (list msg-plist))
                    (gptel-context pending))
 
@@ -274,12 +400,16 @@ Return the result of ORIG-FUN."
         (when ctx
           (when current-root
             (puthash (expand-file-name current-root) ctx macher-agent-active-workspaces)
-            (puthash (file-name-as-directory (expand-file-name current-root)) ctx macher-agent-active-workspaces)
-            (puthash (directory-file-name (expand-file-name current-root)) ctx macher-agent-active-workspaces))
+            (puthash (file-name-as-directory
+                      (expand-file-name current-root)) ctx macher-agent-active-workspaces)
+            (puthash (directory-file-name
+                      (expand-file-name current-root)) ctx macher-agent-active-workspaces))
           (when-let* ((ctx-root (ignore-errors (macher-agent-context-root ctx))))
             (puthash (expand-file-name ctx-root) ctx macher-agent-active-workspaces)
-            (puthash (file-name-as-directory (expand-file-name ctx-root)) ctx macher-agent-active-workspaces)
-            (puthash (directory-file-name (expand-file-name ctx-root)) ctx macher-agent-active-workspaces))
+            (puthash (file-name-as-directory
+                      (expand-file-name ctx-root)) ctx macher-agent-active-workspaces)
+            (puthash (directory-file-name
+                      (expand-file-name ctx-root)) ctx macher-agent-active-workspaces))
           (macher-agent-initialize-skills ctx)))
       res)))
 
@@ -324,7 +454,9 @@ Return a block list if the tool is out of scope, otherwise nil."
          (fsm-tools (when info (plist-get info :tools)))
          (authorised-names (mapcar #'macher-agent-canonical-tool-name fsm-tools)))
     (unless (and canonical-name (member canonical-name authorised-names))
-      (list :block (format "ERROR: Tool '%s' is out of scope. It was not provided to this sub-agent." (or canonical-name tool))))))
+      (list
+       :block (format "ERROR: Tool '%s' is out of scope. It was not provided to this \
+sub-agent." (or canonical-name tool))))))
 
 (defun macher-agent-setup-gptel-buffer ()
   "Set up a gptel buffer with macher-agent capabilities if in an active agent session.
@@ -336,7 +468,8 @@ Return nil."
       (when (bound-and-true-p macher-agent--is-restored-session)
         (setq-local macher-agent-presets nil)
         (setq-local macher-agent--is-restored-session nil))
-      (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
+      (add-hook 'gptel-prompt-transform-functions
+                #'macher-agent-sync-prompt-transformer nil t)
       (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t))))
 
 (add-hook 'gptel-mode-hook #'macher-agent-setup-gptel-buffer)
@@ -356,22 +489,33 @@ and securely inject the persistent VFS context."
                 (when (plist-get info :macher--context)
                   (error "Macher context already present on FSM during setup"))
                 (unless buffer
-                  (error "Trying to set up macher tools, but could not determine request buffer"))
+                  (error
+                   "Trying to set up macher tools, but could not determine request buffer"))
                 (setq context-or-t
                       (if (buffer-live-p buffer)
-                          (let ((agent-ctx (buffer-local-value 'macher-agent--persistent-context buffer)))
+                          (let
+                              ((agent-ctx
+                                (buffer-local-value
+                                 'macher-agent--persistent-context buffer)))
                             (if agent-ctx
                                 (progn
                                   (setf (macher-context-prompt agent-ctx) prompt)
-                                  (setf (macher-context-process-request-function agent-ctx) process-request-function)
+                                  (setf
+                                   (macher-context-process-request-function
+                                    agent-ctx) process-request-function)
                                   (setq info (plist-put info :macher--context agent-ctx))
                                   (setq info (plist-put info :macher-agent-context agent-ctx))
                                   (setf (gptel-fsm-info fsm) info)
                                   agent-ctx)
-                              (if-let* ((workspace (with-current-buffer buffer (macher-workspace buffer))))
-                                  (let ((context (macher--make-context :workspace workspace
-                                                                       :prompt prompt
-                                                                       :process-request-function process-request-function)))
+                              (if-let*
+                                  ((workspace
+                                    (with-current-buffer buffer (macher-workspace buffer))))
+                                  (let
+                                      ((context
+                                        (macher--make-context :workspace workspace
+                                                              :prompt prompt
+                                                              :process-request-function
+                                                              process-request-function)))
                                     (setq info (plist-put info :macher--context context))
                                     (setq info (plist-put info :macher-agent-context context))
                                     (setf (gptel-fsm-info fsm) info)
@@ -392,7 +536,9 @@ and securely inject the persistent VFS context."
               (let* ((ctx (funcall get-context))
                      (info (gptel-fsm-info fsm))
                      (buffer (plist-get info :buffer)))
-                (let ((protected-contents (copy-sequence (macher-agent--get-context-contents ctx))))
+                (let
+                    ((protected-contents
+                      (copy-sequence (macher-agent--get-context-contents ctx))))
                   (funcall process-request-function 'complete ctx fsm)
                   (macher-agent--set-context-contents ctx protected-contents)))))))
     (macher--add-transition-handler fsm init-handler)

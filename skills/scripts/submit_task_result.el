@@ -1,20 +1,21 @@
 (macher-agent-make-tool macher-agent-submit-task-result-tool
-    "Submit the final result of your assigned task back to the orchestrator."
-  :category "worker"
-  :args '((:name "final_answer" :type string :description "The final answer, data, or \
+			"Submit the final result of your assigned task back to the orchestrator."
+			:category "worker"
+			:args '((:name "final_answer" :type string :description "The final answer, data, or \
 summary of completed work."))
-  :command-fn (lambda (payload _context _root)
-                (when-let* ((final_answer (plist-get payload :final_answer))
-                            ((boundp 'macher-agent--parent-callback))
-                            (callback macher-agent--parent-callback))
+			:command-fn (lambda (payload _context _root)
+				      (when-let* ((final_answer (plist-get payload :final_answer))
+						  ((boundp 'macher-agent--parent-callback))
+						  (callback macher-agent--parent-callback))
 
-                  (funcall callback
-                           (make-macher-agent-tool-response
-                            :status 'success
-                            :data final_answer
-                            :buffer-name (buffer-name (current-buffer))))
+					(funcall callback
+						 (make-macher-agent-tool-response
+						  :status 'success
+						  :data final_answer
+						  :buffer-name (buffer-name (current-buffer))))
 
-                  (setq-local macher-agent-task-finished t)
+					(setq-local macher-agent-task-finished t)
 
-                  (make-macher-agent-lisp-result-response
-                   :payload "SUCCESS: Result submitted."))))
+					(make-macher-agent-lisp-result-response
+					 :payload "SUCCESS: Result submitted."
+					 :ptc-payload final_answer))))

@@ -162,7 +162,7 @@
                                 (expect (macher-agent-vfs-entry-curr contents) :to-equal "goodbye world"))))
                           (kill-buffer buf)))
 
-(it "synchronises context seamlessly when interleaving macher-agent and macher tools"
+		    (it "synchronises context seamlessly when interleaving macher-agent and macher tools"
                         (let* ((proj-dir (file-name-as-directory (expand-file-name "tests/fixtures/interleave-proj")))
                                (file-path (concat proj-dir "interleave.txt")))
                           (make-directory proj-dir t)
@@ -187,7 +187,7 @@
                             (delete-file file-path)
                             (delete-directory proj-dir))))
 
-                                        (it "searches VFS content written by write_buffer_in_workspace using search_in_workspace"
+                    (it "searches VFS content written by write_buffer_in_workspace using search_in_workspace"
                         (let* ((ws (make-macher-agent-workspace :project-root default-directory))
                                (ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
                                (write-fn (gptel-tool-function macher-agent-write-buffer-in-workspace-tool))

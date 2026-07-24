@@ -451,7 +451,6 @@ Return the shell command string."
            (is-git (eq 0 (let ((default-directory safe-src-dir))
                            (call-process "git" nil nil nil "rev-parse" "--is-inside-work-tree")))))
       (if is-git
-          ;; Pass safe list to rsync using null-delimited output, now with --recurse-submodules
           (format "(cd %s && { git -c core.quotePath=false ls-files -z -c --recurse-submodules; git -c core.quotePath=false ls-files -z -o --exclude-standard; }) | rsync -aLC --delete --from0 --files-from=- %s %s"
                   (shell-quote-argument src-dir)
                   (shell-quote-argument src-dir)
