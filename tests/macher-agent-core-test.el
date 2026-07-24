@@ -30,10 +30,11 @@
                           
                           ;; Mock the filesystem returning a newer mtime
                           (spy-on 'file-attributes :and-call-fake
-                                  (lambda (file)
-                                    (if (string= file file-path)
-                                        `(t 1 1 1 ,drifted-mtime ,drifted-mtime ,drifted-mtime 100 "mode" t 1 1)
-                                      nil)))
+                                  (lambda (&rest args)
+                                    (let ((file (car args)))
+                                      (if (string= file file-path)
+                                          `(t 1 1 1 ,drifted-mtime ,drifted-mtime ,drifted-mtime 100 "mode" t 1 1)
+                                        nil))))
                           
                           (let ((threw nil))
                             (condition-case err

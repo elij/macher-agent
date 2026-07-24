@@ -167,8 +167,8 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                        (expect (>= call-count 3) :to-be t)
                        (expect (buffer-string) :to-match "Final output: Hello Workspace")
 
-                       (let ((vfs-entry (cl-find "target-buffer" (macher-agent--get-context-contents ctx)
-                                                 :key #'car :test #'equal)))
+                       (let ((vfs-entry (or (cl-find "target-buffer" (macher-agent--get-context-contents ctx) :key #'car :test #'equal)
+                                   (cl-find (expand-file-name "target-buffer") (macher-agent--get-context-contents ctx) :key #'car :test #'equal))))
                          (expect vfs-entry :not :to-be nil)
                          (when vfs-entry
                            (expect (macher-agent-vfs-entry-curr vfs-entry) :to-equal "Hello Workspace")))))
@@ -206,8 +206,8 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
 
                        (expect (>= call-count 2) :to-be t)
 
-                       (let ((vfs-entry (cl-find "sandbox_test.txt" (macher-agent--get-context-contents ctx)
-                                                 :key #'car :test #'equal)))
+                       (let ((vfs-entry (or (cl-find "sandbox_test.txt" (macher-agent--get-context-contents ctx) :key #'car :test #'equal)
+                                   (cl-find (expand-file-name "sandbox_test.txt") (macher-agent--get-context-contents ctx) :key #'car :test #'equal))))
                          (expect vfs-entry :not :to-be nil)
                          (expect (macher-agent-vfs-entry-curr vfs-entry) :to-equal "sandbox inflated content"))
 
@@ -220,7 +220,118 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                              (expect (buffer-string) :to-equal "sandbox inflated content"))))))
 
                   (when (buffer-live-p parent-buffer) (kill-buffer parent-buffer))
-                  (when (file-exists-p sandbox-dir) (delete-directory sandbox-dir t))))))
+                  (when (file-exists-p sandbox-dir) (delete-directory sandbox-dir t)))))
+
+          (it "reads a workspace buffer first and then applies multi-edit to it"
+              (let ((call-count 0)
+                    (target-buf (generate-new-buffer "read-first-target.txt"))
+                    (parent-buffer (generate-new-buffer "*macher-test-read-then-edit*")))
+                (unwind-protect
+                    (with-current-buffer target-buf
+                      (insert "initial content line 1\ninitial content line 2")
+                      (with-current-buffer parent-buffer
+                        (when (fboundp 'markdown-mode) (markdown-mode))
+                        (when (fboundp 'gptel-mode) (gptel-mode 1))
+                        (when (fboundp 'macher-agent-mode) (macher-agent-mode 1))
+
+                        (insert "Read read-first-target.txt and then edit line 2.")
+
+                        (with-macher-agent-test-context
+                         '(("macher-test-read-then-edit" .
+                            ((:text nil :tool-use (("read_buffer_in_workspace" "read-first-target.txt")))
+                             (:text nil :tool-use (("multi_edit_buffer_in_workspace" "read-first-target.txt" [(:old_text "initial content line 2" :new_text "modified line 2")])))
+                             (:text "Edit complete" :tool-use nil))))
+                         call-count
+
+                         (if (fboundp 'macher-agent-send)
+                             (funcall (symbol-function 'macher-agent-send))
+                           (gptel-send))
+
+                         (let ((timeout 100))
+                           (while (and (< call-count 3) (> timeout 0))
+                             (accept-process-output nil 0.05)
+                             (cl-decf timeout)))
+
+                         (expect (>= call-count 3) :to-be t)
+                         (let ((vfs-entry (cl-find "read-first-target.txt" (macher-agent--get-context-contents ctx)
+                                                   :key #'car :test #'equal)))
+                           (expect vfs-entry :not :to-be nil)
+                           (when vfs-entry
+                             (expect (macher-agent-vfs-entry-curr vfs-entry) :to-equal "initial content line 1\nmodified line 2"))))))
+                  (when (buffer-live-p parent-buffer) (kill-buffer parent-buffer))
+                  (when (buffer-live-p target-buf) (kill-buffer target-buf)))))
+
+(it "interleaves macher-agent tools and macher tools seamlessly across turns"
+              (let ((call-count 0)
+                    (parent-buffer (generate-new-buffer "*macher-test-interleave*")))
+                (unwind-protect
+                    (with-current-buffer parent-buffer
+                      (when (fboundp 'markdown-mode) (markdown-mode))
+                      (when (fboundp 'gptel-mode) (gptel-mode 1))
+                      (when (fboundp 'macher-agent-mode) (macher-agent-mode 1))
+
+                      (insert "Interleave macher-agent and macher tool edits.")
+
+                      (with-macher-agent-test-context
+                       '(("macher-test-interleave" .
+                          ((:text nil :tool-use (("write_buffer_in_workspace" "interleave-full.txt" "Agent Edit 1")))
+                           (:text nil :tool-use (("read_buffer_in_workspace" "interleave-full.txt")))
+                           (:text "Read final interleaved edit" :tool-use nil))))
+                       call-count
+
+                       ;; Simulate a macher tool (from macher.el) writing to the same context in between
+                       (fset 'macher-agent--mock-midturn
+                             (lambda (&rest _)
+                               (macher--tool-write-file ctx "interleave-full.txt" "Macher Edit 2 Overwrite")))
+                       (add-hook 'macher-agent-post-tool-use-hook #'macher-agent--mock-midturn)
+
+                       (unwind-protect
+                           (progn
+                             (if (fboundp 'macher-agent-send)
+                                 (funcall (symbol-function 'macher-agent-send))
+                               (gptel-send))
+
+                             (let ((timeout 100))
+                               (while (and (< call-count 3) (> timeout 0))
+                                 (accept-process-output nil 0.05)
+                                 (cl-decf timeout)))
+
+                             (expect (>= call-count 3) :to-be t)
+                             (let ((norm-key (macher-agent--normalize-path-key "interleave-full.txt" ctx)))
+                               (expect (macher-agent--read-context-file ctx norm-key) :to-equal "Macher Edit 2 Overwrite")))
+                         (remove-hook 'macher-agent-post-tool-use-hook #'macher-agent--mock-midturn))))
+
+                  (when (buffer-live-p parent-buffer) (kill-buffer parent-buffer)))))
+
+                    (it "writes a file via VFS write tool and reads it back via search_in_workspace"
+              (let ((call-count 0)
+                    (parent-buffer (generate-new-buffer "*macher-test-vfs-search*")))
+                (unwind-protect
+                    (with-current-buffer parent-buffer
+                      (when (fboundp 'markdown-mode) (markdown-mode))
+                      (when (fboundp 'gptel-mode) (gptel-mode 1))
+                      (when (fboundp 'macher-agent-mode) (macher-agent-mode 1))
+
+                      (insert "Write to VFS and search via tool.")
+
+                      (with-macher-agent-test-context
+                       '(("macher-test-vfs-search" .
+                          ((:text nil :tool-use (("write_buffer_in_workspace" "vfs-integration-target.txt" "findme_vfs_token_12345")))                           (:text nil :tool-use (("search_in_workspace" "findme_vfs_token_12345")))                           (:text "Found token in VFS search" :tool-use nil))))
+                       call-count
+
+                       (if (fboundp 'macher-agent-send)
+                           (funcall (symbol-function 'macher-agent-send))
+                         (gptel-send))
+
+                       (let ((timeout 100))
+                         (while (and (< call-count 3) (> timeout 0))
+                           (accept-process-output nil 0.05)
+                           (cl-decf timeout)))
+
+                       (expect (>= call-count 3) :to-be t)
+                       (expect (buffer-string) :to-match "Found token in VFS search"))
+
+                  (when (buffer-live-p parent-buffer) (kill-buffer parent-buffer)))))))
 
 (provide 'macher-agent-full-integration-test)
 ;;; macher-agent-full-integration-test.el ends here

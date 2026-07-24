@@ -29,13 +29,11 @@ WS is the workspace object.
 
 Return the workspace name string."
   (cond
-   ((and (fboundp 'macher-agent-workspace-p) (macher-agent-workspace-p ws))
+   ((macher-agent-workspace-p ws)
     (file-name-nondirectory (directory-file-name (macher-agent-workspace-project-root ws))))
    ((and (consp ws) (eq (car ws) 'agent) (not (stringp (cdr ws))))
     (file-name-nondirectory (directory-file-name (macher-agent-workspace-project-root (cdr ws)))))
-   ((fboundp 'macher--workspace-name)
-    (ignore-errors (macher--workspace-name ws)))
-   (t "unknown")))
+   (t (ignore-errors (macher--workspace-name ws)))))
 
 (defun macher-agent--split-vfs-contents (contents)
   "Split raw VFS contents into pure virtual and physical lists.
@@ -115,24 +113,20 @@ Return a list containing virtual context, physical context, and physical content
   (let* ((vfs-ctx (or (ignore-errors (macher-agent-resolve-context (or fsm context))) context))
          (raw-contents (or (and context (macher-agent--get-context-contents context))
                            (and vfs-ctx (macher-agent--get-context-contents vfs-ctx))))
-         (categorised (if (fboundp 'macher-agent--partition-vfs-entries)
-                          (macher-agent--partition-vfs-entries raw-contents project-root)
-                        (macher-agent--split-vfs-contents raw-contents)))
+         (categorised (macher-agent--partition-vfs-entries raw-contents project-root))
          (virtual-contents (car categorised))
          (physical-contents (cdr categorised))
          (macher-compatible-ws (cons 'project project-root))
          (v-ctx (and virtual-contents
                      (let ((ctx (macher-agent--make-vfs-context :workspace macher-compatible-ws
                                                                 :contents virtual-contents)))
-                       (when (fboundp 'macher-context-prompt)
-                         (setf (macher-context-prompt ctx) (macher-agent--get-context-prompt context)))
+                       (setf (macher-context-prompt ctx) (macher-agent--get-context-prompt context))
                        (macher-agent--set-context-dirty-p ctx t)
                        ctx)))
          (p-ctx (and physical-contents
                      (let ((ctx (macher-agent--make-vfs-context :workspace macher-compatible-ws
                                                                 :contents physical-contents)))
-                       (when (fboundp 'macher-context-prompt)
-                         (setf (macher-context-prompt ctx) (macher-agent--get-context-prompt context)))
+                       (setf (macher-context-prompt ctx) (macher-agent--get-context-prompt context))
                        (macher-agent--set-context-dirty-p ctx t)
                        ctx))))
     (list v-ctx p-ctx physical-contents)))
@@ -154,11 +148,11 @@ Return a cons cell of (PHYSICAL-CONTEXT . VIRTUAL-CONTEXT)."
   "Process request STATUS for CONTEXT and optional FSM.
 Split the context into physical and virtual parts and call `macher--build-patch` natively on both."
   (let* ((ctx (cond
-               ((and status (fboundp 'macher-context-p) (macher-context-p status)) status)
+               ((and status (macher-context-p status)) status)
                (context context)
                (t (ignore-errors (macher-agent-resolve-context)))))
          (fsm-obj (cond
-                   ((and context (not (fboundp 'macher-context-p))) context)
+                   ((and context (not (macher-context-p context))) context)
                    (fsm fsm)
                    (t nil))))
     (when ctx
@@ -205,14 +199,14 @@ CTX is the context structure.
 
 Return the workspace struct, or nil."
   (cond
-   ((and ctx (fboundp 'macher-context-p) (macher-context-p ctx))
-    (let ((ws (and (fboundp 'macher-context-workspace) (macher-context-workspace ctx))))
+   ((and ctx (macher-context-p ctx))
+    (let ((ws (macher-context-workspace ctx)))
       (if (and (consp ws) (eq (car ws) 'agent))
           (cdr ws)
         ws)))
    ((and (consp ctx) (eq (car ctx) 'agent))
     (cdr ctx))
-   ((and ctx (fboundp 'macher-agent-workspace-p) (macher-agent-workspace-p ctx))
+   ((and ctx (macher-agent-workspace-p ctx))
     ctx)
    (t nil)))
 
@@ -223,7 +217,7 @@ CTX is the context structure.
 WS is the new workspace struct.
 
 Return nil."
-  (when (and ctx (fboundp 'macher-context-p) (macher-context-p ctx))
+  (when (and ctx (macher-context-p ctx))
     (setf (macher-context-workspace ctx) ws)))
 
 (defmacro macher-agent--def-context-accessor (name accessor &optional setter-name docstring)
@@ -236,9 +230,7 @@ DOCSTRING is the optional documentation string to use."
   (let ((getter `(defun ,name (ctx)
                    ,(or docstring (format "Safely access `%s` on CTX." accessor))
                    (and ctx
-                        (fboundp 'macher-context-p)
                         (macher-context-p ctx)
-                        (fboundp ',accessor)
                         (,accessor ctx)))))
     (if setter-name
         `(progn
@@ -246,9 +238,7 @@ DOCSTRING is the optional documentation string to use."
            (defun ,setter-name (ctx val)
              ,(format "Safely set `%s` on CTX." accessor)
              (when (and ctx
-                        (fboundp 'macher-context-p)
-                        (macher-context-p ctx)
-                        (fboundp ',accessor))
+                        (macher-context-p ctx))
                (setf (,accessor ctx) val))))
       getter)))
 
