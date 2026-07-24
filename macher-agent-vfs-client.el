@@ -861,12 +861,15 @@ Return a symbol: `file', `media', `buffer', or `external'."
          (buf (get-buffer path-or-buf))
          (file-from-buf (and buf (buffer-file-name buf)))
          (is-absolute (file-name-absolute-p path-or-buf))
-         (has-slash (string-match-p "/" path-or-buf)))
+         (has-slash (string-match-p "/" path-or-buf))
+         (is-pure-buf (and (not is-absolute) (not has-slash) (string-prefix-p "*" path-or-buf))))
     (cond
+     (is-pure-buf 'buffer)
      ((or (and file-from-buf (file-exists-p file-from-buf))
           (file-exists-p expanded)
           is-absolute
-          has-slash)
+          has-slash
+          root-dir)
       (let* ((path (or (and file-from-buf (file-exists-p file-from-buf) file-from-buf) expanded))
              (is-in-workspace (if root-dir (string-prefix-p (expand-file-name root-dir) path) t)))
         (if is-in-workspace
