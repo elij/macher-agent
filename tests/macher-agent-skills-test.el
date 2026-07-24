@@ -139,7 +139,67 @@
                             (expect response :to-match "SUCCESS")
                             
                             (let ((contents (cl-find "test-file.rs" (macher-context-contents ctx) :key #'macher-agent-vfs-entry-path :test #'equal)))
-                              (expect (macher-agent-vfs-entry-curr contents) :to-equal "line1\nline3"))))))
+                              (expect (macher-agent-vfs-entry-curr contents) :to-equal "line1\nline3")))))
+
+                    (it "allows multi_edit_buffer_in_workspace after reading a live buffer"
+                        (let* ((buf (generate-new-buffer "read-then-edit.txt"))
+                               (ctx (macher--make-context :contents nil))
+                               (read-fn (gptel-tool-function macher-agent-read-buffer-in-workspace-tool))
+                               (edit-fn (gptel-tool-function macher-agent-multi-edit-buffer-in-workspace-tool)))
+                          (with-current-buffer buf
+                            (insert "hello world"))
+                          (spy-on 'macher-agent-resolve-context :and-return-value ctx)
+                          (spy-on 'macher-agent--ensure-access)
+                          
+                          (funcall read-fn nil "read-then-edit.txt")
+                          
+                          (let* ((edits (vector (list :old_text "hello" :new_text "goodbye")))
+                                 (response (funcall edit-fn nil "read-then-edit.txt" edits)))
+                            (expect response :to-match "SUCCESS")
+                            (let ((contents (cl-find "read-then-edit.txt" (macher-context-contents ctx) :key #'macher-agent-vfs-entry-path :test #'equal)))
+                              (expect contents :not :to-be nil)
+                              (when contents
+                                (expect (macher-agent-vfs-entry-curr contents) :to-equal "goodbye world"))))
+                          (kill-buffer buf)))
+
+(it "synchronises context seamlessly when interleaving macher-agent and macher tools"
+                        (let* ((proj-dir (file-name-as-directory (expand-file-name "tests/fixtures/interleave-proj")))
+                               (file-path (concat proj-dir "interleave.txt")))
+                          (make-directory proj-dir t)
+                          (with-temp-file file-path (insert "Initial file text"))
+                          (let* ((ws (cons 'directory proj-dir))
+                                 (ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
+                                 (agent-write-fn (gptel-tool-function macher-agent-write-buffer-in-workspace-tool))
+                                 (agent-read-fn (gptel-tool-function macher-agent-read-buffer-in-workspace-tool)))
+                            (spy-on 'macher-agent-resolve-context :and-return-value ctx)
+                            ;; 1. Macher-agent tool writes to VFS
+                            (funcall agent-write-fn nil "interleave.txt" "VFS Step 1: Agent Write")
+                            ;; 2. Macher tool writes to VFS
+                            (macher--tool-write-file ctx "interleave.txt" "VFS Step 2: Macher Write")
+                            ;; 3. Macher-agent tool reads from VFS
+                            (let ((res (funcall agent-read-fn nil "interleave.txt")))
+                              (expect (if (macher-agent-tool-response-p res)
+                                          (macher-agent-tool-response-payload res)
+                                        res)
+                                      :to-equal "VFS Step 2: Macher Write")
+                              ;; Ensure no duplicate entries with different path keys in contents list
+                              (expect (length (macher-agent--get-context-contents ctx)) :to-equal 1))
+                            (delete-file file-path)
+                            (delete-directory proj-dir))))
+
+                                        (it "searches VFS content written by write_buffer_in_workspace using search_in_workspace"
+                        (let* ((ws (make-macher-agent-workspace :project-root default-directory))
+                               (ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
+                               (write-fn (gptel-tool-function macher-agent-write-buffer-in-workspace-tool))
+                               (search-fn (gptel-tool-function macher-agent-search-in-workspace-tool)))
+                          (spy-on 'macher-agent-resolve-context :and-return-value ctx)
+                          (spy-on 'call-process :and-return-value 0)
+                          (funcall write-fn nil "vfs-search-target.txt" "unique-vfs-search-token line")
+                          (let ((res (funcall search-fn nil "unique-vfs-search-token")))
+                            (expect (if (macher-agent-tool-response-p res)
+                                        (macher-agent-tool-response-payload res)
+                                      res)
+                                    :to-match "unique-vfs-search-token")))))
 
           (describe "Agent Skills (macher-agent-skills.el)"
                     (before-each
@@ -317,3 +377,4 @@
                               (delete-directory mock-dir t)))))))
 
 (provide 'macher-agent-skills-test)
+;;; macher-agent-skills-test.el ends here

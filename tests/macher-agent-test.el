@@ -21,6 +21,22 @@
              (when ws (setf (macher-agent-workspace-active-subagents ws) nil))))
 
           (describe "Context and Security (macher-agent-vfs-client.el)"
+                    (it "ensures buffer persistent-context remains aligned with canonical active workspace instance"
+                        (let* ((proj-dir "/mock/aligned-proj/")
+                               (ws (make-macher-agent-workspace :project-root proj-dir))
+                               (canonical-ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
+                               (stale-ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
+                               (buf (generate-new-buffer "aligned-buf")))
+                          (puthash (expand-file-name proj-dir) canonical-ctx macher-agent-active-workspaces)
+                          (unwind-protect
+                              (with-current-buffer buf
+                                (setq-local default-directory proj-dir)
+                                (setq-local macher-agent--is-workspace t)
+                                (setq-local macher-agent--persistent-context stale-ctx)
+                                (let ((resolved (macher-agent-resolve-context)))
+                                  (expect resolved :to-be canonical-ctx)))
+                            (kill-buffer buf))))
+
                     (it "throws a security error if accessing a path outside of the allowed context"
                         (let ((ctx (macher--make-context :contents (list (macher-agent-vfs-make-entry "allowed.txt" "old" "new")))))
                           (expect (macher-agent--ensure-access ctx "forbidden.txt") :to-throw 'error)))
@@ -91,7 +107,7 @@
                                       (expect (macher-agent-vfs-entry-curr entry) :to-equal "v2-remote"))
 
                                     (delete-directory test-dir t)))
-
+                              
                               (it "preserves unapplied virtual edits across tool calls if the physical state has not mutated"
                                   (let* ((entry (macher-agent-vfs-make-entry "test-file.el" "original state" "proposed ghost state")))
 
@@ -330,6 +346,24 @@
 
                                       ;; Clean up temp buffers
                                       (when (buffer-live-p other-buf) (kill-buffer other-buf))
+                                      (when (buffer-live-p restore-buf) (kill-buffer restore-buf)))))
+
+                              (it "synchronises deserialised persistent-context into active-workspaces after restore"
+                                  (let* ((restore-buf (generate-new-buffer "restore-test-buf"))
+                                         (restore-dir "/mock/proj/restored-ws/")
+                                         (ws (make-macher-agent-workspace :project-root restore-dir))
+                                         (deserialised-ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
+                                         (macher-agent--allow-gptel-restore t)
+                                         (orig-fun (lambda (&rest _args)
+                                                     (setq-local macher-agent--persistent-context deserialised-ctx))))
+                                    (unwind-protect
+                                        (with-current-buffer restore-buf
+                                          (setq-local default-directory restore-dir)
+                                          (macher-agent--gptel-restore-advice orig-fun)
+                                          (let ((registered (gethash (expand-file-name restore-dir) macher-agent-active-workspaces)))
+                                            (expect registered :to-equal deserialised-ctx))
+                                          (let ((resolved-sub (macher-agent--resolve-context-from-ws (concat restore-dir "submodule-a/"))))
+                                            (expect resolved-sub :to-equal deserialised-ctx)))
                                       (when (buffer-live-p restore-buf) (kill-buffer restore-buf))))))
                     (describe "Sandbox Execution (macher-agent-vfs-client.el)"
                               (describe "read_media_in_workspace"
@@ -419,451 +453,481 @@
                                                    (cmd (macher-agent--build-rsync-cmd src dest)))
 
                                               (expect (stringp cmd) :to-be t)
-                                              (expect (string-match-p "git .*ls-files" cmd) :to-be-truthy)
+                                              (expect (string-match-p "git .*ls-files -z -c --recurse-submodules" cmd) :to-be-truthy)
+                                              (expect (string-match-p "git .*ls-files -z -o --exclude-standard" cmd) :to-be-truthy)
                                               (expect (string-match-p "rsync -aLC --delete --from0 --files-from=-" cmd) :to-be-truthy)
 
                                               ;; Optional but good practice: verify our mock was actually triggered
                                               (expect 'call-process :to-have-been-called-with
-                                                      "git" nil nil nil "rev-parse" "--is-inside-work-tree")))))
+                                                      "git" nil nil nil "rev-parse" "--is-inside-work-tree")))
 
-                    (describe "Macher-Agent Tool Category Isolation"
+                                        (it "throws an error if the directory is not inside a git repository"
+                                            (spy-on 'call-process :and-return-value 1)
+                                            (expect (macher-agent--build-rsync-cmd "/my/project/" "/tmp/sandbox/")
+                                                    :to-throw 'error)))
 
-                              (it "preserves the custom category to avoid being purged by upstream read-only presets"
-                                  (let ((mock-tool (gptel-make-tool :name "my_custom_tool"
-                                                                    :function #'ignore
-                                                                    :category "macher-agent-calendar"
-                                                                    :description "test"
-                                                                    :args nil))
-                                        ;; Extract the clearing function from the upstream preset definition
-                                        (clear-fn (plist-get (plist-get macher--preset-clear-tools :tools) :function)))
+                              (describe "Macher-Agent Tool Category Isolation"
 
-                                    ;; The custom tool MUST maintain its distinct category boundary
-                                    (expect (gptel-tool-category mock-tool) :not :to-equal macher-tool-category)
+                                        (it "preserves the custom category to avoid being purged by upstream read-only presets"
+                                            (let ((mock-tool (gptel-make-tool :name "my_custom_tool"
+                                                                              :function #'ignore
+                                                                              :category "macher-agent-calendar"
+                                                                              :description "test"
+                                                                              :args nil))
+                                                  ;; Extract the clearing function from the upstream preset definition
+                                                  (clear-fn (plist-get (plist-get macher--preset-clear-tools :tools) :function)))
 
-                                    ;; It MUST survive the upstream framework's aggressive tool purge
-                                    (let ((filtered-tools (funcall clear-fn (list mock-tool))))
-                                      (expect (length filtered-tools) :to-equal 1)
-                                      (expect (gptel-tool-name (car filtered-tools)) :to-equal "my_custom_tool")))))
-                    (describe "Virtual File System (VFS) Sandbox Isolation"
+                                              ;; The custom tool MUST maintain its distinct category boundary
+                                              (expect (gptel-tool-category mock-tool) :not :to-equal macher-tool-category)
 
-                              (describe "deletions and moves"
-                                        (it "preserves explicit nil values to correctly register deletions"
-                                            (let* ((entry (cons "test.txt" nil))
-                                                   (hydrated (macher-agent--hydrate-vfs-entry entry "/mock/root")))
-                                              (expect (macher-agent-vfs-entry-curr hydrated) :to-be nil)))
+                                              ;; It MUST survive the upstream framework's aggressive tool purge
+                                              (let ((filtered-tools (funcall clear-fn (list mock-tool))))
+                                                (expect (length filtered-tools) :to-equal 1)
+                                                (expect (gptel-tool-name (car filtered-tools)) :to-equal "my_custom_tool")))))
+                              (describe "Virtual File System (VFS) Sandbox Isolation"
 
-                                        (it "physically removes a file from sandbox during process-entries if new-content is nil"
-                                            (let* ((entries '("test.txt"))
-                                                   (sandbox-dir (make-temp-file "macher-test-sandbox-" t))
-                                                   (target-file (expand-file-name "test.txt" sandbox-dir)))
-                                              (with-temp-file target-file (insert "existing"))
-                                              (expect (file-exists-p target-file) :to-be t)
-                                              (macher-agent--vfs-process-entries
-                                               entries
-                                               sandbox-dir
-                                               (lambda (e) e)
-                                               (lambda (_) nil))
-                                              (expect (file-exists-p target-file) :to-be nil)
-                                              (delete-directory sandbox-dir t))))
+                                        (describe "deletions and moves"
+                                                  (it "preserves explicit nil values to correctly register deletions"
+                                                      (let* ((entry (cons "test.txt" nil))
+                                                             (hydrated (macher-agent--hydrate-vfs-entry entry "/mock/root")))
+                                                        (expect (macher-agent-vfs-entry-curr hydrated) :to-be nil)))
 
-                              (describe "macher-agent--vfs-apply-overlay"
+                                                  (it "physically removes a file from sandbox during process-entries if new-content is nil"
+                                                      (let* ((entries '("test.txt"))
+                                                             (sandbox-dir (make-temp-file "macher-test-sandbox-" t))
+                                                             (target-file (expand-file-name "test.txt" sandbox-dir)))
+                                                        (with-temp-file target-file (insert "existing"))
+                                                        (expect (file-exists-p target-file) :to-be t)
+                                                        (macher-agent--vfs-process-entries
+                                                         entries
+                                                         sandbox-dir
+                                                         (lambda (e) e)
+                                                         (lambda (_) nil))
+                                                        (expect (file-exists-p target-file) :to-be nil)
+                                                        (delete-directory sandbox-dir t))))
 
-                                        (it "reroutes virtual edits to the ephemeral sandbox, protecting the physical disk"
-                                            (let* ((workspace-root "/my/project/")
-                                                   (sandbox-dir "/tmp/sandbox-12345/")
-                                                   ;; Create a mock context representing a dirty workspace
-                                                   (mock-ws (make-macher-agent-workspace :project-root workspace-root))
-                                                   (mock-ctx (macher--make-context :dirty-p t
-                                                                                   :workspace mock-ws
-                                                                                   :contents (list (macher-agent-vfs-make-entry "/my/project/src/main.rs" "orig" "new content"))))
-                                                   (write-region-called-with nil))
+                                        (describe "macher-agent--vfs-apply-overlay"
 
-                                              ;; Spy on file-in-directory-p to allow mock/non-existent sandbox directories
-                                              (spy-on 'file-in-directory-p :and-return-value t)
+                                                  (it "reroutes virtual edits to the ephemeral sandbox, protecting the physical disk"
+                                                      (let* ((workspace-root "/my/project/")
+                                                             (sandbox-dir "/tmp/sandbox-12345/")
+                                                             ;; Create a mock context representing a dirty workspace
+                                                             (mock-ws (make-macher-agent-workspace :project-root workspace-root))
+                                                             (mock-ctx (macher--make-context :dirty-p t
+                                                                                             :workspace mock-ws
+                                                                                             :contents (list (macher-agent-vfs-make-entry "/my/project/src/main.rs" "orig" "new content"))))
+                                                             (write-region-called-with nil))
 
-                                              ;; Mock the context root provider (struct access)
-                                              (spy-on 'macher--workspace-root :and-return-value workspace-root)
+                                                        ;; Spy on file-in-directory-p to allow mock/non-existent sandbox directories
+                                                        (spy-on 'file-in-directory-p :and-return-value t)
 
-                                              ;; Intercept the destructive write action
-                                              (spy-on 'write-region :and-call-fake
-                                                      (lambda (start _end filename &rest _)
-                                                        (push (list start filename) write-region-called-with)))
+                                                        ;; Mock the context root provider (struct access)
+                                                        (spy-on 'macher--workspace-root :and-return-value workspace-root)
 
-                                              (macher-agent--vfs-apply-overlay mock-ctx sandbox-dir)
+                                                        ;; Intercept the destructive write action
+                                                        (spy-on 'write-region :and-call-fake
+                                                                (lambda (start _end filename &rest _)
+                                                                  (push (list start filename) write-region-called-with)))
 
-                                              ;; The orchestrator MUST execute a file write...
-                                              (expect 'write-region :to-have-been-called)
+                                                        (macher-agent--vfs-apply-overlay mock-ctx sandbox-dir)
 
-                                              ;; ...it MUST write the new virtual content...
-                                              (expect (caar write-region-called-with) :to-equal "new content")
+                                                        ;; The orchestrator MUST execute a file write...
+                                                        (expect 'write-region :to-have-been-called)
 
-                                              ;; ...and CRITICALLY, it MUST write it to the sandbox, NOT the physical /my/project/ path!
-                                              (expect (cadar write-region-called-with) :to-equal "/tmp/sandbox-12345/src/main.rs")))
+                                                        ;; ...it MUST write the new virtual content...
+                                                        (expect (caar write-region-called-with) :to-equal "new content")
 
-                                        (it "does not flush anything if the virtual memory is clean"
-                                            (let* ((mock-ctx (macher--make-context :dirty-p nil :contents nil)))
+                                                        ;; ...and CRITICALLY, it MUST write it to the sandbox, NOT the physical /my/project/ path!
+                                                        (expect (cadar write-region-called-with) :to-equal "/tmp/sandbox-12345/src/main.rs")))
 
-                                              (spy-on 'write-region)
+                                                  (it "does not flush anything if the virtual memory is clean"
+                                                      (let* ((mock-ctx (macher--make-context :dirty-p nil :contents nil)))
 
-                                              (macher-agent--vfs-apply-overlay mock-ctx "/tmp/sandbox-12345/")
+                                                        (spy-on 'write-region)
 
-                                              ;; Ensure no ghost files are created in the sandbox
-                                              (expect 'write-region :not :to-have-been-called))))
+                                                        (macher-agent--vfs-apply-overlay mock-ctx "/tmp/sandbox-12345/")
 
-                              (describe "VFS Strict Pipeline Execution"
-                                        (it "always executes the 3-step composition in exact order for every tool"
-                                            (let ((call-order nil))
-                                              (spy-on 'macher-agent--vfs-verify-clean-merge :and-call-fake (lambda (&rest _) (push 'merge call-order)))
-                                              (spy-on 'macher-agent--vfs-sync-baseline :and-call-fake (lambda (&rest _) (push 'sync call-order)))
-                                              (spy-on 'macher-agent--vfs-apply-overlay :and-call-fake (lambda (&rest _) (push 'overlay call-order)))
+                                                        ;; Ensure no ghost files are created in the sandbox
+                                                        (expect 'write-region :not :to-have-been-called))))
 
-                                              ;; Execute a dummy tool
-                                              (let ((mock-context (macher--make-context :workspace nil :contents nil)))
-                                                (spy-on 'macher-agent-context-root :and-return-value "/my/project/")
-                                                (spy-on 'make-temp-file :and-return-value "/tmp/sandbox-12345/")
-                                                (spy-on 'delete-directory)
-                                                (spy-on 'shell-command-to-string :and-return-value "running")
+                                        (describe "VFS Strict Pipeline Execution"
+                                                  (it "always executes the 3-step composition in exact order for every tool"
+                                                      (let ((call-order nil))
+                                                        (spy-on 'macher-agent--vfs-verify-clean-merge :and-call-fake (lambda (&rest _) (push 'merge call-order)))
+                                                        (spy-on 'macher-agent--vfs-sync-baseline :and-call-fake (lambda (&rest _) (push 'sync call-order)))
+                                                        (spy-on 'macher-agent--vfs-apply-overlay :and-call-fake (lambda (&rest _) (push 'overlay call-order)))
 
-                                                (macher-agent-with-strict-vfs-pipeline mock-context
-                                                                                       (shell-command-to-string "echo 'running'")))
+                                                        ;; Execute a dummy tool
+                                                        (let ((mock-context (macher--make-context :workspace nil :contents nil)))
+                                                          (spy-on 'macher-agent-context-root :and-return-value "/my/project/")
+                                                          (spy-on 'make-temp-file :and-return-value "/tmp/sandbox-12345/")
+                                                          (spy-on 'delete-directory)
+                                                          (spy-on 'shell-command-to-string :and-return-value "running")
 
-                                              ;; 1. Assert they were all called
-                                              (expect 'macher-agent--vfs-verify-clean-merge :to-have-been-called)
-                                              (expect 'macher-agent--vfs-sync-baseline :to-have-been-called)
-                                              (expect 'macher-agent--vfs-apply-overlay :to-have-been-called)
+                                                          (macher-agent-with-strict-vfs-pipeline mock-context
+                                                                                                 (shell-command-to-string "echo 'running'")))
 
-                                              ;; 2. Assert exact execution order
-                                              (expect (reverse call-order) :to-equal '(merge sync overlay))))
+                                                        ;; 1. Assert they were all called
+                                                        (expect 'macher-agent--vfs-verify-clean-merge :to-have-been-called)
+                                                        (expect 'macher-agent--vfs-sync-baseline :to-have-been-called)
+                                                        (expect 'macher-agent--vfs-apply-overlay :to-have-been-called)
 
-                                        (it "does not mangle OS-level absolute sandbox paths during rsync"
-                                            ;; This specific test prevents the regression we just experienced
-                                            (spy-on 'macher-agent--build-rsync-cmd :and-return-value "echo dummy")
-                                            (spy-on 'delete-directory)
+                                                        ;; 2. Assert exact execution order
+                                                        (expect (reverse call-order) :to-equal '(merge sync overlay))))
 
-                                            (let ((mock-context (macher--make-context :workspace nil :contents nil)))
-                                              (spy-on 'macher-agent-context-root :and-return-value "/my/project/")
-                                              (macher-agent-with-strict-vfs-pipeline mock-context nil))
+                                                  (it "does not mangle OS-level absolute sandbox paths during rsync"
+                                                      ;; This specific test prevents the regression we just experienced
+                                                      (spy-on 'macher-agent--build-rsync-cmd :and-return-value "echo dummy")
+                                                      (spy-on 'delete-directory)
 
-                                            ;; The destination argument to rsync MUST be an absolute path in /tmp or /var
-                                            (let ((rsync-dest-arg (nth 1 (spy-calls-args-for 'macher-agent--build-rsync-cmd 0))))
-                                              (expect (file-name-absolute-p rsync-dest-arg) :to-be t)))))
-                    (describe "Interactive Commands and State (macher-agent-orchestration.el)"
-                              (it "macher-agent-add-buffer-to-scope explicitly errors out if no existing session is found"
-                                  (let ((buf (generate-new-buffer "lazy-target")))
-                                    (let ((macher-agent--active-fsm nil)
-                                          (macher-agent-active-workspaces (make-hash-table :test 'equal))
-                                          (macher-agent--persistent-context nil))
-                                      (cl-letf (((symbol-function 'buffer-list) (lambda () nil)))
-                                        (expect (macher-agent-add-buffer-to-scope "lazy-target") :to-throw 'error)))
-                                    (kill-buffer buf)))
-                              (it "macher-agent-add-subagent creates a buffer and tracks it globally"
-                                  (let* ((mock-workspace (make-macher-agent-workspace :project-root "/tmp/"))
-                                         (mock-context (macher-agent--make-vfs-context :workspace mock-workspace :contents nil)))
-                                    (puthash (expand-file-name "/tmp/") mock-context macher-agent-active-workspaces)
-                                    (spy-on 'macher-agent-resolve-context :and-return-value mock-context)
-                                    (let ((buf (macher-agent-add-subagent "test-worker" "/tmp/" nil mock-context)))
-                                      (expect (buffer-live-p buf) :to-be t)
-                                      (expect (assoc "test-worker" (macher-agent-workspace-active-subagents (macher-agent--get-context-workspace (macher-agent-resolve-context)))) :to-be-truthy)
-                                      (kill-buffer buf))))
+                                                      (let ((mock-context (macher--make-context :workspace nil :contents nil)))
+                                                        (spy-on 'macher-agent-context-root :and-return-value "/my/project/")
+                                                        (macher-agent-with-strict-vfs-pipeline mock-context nil))
 
-                              (it "macher-agent-apply-virtual-buffers applies pending context edits to live Emacs buffers"
-                                  (let* ((buf (generate-new-buffer "live-target"))
-                                         (ctx (macher--make-context :contents (list (macher-agent-vfs-make-entry (buffer-name buf) "old" "new text")))))
-                                    (with-current-buffer buf (insert "old"))
+                                                      ;; The destination argument to rsync MUST be an absolute path in /tmp or /var
+                                                      (let ((rsync-dest-arg (nth 1 (spy-calls-args-for 'macher-agent--build-rsync-cmd 0))))
+                                                        (expect (file-name-absolute-p rsync-dest-arg) :to-be t)))))
+                              (describe "Interactive Commands and State (macher-agent-orchestration.el)"
+                                        (it "macher-agent-add-buffer-to-scope explicitly errors out if no existing session is found"
+                                            (let ((buf (generate-new-buffer "lazy-target")))
+                                              (let ((macher-agent--active-fsm nil)
+                                                    (macher-agent-active-workspaces (make-hash-table :test 'equal))
+                                                    (macher-agent--persistent-context nil))
+                                                (cl-letf (((symbol-function 'buffer-list) (lambda () nil)))
+                                                  (expect (macher-agent-add-buffer-to-scope "lazy-target") :to-throw 'error)))
+                                              (kill-buffer buf)))
+                                        (it "macher-agent-add-subagent creates a buffer and tracks it globally"
+                                            (let* ((mock-workspace (make-macher-agent-workspace :project-root "/tmp/"))
+                                                   (mock-context (macher-agent--make-vfs-context :workspace mock-workspace :contents nil)))
+                                              (puthash (expand-file-name "/tmp/") mock-context macher-agent-active-workspaces)
+                                              (spy-on 'macher-agent-resolve-context :and-return-value mock-context)
+                                              (let ((buf (macher-agent-add-subagent "test-worker" "/tmp/" nil mock-context)))
+                                                (expect (buffer-live-p buf) :to-be t)
+                                                (expect (assoc "test-worker" (macher-agent-workspace-active-subagents (macher-agent--get-context-workspace (macher-agent-resolve-context)))) :to-be-truthy)
+                                                (kill-buffer buf))))
 
-                                    (spy-on 'macher-agent-resolve-context :and-return-value ctx)
-                                    (spy-on 'macher-agent--auto-sync-context)
+                                        (it "macher-agent-apply-virtual-buffers applies pending context edits to live Emacs buffers"
+                                            (let* ((buf (generate-new-buffer "live-target"))
+                                                   (ctx (macher--make-context :contents (list (macher-agent-vfs-make-entry (buffer-name buf) "old" "new text")))))
+                                              (with-current-buffer buf (insert "old"))
 
-                                    (macher-agent-apply-virtual-buffers)
+                                              (spy-on 'macher-agent-resolve-context :and-return-value ctx)
+                                              (spy-on 'macher-agent--auto-sync-context)
 
-                                    (with-current-buffer buf
-                                      (expect (buffer-string) :to-equal "new text"))
-                                    (kill-buffer buf)))
+                                              (macher-agent-apply-virtual-buffers)
 
-                              (it "clears persistent context upon user request"
-                                  (let ((buf (generate-new-buffer "active-session")))
-                                    (with-current-buffer buf
-                                      (setq-local macher-agent--persistent-context 'some-data)
-                                      (macher-agent-clear-context)
-                                      (expect macher-agent--persistent-context :to-be nil))
-                                    (kill-buffer buf)))
+                                              (with-current-buffer buf
+                                                (expect (buffer-string) :to-equal "new text"))
+                                              (kill-buffer buf)))
 
-                              (it "clears active presets during setup if the restored session tag is present"
-                                  (let ((buf (generate-new-buffer "restored-session-buf"))
-                                        (ctx (macher--make-context :workspace (make-macher-agent-workspace :project-root "/tmp/") :contents nil)))
-                                    (with-current-buffer buf
-                                      (setq-local macher-agent--is-workspace t)
-                                      (setq-local macher-agent--persistent-context ctx)
-                                      (setq-local macher-agent-presets '(some-preset))
-                                      (setq-local macher-agent--is-restored-session t)
-                                      (macher-agent-setup-gptel-buffer)
-                                      (expect macher-agent-presets :to-be nil)
-                                      (expect macher-agent--is-restored-session :to-be nil))
-                                    (kill-buffer buf)))
+                                        (it "clears persistent context upon user request"
+                                            (let ((buf (generate-new-buffer "active-session")))
+                                              (with-current-buffer buf
+                                                (setq-local macher-agent--persistent-context 'some-data)
+                                                (macher-agent-clear-context)
+                                                (expect macher-agent--persistent-context :to-be nil))
+                                              (kill-buffer buf)))
 
-                              (it "handles exclusive override flag by resetting accumulated base and preceding state"
-                                  (let* ((tool1 (gptel-make-tool :name "tool1" :description "tool1"))
-                                         (toolA (gptel-make-tool :name "toolA" :description "toolA"))
-                                         (toolB (gptel-make-tool :name "toolB" :description "toolB"))
-                                         (gptel-tools (list tool1 toolA toolB))
-                                         (base-state `(:model gpt-3.5-turbo
-                                                              :system "Base system message"
-                                                              :temperature 0.7
-                                                              :max-tokens 100
-                                                              :tools (,tool1)
-                                                              :known-presets ((preset-a . (:system "Preset A prompt" :temperature 0.5 :tools (,toolA)))
-                                                                              (preset-b . (:system "Preset B prompt" :exclusive t :temperature 0.2 :tools (,toolB))))))
-                                         (presets '(preset-a preset-b)))
-                                    (let ((payload (macher-agent-compose-payload base-state presets)))
-                                      ;; Since preset-b has exclusive t, it resets preset-a and base-state!
-                                      (expect (plist-get payload :system) :to-equal "### Skill: preset-b\nPreset B prompt\n")
-                                      (expect (plist-get payload :temperature) :to-equal 0.2)
-                                      (expect (mapcar #'gptel-tool-name (plist-get payload :tools)) :to-equal '("toolB")))))
+                                        (it "clears active presets during setup if the restored session tag is present"
+                                            (let ((buf (generate-new-buffer "restored-session-buf"))
+                                                  (ctx (macher--make-context :workspace (make-macher-agent-workspace :project-root "/tmp/") :contents nil)))
+                                              (with-current-buffer buf
+                                                (setq-local macher-agent--is-workspace t)
+                                                (setq-local macher-agent--persistent-context ctx)
+                                                (setq-local macher-agent-presets '(some-preset))
+                                                (setq-local macher-agent--is-restored-session t)
+                                                (macher-agent-setup-gptel-buffer)
+                                                (expect macher-agent-presets :to-be nil)
+                                                (expect macher-agent--is-restored-session :to-be nil))
+                                              (kill-buffer buf)))
 
-                              (describe "Tool Signatures (Macro Contracts)"
-                                        (before-all
-                                         (macher-agent-make-tool mock-async-contract-tool
-                                             "Mock async tool"
-                                           :category "test"
-                                           :args (list (list :name "arg1" :type 'string) (list :name "arg2" :type 'string))
-                                           :command-fn (lambda (payload _context _root)
-                                                         (make-macher-agent-lisp-result-response :payload (format "Async %s %s" (plist-get payload :arg1) (plist-get payload :arg2)))))
+                                        (it "handles exclusive override flag by resetting accumulated base and preceding state"
+                                            (let* ((tool1 (gptel-make-tool :name "tool1" :description "tool1"))
+                                                   (toolA (gptel-make-tool :name "toolA" :description "toolA"))
+                                                   (toolB (gptel-make-tool :name "toolB" :description "toolB"))
+                                                   (gptel-tools (list tool1 toolA toolB))
+                                                   (base-state `(:model gpt-3.5-turbo
+                                                                        :system "Base system message"
+                                                                        :temperature 0.7
+                                                                        :max-tokens 100
+                                                                        :tools (,tool1)
+                                                                        :known-presets ((preset-a . (:system "Preset A prompt" :temperature 0.5 :tools (,toolA)))
+                                                                                        (preset-b . (:system "Preset B prompt" :exclusive t :temperature 0.2 :tools (,toolB))))))
+                                                   (presets '(preset-a preset-b)))
+                                              (let ((payload (macher-agent-compose-payload base-state presets)))
+                                                ;; Since preset-b has exclusive t, it resets preset-a and base-state!
+                                                (expect (plist-get payload :system) :to-equal "### Skill: preset-b\nPreset B prompt\n")
+                                                (expect (plist-get payload :temperature) :to-equal 0.2)
+                                                (expect (mapcar #'gptel-tool-name (plist-get payload :tools)) :to-equal '("toolB")))))
 
-                                         (macher-agent-make-tool mock-sync-contract-tool
-                                             "Mock sync tool"
-                                           :category "test"
-                                           :args (list (list :name "arg1" :type 'string))
-                                           :command-fn (lambda (payload _context _root)
-                                                         (make-macher-agent-lisp-result-response :payload (format "Sync %s" (plist-get payload :arg1))))))
+                                        (describe "Tool Schema Validation and Lifecycle Hooks"
+                                                  (before-all
+                                                   (macher-agent-make-tool mock-async-contract-tool
+                                                       "Mock async tool"
+                                                     :category "test"
+                                                     :args (list (list :name "arg1" :type 'string) (list :name "arg2" :type 'string))
+                                                     :command-fn (lambda (payload _context _root)
+                                                                   (make-macher-agent-lisp-result-response :payload (format "Async %s %s" (plist-get payload :arg1) (plist-get payload :arg2)))))
 
-                                        (it "generates variadic signatures for async tools to safely absorb FSM contexts"
-                                            (let* ((tool-fn (gptel-tool-function mock-async-contract-tool))
-                                                   (arity (func-arity tool-fn)))
-                                              (expect (car arity) :to-equal 1)
-                                              (expect (cdr arity) :to-equal 'many)))
+                                                   (macher-agent-make-tool mock-sync-contract-tool
+                                                       "Mock sync tool"
+                                                     :category "test"
+                                                     :args (list (list :name "arg1" :type 'string))
+                                                     :command-fn (lambda (payload _context _root)
+                                                                   (make-macher-agent-lisp-result-response :payload (format "Sync %s" (plist-get payload :arg1)))))
 
-                                        (it "generates variadic signatures for sync tools to safely absorb FSM contexts"
-                                            (let* ((tool-fn (gptel-tool-function mock-sync-contract-tool))
-                                                   (arity (func-arity tool-fn)))
-                                              (expect (car arity) :to-equal 1)
-                                              (expect (cdr arity) :to-equal 'many))))
+                                                   (macher-agent-make-tool mock-complex-schema-tool
+                                                       "Mock complex schema tool"
+                                                     :category "test"
+                                                     :args (list (list :name "tasks"
+                                                                       :type 'array
+                                                                       :items '(:type object
+                                                                                      :properties (:name (:type string)
+                                                                                                         :presets (:type array :items (:type string))))))
+                                                     :command-fn (lambda (_payload _context _root)
+                                                                   (make-macher-agent-lisp-result-response :payload "Valid schema"))))
 
-                              (describe "Tool Lifecycle Hooks"
-                                        (before-each
-                                         (setq macher-agent-pre-tool-use-hook nil)
-                                         (setq macher-agent-permission-request-hook nil)
-                                         (setq macher-agent-post-tool-use-hook nil)
-                                         (setq macher-agent-post-tool-use-failure-hook nil))
+                                                  (it "validates schema parameters correctly for valid payloads"
+                                                      (let ((callback-result nil))
+                                                        (funcall (gptel-tool-function mock-complex-schema-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 '[(:name "task1" :presets ["preset1" "preset2"])])
+                                                        (expect callback-result :to-match "Valid schema")))
 
-                                        (after-all
-                                         (setq macher-agent-pre-tool-use-hook nil)
-                                         (setq macher-agent-permission-request-hook nil)
-                                         (setq macher-agent-post-tool-use-hook nil)
-                                         (setq macher-agent-post-tool-use-failure-hook nil))
+                                                  (it "returns a descriptive error for malformed schema parameters"
+                                                      (let ((callback-result nil))
+                                                        (funcall (gptel-tool-function mock-complex-schema-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 '[(:name "task1" :presets "worker")])
+                                                        (expect callback-result :to-match "The 'tasks\\[0\\]\\.presets' parameter must be an array, not string")))
 
-                                        (it "runs pre-tool-use-hook and aborts if it returns nil"
-                                            (let ((pre-called nil)
-                                                  (callback-result nil))
-                                              (add-hook 'macher-agent-pre-tool-use-hook
-                                                        (lambda (name args)
-                                                          (setq pre-called (list name args))
-                                                          nil))
-                                              (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       (lambda (res) (setq callback-result res))
-                                                       "hello")
-                                              (expect pre-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "hello")))
-                                              (expect callback-result :to-match "Execution blocked by macher-agent-pre-tool-use-hook")))
+                                                  (it "generates variadic signatures for async tools to safely absorb FSM contexts"
+                                                      (let* ((tool-fn (gptel-tool-function mock-async-contract-tool))
+                                                             (arity (func-arity tool-fn)))
+                                                        (expect (car arity) :to-equal 1)
+                                                        (expect (cdr arity) :to-equal 'many)))
 
-                                        (it "runs pre-tool-use-hook and aborts if it signals an error"
-                                            (let ((callback-result nil))
-                                              (add-hook 'macher-agent-pre-tool-use-hook
-                                                        (lambda (_name _args)
-                                                          (error "Custom pre error")))
-                                              (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       (lambda (res) (setq callback-result res))
-                                                       "hello")
-                                              (expect callback-result :to-match "Execution blocked by error in macher-agent-pre-tool-use-hook: Custom pre error")))
+                                                  (it "generates variadic signatures for sync tools to safely absorb FSM contexts"
+                                                      (let* ((tool-fn (gptel-tool-function mock-sync-contract-tool))
+                                                             (arity (func-arity tool-fn)))
+                                                        (expect (car arity) :to-equal 1)
+                                                        (expect (cdr arity) :to-equal 'many)))
 
-                                        (it "runs permission-request-hook and succeeds by default if empty"
-                                            (let ((callback-result nil))
-                                              (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       (lambda (res) (setq callback-result res))
-                                                       "hello")
-                                              (expect callback-result :to-match "Sync hello")))
+                                                  (before-each
+                                                   (setq macher-agent-pre-tool-use-hook nil)
+                                                   (setq macher-agent-permission-request-hook nil)
+                                                   (setq macher-agent-post-tool-use-hook nil)
+                                                   (setq macher-agent-post-tool-use-failure-hook nil))
 
-                                        (it "runs permission-request-hook and aborts if it returns nil"
-                                            (let ((perm-called nil)
-                                                  (callback-result nil))
-                                              (add-hook 'macher-agent-permission-request-hook
-                                                        (lambda (name args)
-                                                          (setq perm-called (list name args))
-                                                          nil))
-                                              (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       (lambda (res) (setq callback-result res))
-                                                       "hello")
-                                              (expect perm-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "hello")))
-                                              (expect callback-result :to-match "Permission denied by macher-agent-permission-request-hook")))
+                                                  (after-all
+                                                   (setq macher-agent-pre-tool-use-hook nil)
+                                                   (setq macher-agent-permission-request-hook nil)
+                                                   (setq macher-agent-post-tool-use-hook nil)
+                                                   (setq macher-agent-post-tool-use-failure-hook nil))
 
-                                        (it "runs post-tool-use-hook upon successful execution"
-                                            (let ((post-called nil)
-                                                  (callback-result nil))
-                                              (add-hook 'macher-agent-post-tool-use-hook
-                                                        (lambda (name args result)
-                                                          (setq post-called (list name args result))))
-                                              (funcall (gptel-tool-function mock-sync-contract-tool)
-                                                       (lambda (res) (setq callback-result res))
-                                                       "world")
-                                              (expect callback-result :to-match "Sync world")
-                                              (expect post-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "world") "Sync world"))))
+                                                  (it "runs pre-tool-use-hook and aborts if it returns nil"
+                                                      (let ((pre-called nil)
+                                                            (callback-result nil))
+                                                        (add-hook 'macher-agent-pre-tool-use-hook
+                                                                  (lambda (name args)
+                                                                    (setq pre-called (list name args))
+                                                                    nil))
+                                                        (funcall (gptel-tool-function mock-sync-contract-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 "hello")
+                                                        (expect pre-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "hello")))
+                                                        (expect callback-result :to-match "Execution blocked by macher-agent-pre-tool-use-hook")))
 
-                                        (it "runs post-tool-use-failure-hook if the tool body throws an error"
-                                            (macher-agent-make-tool mock-error-tool
-                                                "Mock error tool"
-                                              :category "test"
-                                              :args (list (list :name "arg1" :type 'string))
-                                              :command-fn (lambda (_payload _context _root)
-                                                            (error "Failing intentionally")))
-                                            (let ((failure-called nil)
-                                                  (callback-result nil))
-                                              (add-hook 'macher-agent-post-tool-use-failure-hook
-                                                        (lambda (name args err)
-                                                          (setq failure-called (list name args err))))
-                                              (funcall (gptel-tool-function mock-error-tool)
-                                                       (lambda (res) (setq callback-result res))
-                                                       "fail")
-                                              (expect callback-result :to-match "Failing intentionally")
-                                              (expect (car failure-called) :to-be 'mock-error-tool)
-                                              (expect (cadr failure-called) :to-equal '(:arg1 "fail"))
-                                              (expect (error-message-string (caddr failure-called)) :to-equal "Failing intentionally"))))
+                                                  (it "runs pre-tool-use-hook and aborts if it signals an error"
+                                                      (let ((callback-result nil))
+                                                        (add-hook 'macher-agent-pre-tool-use-hook
+                                                                  (lambda (_name _args)
+                                                                    (error "Custom pre error")))
+                                                        (funcall (gptel-tool-function mock-sync-contract-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 "hello")
+                                                        (expect callback-result :to-match "Execution blocked by error in macher-agent-pre-tool-use-hook: Custom pre error")))
 
-                              (describe "Agent Skills (macher-agent-skills.el)"
-                                        (before-each
-                                         (spy-on 'macher-agent-resolve-context :and-return-value
-                                                 (macher-agent--make-vfs-context :workspace (make-macher-agent-workspace :project-root "/mock/proj") :contents nil)))
-                                        (it "parses SKILL.md files correctly extracting frontmatter and markdown body"
-                                            (let* ((parsed (macher-agent-parse-skill-file "tests/fixtures/skills/global/SKILL.md")))
-                                              (expect (plist-get parsed :name) :to-equal "mock-skill")
-                                              (expect (plist-get parsed :name-sym) :to-equal 'mock-skill)
-                                              (expect (plist-get parsed :description) :to-equal "A mock skill for testing")
-                                              (expect (plist-get parsed :allowed-tools) :to-equal '("mock-tool-1" "mock-tool-2"))
-                                              (expect (plist-get parsed :body) :to-equal "This is the system prompt for the mock skill.\nIt spans multiple lines.")))
+                                                  (it "runs permission-request-hook and succeeds by default if empty"
+                                                      (let ((callback-result nil))
+                                                        (funcall (gptel-tool-function mock-sync-contract-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 "hello")
+                                                        (expect callback-result :to-match "Sync hello")))
 
-                                        (it "resolves global skill tools by loading their script if not registered"
-                                            (let* ((loaded-tool-object (gptel-make-tool :name "mock-tool-load" :category "test")))
-                                              (setq mock-tool-load-global loaded-tool-object)
-                                              (spy-on 'file-exists-p :and-return-value t)
-                                              (spy-on 'insert-file-contents :and-call-fake (lambda (f) (insert "(setq mock-tool-load mock-tool-load-global)")))
-                                              (let ((resolved (macher-agent-resolve-tool "mock-tool-load" nil "tests/fixtures/skills/global/")))
-                                                (expect resolved :to-equal loaded-tool-object))))
+                                                  (it "runs permission-request-hook and aborts if it returns nil"
+                                                      (let ((perm-called nil)
+                                                            (callback-result nil))
+                                                        (add-hook 'macher-agent-permission-request-hook
+                                                                  (lambda (name args)
+                                                                    (setq perm-called (list name args))
+                                                                    nil))
+                                                        (funcall (gptel-tool-function mock-sync-contract-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 "hello")
+                                                        (expect perm-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "hello")))
+                                                        (expect callback-result :to-match "Permission denied by macher-agent-permission-request-hook")))
 
-                                        (it "refuses to load workspace skill tools (security context)"
-                                            (let* ((mock-script-dir (expand-file-name "tests/fixtures/skills/workspace/scripts"))
-                                                   (mock-script-path (expand-file-name "workspace-tool-1.el" mock-script-dir)))
-                                              ;; Setup mock script
-                                              (make-directory mock-script-dir t)
-                                              (with-temp-file mock-script-path
-                                                (insert "(setq workspace-tool-1 'workspace-loaded)"))
+                                                  (it "runs post-tool-use-hook upon successful execution"
+                                                      (let ((post-called nil)
+                                                            (callback-result nil))
+                                                        (add-hook 'macher-agent-post-tool-use-hook
+                                                                  (lambda (name args result)
+                                                                    (setq post-called (list name args result))))
+                                                        (funcall (gptel-tool-function mock-sync-contract-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 "world")
+                                                        (expect callback-result :to-match "Sync world")
+                                                        (expect post-called :to-equal (list 'mock-sync-contract-tool '(:arg1 "world") "Sync world"))))
 
-                                              ;; Test workspace parsing logic
-                                              (macher-agent--load-skill-from-path "tests/fixtures/skills/workspace/" (macher-agent-resolve-context))
-                                              (let* ((workspace (macher-agent--get-context-workspace (macher-agent-resolve-context)))
-                                                     (skill-meta (alist-get 'workspace-skill (macher-agent-workspace-skills-alist workspace))))
-                                                (expect (plist-get skill-meta :context-dir) :to-be nil))
+                                                  (it "runs post-tool-use-failure-hook if the tool body throws an error"
+                                                      (macher-agent-make-tool mock-error-tool
+                                                          "Mock error tool"
+                                                        :category "test"
+                                                        :args (list (list :name "arg1" :type 'string))
+                                                        :command-fn (lambda (_payload _context _root)
+                                                                      (error "Failing intentionally")))
+                                                      (let ((failure-called nil)
+                                                            (callback-result nil))
+                                                        (add-hook 'macher-agent-post-tool-use-failure-hook
+                                                                  (lambda (name args err)
+                                                                    (setq failure-called (list name args err))))
+                                                        (funcall (gptel-tool-function mock-error-tool)
+                                                                 (lambda (res) (setq callback-result res))
+                                                                 "fail")
+                                                        (expect callback-result :to-match "Failing intentionally")
+                                                        (expect (car failure-called) :to-be 'mock-error-tool)
+                                                        (expect (cadr failure-called) :to-equal '(:arg1 "fail"))
+                                                        (expect (error-message-string (caddr failure-called)) :to-equal "Failing intentionally"))))
 
-                                              ;; Resolution should fail to load because context-dir is nil,
-                                              ;; returning the raw string fallback instead of a loaded tool object.
-                                              (let ((resolved (macher-agent-resolve-tool "workspace-tool-1" nil nil)))
-                                                (expect resolved :to-equal "workspace-tool-1"))
+                                        (describe "Agent Skills (macher-agent-skills.el)"
+                                                  (before-each
+                                                   (spy-on 'macher-agent-resolve-context :and-return-value
+                                                           (macher-agent--make-vfs-context :workspace (make-macher-agent-workspace :project-root "/mock/proj") :contents nil)))
+                                                  (it "parses SKILL.md files correctly extracting frontmatter and markdown body"
+                                                      (let* ((parsed (macher-agent-parse-skill-file "tests/fixtures/skills/global/SKILL.md")))
+                                                        (expect (plist-get parsed :name) :to-equal "mock-skill")
+                                                        (expect (plist-get parsed :name-sym) :to-equal 'mock-skill)
+                                                        (expect (plist-get parsed :description) :to-equal "A mock skill for testing")
+                                                        (expect (plist-get parsed :allowed-tools) :to-equal '("mock-tool-1" "mock-tool-2"))
+                                                        (expect (plist-get parsed :body) :to-equal "This is the system prompt for the mock skill.\nIt spans multiple lines.")))
 
-                                              (delete-directory mock-script-dir t)))
+                                                  (it "resolves global skill tools by loading their script if not registered"
+                                                      (let* ((loaded-tool-object (gptel-make-tool :name "mock-tool-load" :category "test")))
+                                                        (setq mock-tool-load-global loaded-tool-object)
+                                                        (spy-on 'file-exists-p :and-return-value t)
+                                                        (spy-on 'insert-file-contents :and-call-fake (lambda (f) (insert "(setq mock-tool-load mock-tool-load-global)")))
+                                                        (let ((resolved (macher-agent-resolve-tool "mock-tool-load" nil "tests/fixtures/skills/global/")))
+                                                          (expect resolved :to-equal loaded-tool-object))))
 
-                                        (it "verifies tool resolution hierarchy (workspace shadows package tools)"
-                                            (let* ((pkg-dir (make-temp-file "macher-pkg" t))
-                                                   (ws-dir (make-temp-file "macher-ws" t))
-                                                   (pkg-scripts (expand-file-name "scripts" pkg-dir))
-                                                   (ws-scripts (expand-file-name "scripts" ws-dir))
-                                                   (ws-a (gptel-make-tool :name "tool-a" :category "test1"))
-                                                   (pkg-b (gptel-make-tool :name "tool-b" :category "test2")))
-                                              (setq mock-ws-a-global ws-a)
-                                              (setq mock-pkg-b-global pkg-b)
-                                              (make-directory pkg-scripts t)
-                                              (make-directory ws-scripts t)
-                                              ;; Package provides tool-a and tool-b
-                                              (with-temp-file (expand-file-name "tool-a.el" pkg-scripts) (insert "(setq tool-a 'pkg-a)"))
-                                              (with-temp-file (expand-file-name "tool-b.el" pkg-scripts) (insert "(setq tool-b mock-pkg-b-global)"))
-                                              ;; Workspace overrides tool-a
-                                              (with-temp-file (expand-file-name "tool-a.el" ws-scripts) (insert "(setq tool-a mock-ws-a-global)"))
+                                                  (it "refuses to load workspace skill tools (security context)"
+                                                      (let* ((mock-script-dir (expand-file-name "tests/fixtures/skills/workspace/scripts"))
+                                                             (mock-script-path (expand-file-name "workspace-tool-1.el" mock-script-dir)))
+                                                        ;; Setup mock script
+                                                        (make-directory mock-script-dir t)
+                                                        (with-temp-file mock-script-path
+                                                          (insert "(setq workspace-tool-1 'workspace-loaded)"))
 
-                                              ;; Clear registry
-                                              (let* ((ctx (macher-agent-resolve-context))
-                                                     (ws (macher-agent--get-context-workspace ctx)))
-                                                (clrhash (macher-agent-workspace-tools-registry ws)))
+                                                        ;; Test workspace parsing logic
+                                                        (macher-agent--load-skill-from-path "tests/fixtures/skills/workspace/" (macher-agent-resolve-context))
+                                                        (let* ((workspace (macher-agent--get-context-workspace (macher-agent-resolve-context)))
+                                                               (skill-meta (alist-get 'workspace-skill (macher-agent-workspace-skills-alist workspace))))
+                                                          (expect (plist-get skill-meta :context-dir) :to-be nil))
 
-                                              ;; Resolve pkg first, then workspace shadows
-                                              (let* ((res-pkg-b (macher-agent-resolve-tool "tool-b" nil pkg-dir))
-                                                     (res-ws-a (macher-agent-resolve-tool "tool-a" nil ws-dir)))
-                                                (expect res-pkg-b :to-equal pkg-b)
-                                                (expect res-ws-a :to-equal ws-a))
+                                                        ;; Resolution should fail to load because context-dir is nil,
+                                                        ;; returning the raw string fallback instead of a loaded tool object.
+                                                        (let ((resolved (macher-agent-resolve-tool "workspace-tool-1" nil nil)))
+                                                          (expect resolved :to-equal "workspace-tool-1"))
 
-                                              (delete-directory pkg-dir t)
-                                              (delete-directory ws-dir t)))
+                                                        (delete-directory mock-script-dir t)))
 
-                                        (it "applies skill tools correctly into gptel-tools when selected"
-                                            (let* ((gptel-tools nil)
-                                                   (gptel--known-presets nil)
-                                                   (gptel-directives nil)
-                                                   (mock-tool-obj (if (fboundp 'gptel-make-tool)
-                                                                      (gptel-make-tool :name "the_tool" :function (lambda () nil) :description "A tool")
-                                                                    'the-tool)))
-                                              (spy-on 'gptel-tool-p :and-return-value t)
-                                              (let* ((ctx (macher-agent-resolve-context))
-                                                     (workspace (macher-agent--get-context-workspace ctx)))
-                                                (puthash "selected-tool" mock-tool-obj (macher-agent-workspace-tools-registry workspace))
+                                                  (it "verifies tool resolution hierarchy (workspace shadows package tools)"
+                                                      (let* ((pkg-dir (make-temp-file "macher-pkg" t))
+                                                             (ws-dir (make-temp-file "macher-ws" t))
+                                                             (pkg-scripts (expand-file-name "scripts" pkg-dir))
+                                                             (ws-scripts (expand-file-name "scripts" ws-dir))
+                                                             (ws-a (gptel-make-tool :name "tool-a" :category "test1"))
+                                                             (pkg-b (gptel-make-tool :name "tool-b" :category "test2")))
+                                                        (setq mock-ws-a-global ws-a)
+                                                        (setq mock-pkg-b-global pkg-b)
+                                                        (make-directory pkg-scripts t)
+                                                        (make-directory ws-scripts t)
+                                                        ;; Package provides tool-a and tool-b
+                                                        (with-temp-file (expand-file-name "tool-a.el" pkg-scripts) (insert "(setq tool-a 'pkg-a)"))
+                                                        (with-temp-file (expand-file-name "tool-b.el" pkg-scripts) (insert "(setq tool-b mock-pkg-b-global)"))
+                                                        ;; Workspace overrides tool-a
+                                                        (with-temp-file (expand-file-name "tool-a.el" ws-scripts) (insert "(setq tool-a mock-ws-a-global)"))
 
-                                                (setf (alist-get 'test-preset (macher-agent-workspace-skills-alist workspace))
-                                                      (list :description "test" :system "Directive body" :tools (list mock-tool-obj) :context-dir nil))
+                                                        ;; Clear registry
+                                                        (let* ((ctx (macher-agent-resolve-context))
+                                                               (ws (macher-agent--get-context-workspace ctx)))
+                                                          (clrhash (macher-agent-workspace-tools-registry ws)))
 
-                                                (with-temp-buffer
-                                                  (let ((gptel--known-presets nil))
-                                                    (macher-agent-initialize-skills ctx)
-                                                    (let ((preset-def (buffer-local-value 'gptel--known-presets (current-buffer))))
-                                                      (setq preset-def (alist-get 'test-preset preset-def))
-                                                      (expect preset-def :not :to-be nil)
-                                                      (expect (plist-get preset-def :tools) :to-equal '(:append ("the_tool")))))))))
+                                                        ;; Resolve pkg first, then workspace shadows
+                                                        (let* ((res-pkg-b (macher-agent-resolve-tool "tool-b" nil pkg-dir))
+                                                               (res-ws-a (macher-agent-resolve-tool "tool-a" nil ws-dir)))
+                                                          (expect res-pkg-b :to-equal pkg-b)
+                                                          (expect res-ws-a :to-equal ws-a))
 
-                                        (it "creates a preset when allowed-tools is provided"
-                                            (let* ((mock-dir (make-temp-file "macher-test-skills-preset" t))
-                                                   (skill-dir (expand-file-name "test-skill" mock-dir)))
-                                              (make-directory skill-dir t)
-                                              (with-temp-file (expand-file-name "SKILL.md" skill-dir)
-                                                (insert "---\nname: my-preset\ndescription: test\nallowed-tools:\n  - some-tool\nmodel: gpt-4o\n---\nPreset body"))
-                                              (spy-on 'macher-agent-resolve-tool :and-return-value "some-tool")
-                                              (with-temp-buffer
-                                                (let ((gptel-directives nil)
-                                                      (gptel--known-presets nil))
-                                                  (macher-agent-initialize-skills nil mock-dir)
+                                                        (delete-directory pkg-dir t)
+                                                        (delete-directory ws-dir t)))
 
-                                                  (let ((preset-def (alist-get 'my-preset gptel--known-presets)))
-                                                    (expect preset-def :not :to-be nil)
-                                                    (expect (plist-get preset-def :system) :to-equal "Preset body")
-                                                    (expect (plist-get preset-def :model) :to-equal 'gpt-4o)
-                                                    (expect (plist-get preset-def :tools) :to-equal '(:append ("some-tool"))))
-                                                  (delete-directory mock-dir t)))))
+                                                  (it "applies skill tools correctly into gptel-tools when selected"
+                                                      (let* ((gptel-tools nil)
+                                                             (gptel--known-presets nil)
+                                                             (gptel-directives nil)
+                                                             (mock-tool-obj (if (fboundp 'gptel-make-tool)
+                                                                                (gptel-make-tool :name "the_tool" :function (lambda () nil) :description "A tool")
+                                                                              'the-tool)))
+                                                        (spy-on 'gptel-tool-p :and-return-value t)
+                                                        (let* ((ctx (macher-agent-resolve-context))
+                                                               (workspace (macher-agent--get-context-workspace ctx)))
+                                                          (puthash "selected-tool" mock-tool-obj (macher-agent-workspace-tools-registry workspace))
 
-                                        (it "injects directly into gptel-directives when allowed-tools is omitted"
-                                            (let* ((mock-dir (make-temp-file "macher-test-skills-directive" t))
-                                                   (skill-dir (expand-file-name "test-skill" mock-dir)))
-                                              (make-directory skill-dir t)
-                                              (with-temp-file (expand-file-name "SKILL.md" skill-dir)
-                                                (insert "---\nname: my-directive\n---\nDirective body"))
-                                              (with-temp-buffer
-                                                (let ((gptel-directives nil)
-                                                      (gptel--known-presets nil))
-                                                  (macher-agent-initialize-skills nil mock-dir)
-                                                  (expect (alist-get 'my-directive gptel-directives) :to-equal "Directive body")
-                                                  (let ((preset-def (alist-get 'my-directive gptel--known-presets)))
-                                                    (expect preset-def :not :to-be nil)
-                                                    (expect (plist-get preset-def :system) :to-equal "Directive body"))
-                                                  (delete-directory mock-dir t)))))))))
+                                                          (setf (alist-get 'test-preset (macher-agent-workspace-skills-alist workspace))
+                                                                (list :description "test" :system "Directive body" :tools (list mock-tool-obj) :context-dir nil))
+
+                                                          (with-temp-buffer
+                                                            (let ((gptel--known-presets nil))
+                                                              (macher-agent-initialize-skills ctx)
+                                                              (let ((preset-def (buffer-local-value 'gptel--known-presets (current-buffer))))
+                                                                (setq preset-def (alist-get 'test-preset preset-def))
+                                                                (expect preset-def :not :to-be nil)
+                                                                (expect (plist-get preset-def :tools) :to-equal '(:append ("the_tool")))))))))
+
+                                                  (it "creates a preset when allowed-tools is provided"
+                                                      (let* ((mock-dir (make-temp-file "macher-test-skills-preset" t))
+                                                             (skill-dir (expand-file-name "test-skill" mock-dir)))
+                                                        (make-directory skill-dir t)
+                                                        (with-temp-file (expand-file-name "SKILL.md" skill-dir)
+                                                          (insert "---\nname: my-preset\ndescription: test\nallowed-tools:\n  - some-tool\nmodel: gpt-4o\n---\nPreset body"))
+                                                        (spy-on 'macher-agent-resolve-tool :and-return-value "some-tool")
+                                                        (with-temp-buffer
+                                                          (let ((gptel-directives nil)
+                                                                (gptel--known-presets nil))
+                                                            (macher-agent-initialize-skills nil mock-dir)
+
+                                                            (let ((preset-def (alist-get 'my-preset gptel--known-presets)))
+                                                              (expect preset-def :not :to-be nil)
+                                                              (expect (plist-get preset-def :system) :to-equal "Preset body")
+                                                              (expect (plist-get preset-def :model) :to-equal 'gpt-4o)
+                                                              (expect (plist-get preset-def :tools) :to-equal '(:append ("some-tool"))))
+                                                            (delete-directory mock-dir t)))))
+
+                                                  (it "injects directly into gptel-directives when allowed-tools is omitted"
+                                                      (let* ((mock-dir (make-temp-file "macher-test-skills-directive" t))
+                                                             (skill-dir (expand-file-name "test-skill" mock-dir)))
+                                                        (make-directory skill-dir t)
+                                                        (with-temp-file (expand-file-name "SKILL.md" skill-dir)
+                                                          (insert "---\nname: my-directive\n---\nDirective body"))
+                                                        (with-temp-buffer
+                                                          (let ((gptel-directives nil)
+                                                                (gptel--known-presets nil))
+                                                            (macher-agent-initialize-skills nil mock-dir)
+                                                            (expect (alist-get 'my-directive gptel-directives) :to-equal "Directive body")
+                                                            (let ((preset-def (alist-get 'my-directive gptel--known-presets)))
+                                                              (expect preset-def :not :to-be nil)
+                                                              (expect (plist-get preset-def :system) :to-equal "Directive body"))
+                                                            (delete-directory mock-dir t))))))))))
 
 (provide 'macher-agent-test)

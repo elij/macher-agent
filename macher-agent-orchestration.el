@@ -20,6 +20,8 @@
 (declare-function macher-agent--inject-context-state "macher-agent-vfs-client" (context &optional directives))
 (declare-function macher-agent--init-workspace-state "macher-agent-vfs-client")
 (declare-function macher-agent--auto-sync-context "macher-agent-vfs-client" (&optional ctx fsm))
+(declare-function macher-agent-normalize-tools "macher-agent-api" (tools))
+(declare-function macher-agent-initialize-skills "macher-agent-api" (&optional context dir))
 
 (defvar macher-agent-submit-task-result-tool)
 
@@ -85,8 +87,7 @@ Return nil."
       (when (and (macher-agent-subagent-p)
                  (macher-agent-ready-to-reap-p))
         (set-buffer-modified-p nil)
-        (when (fboundp 'gptel-abort)
-          (gptel-abort buf))
+        (gptel-abort buf)
         (let ((kill-buffer-query-functions nil)
               (kill-buffer-hook nil))
           (kill-buffer buf))))))
@@ -169,18 +170,16 @@ Return the unified state property list."
                (setq state (plist-put state key val))))))
 
       (dolist (sym inline-presets)
-        (let* ((clean-sym (if (fboundp 'macher-normalise-preset-name)
-                              (macher-normalise-preset-name sym) sym))
+        (let* ((clean-sym (macher-normalise-preset-name sym))
                (spec (when clean-sym (alist-get clean-sym known)))
-               (tool (when (and (not spec) clean-sym (fboundp 'gptel-get-tool))
+               (tool (when (and (not spec) clean-sym)
                        (or (ignore-errors (gptel-get-tool (symbol-name clean-sym)))
                            (ignore-errors (gptel-get-tool (replace-regexp-in-string "-" "_" (symbol-name clean-sym))))))))
           (cond
            (spec (apply-spec sym spec))
            (tool (setq state (plist-put state :tools (append (plist-get state :tools) (list tool)))))))))
 
-    (when (fboundp 'macher-agent-normalize-tools)
-      (setq state (plist-put state :tools (macher-agent-normalize-tools (plist-get state :tools)))))
+    (setq state (plist-put state :tools (macher-agent-normalize-tools (plist-get state :tools))))
 
     state))
 
@@ -444,7 +443,7 @@ CONTEXT is the optional active context structure.
 PRESETS represents optional requested presets.
 
 Return the newly created subagent buffer."
-  (when (and context (fboundp 'macher-agent-initialize-skills))
+  (when context
     (macher-agent-initialize-skills context))
   (let* ((parent-buf (current-buffer))
          (parent-tools (bound-and-true-p gptel-tools))
@@ -517,8 +516,8 @@ Return nil."
             (setq-local macher-agent--pending-children nil)
             (setq-local macher-agent--child-results nil)
             (setq-local macher-agent--resume-callback nil)
-            (let ((ctx (ignore-errors (macher-agent-resolve-context))))
-              (when ctx (macher-agent--auto-sync-context ctx)))))
+            (when-let* ((ctx (ignore-errors (macher-agent-resolve-context))))
+              (macher-agent--auto-sync-context ctx))))
 
 (defun macher-agent-resume-parent-agent ()
   "Aggregate sub-agent results and resume the parent LLM cycle on a clean stack."

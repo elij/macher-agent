@@ -117,7 +117,7 @@ Return nil."
 WORKSPACE is the workspace object.
 
 Return the project root path string, or nil."
-  (if (and (fboundp 'macher-agent-workspace-p) (macher-agent-workspace-p workspace))
+  (if (macher-agent-workspace-p workspace)
       (macher-agent-workspace-project-root workspace)
     (macher--workspace-root workspace)))
 
@@ -418,7 +418,7 @@ ARGS represents the list of event arguments passed by the hook."
          (context (or
                    (cl-find-if
                     (lambda (x) (and x (not (stringp x))
-                                     (fboundp 'macher-context-p) (macher-context-p x))) args)
+                                     (macher-context-p x))) args)
                    (bound-and-true-p macher-agent--persistent-context)))
          (workspace (when context (macher-agent--get-context-workspace context))))
 
@@ -427,9 +427,7 @@ ARGS represents the list of event arguments passed by the hook."
              (registry (if workspace
                            (macher-agent-workspace-tools-registry workspace)
                          macher-agent-tools-registry))
-             (canonical-name (if (fboundp 'macher-agent-canonical-tool-name)
-                                 (macher-agent-canonical-tool-name tool-name)
-                               tool-name)))
+             (canonical-name (macher-agent-canonical-tool-name tool-name)))
         (when registry
           (remhash canonical-name registry)
           (remhash tool-name registry)
@@ -443,8 +441,7 @@ ARGS represents the list of event arguments passed by the hook."
                                           (macher-agent-workspace-project-root workspace))))
         (macher-agent-initialize-skills context skills-dir)))
 
-    (when (and path (fboundp 'macher-agent--is-managed-path-p)
-               (macher-agent--is-managed-path-p path))
+    (when (and path (macher-agent--is-managed-path-p path))
       nil)))
 
 (add-hook 'macher-agent-context-mutated-hook #'macher-agent--mutation-dispatcher)
@@ -596,15 +593,16 @@ SKILLS-DIR is the path to the skills directory (string).
 CONTEXT is the active context structure.
 
 Return nil."
-  (let ((scripts-dir (expand-file-name "scripts" skills-dir)))
-    (when (file-directory-p scripts-dir)
-      (let* ((workspace (when context (macher-agent--get-context-workspace context)))
-             (registry (if workspace
-                           (macher-agent-workspace-tools-registry workspace) macher-agent-tools-registry)))
-        (dolist (script (directory-files scripts-dir t "\\.el$"))
-          (let* ((base (file-name-base script))
-                 (tool (macher-agent-resolve-tool base registry skills-dir context)))
-            (ignore tool)))))))
+  (when-let* ((scripts-dir (expand-file-name "scripts" skills-dir))
+              ((file-directory-p scripts-dir)))
+    (let* ((workspace (when context (macher-agent--get-context-workspace context)))
+           (registry (if workspace
+                         (macher-agent-workspace-tools-registry workspace)
+                       macher-agent-tools-registry)))
+      (dolist (script (directory-files scripts-dir t "\\.el$"))
+        (let* ((base (file-name-base script))
+               (tool (macher-agent-resolve-tool base registry skills-dir context)))
+          (ignore tool))))))
 
 (defun macher-agent--load-skill-from-path (path &optional context)
   "Load a skill from PATH and register it natively with gptel.

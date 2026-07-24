@@ -53,7 +53,8 @@ When a tool or hook requests the active context, the system MUST resolve it in t
 4. Fallback to the `macher-agent-active-workspaces` global registry using the current directory's Git or project root.
 
 * File reads MUST prioritise `vfs-entry-curr`.  If no VFS entry exists, it MUST read from active Emacs buffers, and finally fallback to the physical disk.
-* Any path accessed by the VFS MUST NOT be absolute and MUST resolve strictly within the designated workspace root.  Path traversal (for example, `../` escaping the root) MUST throw a `SECURITY ERROR`.
+* VFS entries in `macher-context-contents` MUST use canonical expanded absolute paths (resolved via `macher-agent--normalize-path-key`) for file entries to ensure seamless state sharing between `macher.el` and `macher-agent`.  Unvisiting or pure Emacs buffers (such as `*scratch*`) MUST retain raw string names as VFS keys.
+* Any path accessed by the VFS MUST NOT be absolute when passed by tools and MUST resolve strictly within the designated workspace root.  Path traversal (for example, `../` escaping the root) MUST throw a `SECURITY ERROR`.
 
 ### 3.2 Ephemeral sandboxing
 
@@ -61,7 +62,7 @@ When executing operating system processes (via `macher-agent-process-response`),
 
 1. The orchestrator MUST verify the project is a valid Git repository.
 2. It MUST create an ephemeral operating system directory (`/tmp/macher-sandbox-XXX`).
-3. It MUST clone the physical disk state via `git ls-files ... | rsync`.
+3. It MUST clone the physical disk state via `git ls-files --recurse-submodules ... | rsync`.
 4. It MUST apply the VFS overlay (writing all modified `vfs-entry-curr` strings into the sandbox).
 5. The process MUST execute inside this sandbox.  Upon exit (0 or greater than 0), the sandbox MUST be recursively deleted.
 6. Path containment verification uses standard Emacs file system functions when paths exist, and falls back to canonicalised lexical prefix matching (implemented in `macher-agent--resolve-safe-path`) when virtual directories do not exist on disk, preventing false positives in the virtual file system sandbox isolation test suite.
@@ -201,6 +202,16 @@ The system MUST intercept `gptel`'s private networking and stream insertion func
 * *Prompt transform input:* `(async-fn fsm)`.  The hook MUST operate strictly within the temporary transmission buffer.  It MUST read the original buffer state, parse and strip tags ephemerally within the temporary buffer, and invoke the pure composition engine (`macher-agent-compose-payload`).  Finally, it MUST apply the composed property list locally to the temporary buffer before transmission, leaving the original source buffer strictly immutable.
 * *Post response input:* `(beg end)`.  The integers defining the buffer region.  The hook MUST extract the string from these bounds to trigger `macher-agent-delegate-response` callbacks.
 
+#### 6.2.6 State restoration and active state machine binding
+
+* **Target:** `gptel--restore-state`
+* **Interception:** `advice-add :around` (`#'macher-agent--gptel-restore-advice`)
+* **Behaviour:** Prevents uncoordinated state restoration unless `macher-agent--allow-gptel-restore` is set. Initialises workspace state and active skills upon restoration.
+
+* **Target:** `gptel--handle-pre-tool`, `gptel--handle-tool-use`, and `gptel--handle-post-tool`
+* **Interception:** `advice-add :around` (`#'macher-agent--bind-active-fsm-advice`)
+* **Behaviour:** Dynamically binds `macher-agent--active-fsm` during tool handling so downstream hooks and scope validators can inspect the active FSM property list without relying on global state variables.
+
 ---
 
 ### 6.3 The macher boundary for workspace and patch generation
@@ -237,9 +248,10 @@ Because `macher` relies on Emacs physical buffers and `macher-agent` uses pure-m
 
 ### 7.1 The gptel bridge
 
-1. **Nil response protection**: `gptel--insert-response` is advised to gracefully handle empty (nil) streaming chunks without throwing Emacs type errors.
-2. **Media injection**: Handled during prompt construction via `gptel-prompt-transform-functions` in `macher-agent-sync-prompt-transformer`. If the context contains `pending-media`, raw base64 data is injected directly into the prompt payload before transmission and cleared from the queue.
+1. **Nil response protection**: `gptel--insert-response` and `gptel-curl--stream-insert-response` are advised to gracefully handle empty (nil) streaming chunks without throwing Emacs type errors.
+2. **Media injection**: Handled during state machine transitions (`gptel--fsm-transition`) and prompt construction via `gptel-prompt-transform-functions` in `macher-agent-sync-prompt-transformer`. If the context contains `pending-media`, raw base64 data is injected directly into the prompt payload before transmission and cleared from the queue.
 3. **Base64 override**: The native `gptel--base64-encode` is intercepted to check the VFS first.  If the file exists in the agent's memory, it encodes the virtual string instead of reading the physical disk.
+4. **State restoration and FSM binding**: `gptel--restore-state` is advised to coordinate session initialisation, while tool execution handlers (`gptel--handle-pre-tool`, `gptel--handle-tool-use`, `gptel--handle-post-tool`) are advised to bind `macher-agent--active-fsm` dynamically.
 
 ### 7.2 The macher bridge for patch generation
 

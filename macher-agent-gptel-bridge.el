@@ -13,10 +13,11 @@
 
 (declare-function macher-agent-resolve-context "macher-agent-vfs-client")
 (declare-function macher-agent--auto-sync-context "macher-agent-vfs-client")
+(declare-function macher-agent--init-workspace-state "macher-agent-vfs-client")
 (declare-function macher-agent--split-context "macher-agent-vfs-client")
 (declare-function macher-agent--build-virtual-patch "macher-agent-vfs-client")
 (declare-function macher-agent--reap-buffer "macher-agent-orchestration")
-(declare-function macher-agent--reap-buffer "macher-agent--apply-payload-locally")
+(declare-function macher-agent-compose-payload "macher-agent-orchestration")
 (declare-function macher-agent-initialize-skills "macher-agent-api")
 (declare-function macher-agent-canonical-tool-name "macher-agent-api")
 
@@ -57,8 +58,7 @@ Return the result of ASYNC-FN."
     (when ctx
       (with-current-buffer orig-buf
         (macher-agent--auto-sync-context ctx)
-        (when (fboundp 'macher-agent-initialize-skills)
-          (macher-agent-initialize-skills ctx))))
+        (macher-agent-initialize-skills ctx)))
 
     (let ((matched-skills nil)
           (inline-preset-used nil)
@@ -90,55 +90,55 @@ Return the result of ASYNC-FN."
             (unless (string-match-p "[A-Za-z]" remaining-text)
               (setq redirected-skill (pop matched-skills)))))
 
-        (when (fboundp 'macher-agent-compose-payload)
-          (let* ((base-state
-                  (with-current-buffer orig-buf
-                    (list :model gptel-model
-                          :system gptel-system-prompt
-                          :temperature (bound-and-true-p gptel-temperature)
-                          :max-tokens (bound-and-true-p gptel-max-tokens)
-                          :tools gptel-tools
-                          :known-presets (bound-and-true-p gptel--known-presets))))
-                 (remaining-skills (nreverse matched-skills))
-                 (all-skills (if redirected-skill
-                                 (append remaining-skills (list redirected-skill))
-                               remaining-skills))
-                 (payload (when all-skills
-                            (macher-agent-compose-payload base-state all-skills))))
+        (when (let ((base-state
+                     (with-current-buffer orig-buf
+                       (list :model gptel-model
+                             :system gptel-system-prompt
+                             :temperature (bound-and-true-p gptel-temperature)
+                             :max-tokens (bound-and-true-p gptel-max-tokens)
+                             :tools gptel-tools
+                             :known-presets (bound-and-true-p gptel--known-presets)))))
+                (let* ((remaining-skills (nreverse matched-skills))
+                       (all-skills (if redirected-skill
+                                       (append remaining-skills (list redirected-skill))
+                                     remaining-skills))
+                       (payload (when all-skills
+                                  (macher-agent-compose-payload base-state all-skills))))
 
-            (when payload
-              (let* ((sys-payload (when remaining-skills
-                                    (macher-agent-compose-payload base-state remaining-skills)))
-                     (final-sys-prompt (if sys-payload
-                                           (plist-get sys-payload :system)
-                                         (plist-get base-state :system))))
+                  (when payload
+                    (let* ((sys-payload (when remaining-skills
+                                          (macher-agent-compose-payload base-state remaining-skills)))
+                           (final-sys-prompt (if sys-payload
+                                                 (plist-get sys-payload :system)
+                                               (plist-get base-state :system))))
 
-                (setq payload (plist-put payload :system final-sys-prompt)))
+                      (setq payload (plist-put payload :system final-sys-prompt)))
 
-              (macher-agent--apply-payload-locally payload)
+                    (macher-agent--apply-payload-locally payload)
 
-              (when fsm
-                (let ((new-info (copy-sequence (gptel-fsm-info fsm))))
-                  (dolist (key '(:system :model :temperature :max-tokens :tools))
-                    (when (plist-member payload key)
-                      (setq new-info (plist-put new-info key (plist-get payload key)))))
-                  (setf (gptel-fsm-info fsm) new-info))))
+                    (when fsm
+                      (let ((new-info (copy-sequence (gptel-fsm-info fsm))))
+                        (dolist (key '(:system :model :temperature :max-tokens :tools))
+                          (when (plist-member payload key)
+                            (setq new-info (plist-put new-info key (plist-get payload key)))))
+                        (setf (gptel-fsm-info fsm) new-info))))
 
-            (when redirected-skill
-              (when-let* ((dummy-base (plist-put (copy-sequence base-state) :system ""))
-                          (dummy-payload (macher-agent-compose-payload dummy-base (list redirected-skill)))
-                          (sys-prompt (plist-get dummy-payload :system))
-                          ((stringp sys-prompt))
-                          ((not (string-empty-p sys-prompt))))
-                (delete-region prompt-start (point-max))
-                (insert sys-prompt)
-                (when fsm
-                  (setf (gptel-fsm-info fsm)
-                        (plist-put (gptel-fsm-info fsm) :prompt sys-prompt)))))))))
+                  (when redirected-skill
+                    (when-let* ((dummy-base (plist-put (copy-sequence base-state) :system ""))
+                                (dummy-payload (macher-agent-compose-payload dummy-base (list redirected-skill)))
+                                (sys-prompt (plist-get dummy-payload :system))
+                                ((stringp sys-prompt))
+                                ((not (string-empty-p sys-prompt))))
+                      (delete-region prompt-start (point-max))
+                      (insert sys-prompt)
+                      (when fsm
+                        (setf (gptel-fsm-info fsm)
+                              (plist-put (gptel-fsm-info fsm) :prompt sys-prompt))))))
+                t))
 
-    (when-let* ((fn async-fn)
-                ((functionp fn)))
-      (funcall fn))))
+        (when-let* ((fn async-fn)
+                    ((functionp fn)))
+          (funcall fn))))))
 
 (defun macher-agent-post-response-reaper (_beg _end)
   "Reap the sub-agent buffer if flagged for disposal.
@@ -151,8 +151,7 @@ Return nil."
              (macher-agent-ready-to-reap-p))
     (let ((buf (current-buffer)))
       (run-at-time 0 nil (lambda ()
-                           (when (and (buffer-live-p buf)
-                                      (fboundp 'macher-agent--reap-buffer))
+                           (when (buffer-live-p buf)
                              (macher-agent--reap-buffer buf)))))))
 
 (defun macher-agent-gptel-transmit (task-context callbacks)
@@ -202,43 +201,44 @@ Return nil."
          (info (when fsm (gptel-fsm-info fsm)))
          (ctx (ignore-errors (macher-agent-resolve-context fsm))))
     (when ctx
-      (when (fboundp 'macher-agent--auto-sync-context)
-        (macher-agent--auto-sync-context ctx))
+      (macher-agent--auto-sync-context ctx)
       (when fsm
         (let* ((info (gptel-fsm-info fsm))
                (has-ctx (plist-get info :macher-agent-context)))
           (unless has-ctx
             (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-context ctx))))))))
 
+(defvar macher-agent--in-media-injection nil)
+
 (defun macher-agent--inject-media-fsm-advice (orig-fun fsm &rest args)
-  "Inject pending tool media into the FSM payload right before transitioning to WAIT.
+  "Inject pending tool media into the FSM payload right before transitioning to WAIT."
+  (if macher-agent--in-media-injection
+      (apply orig-fun fsm args)
+    (let* ((new-state (car args))
+           (target-state (or new-state (ignore-errors (gptel--fsm-next fsm)))))
+      (when (or (eq target-state 'WAIT) (null target-state))
+        (let* ((info (macher-agent--extract-fsm-info fsm))
+               (ctx (plist-get info :macher-agent-context))
+               (pending (when ctx (macher-agent--get-context-data ctx :pending-media))))
 
-ORIG-FUN is the original transition function.
-FSM is the finite-state machine object.
-ARGS represents additional arguments passed to ORIG-FUN."
-  (let* ((new-state (car args))
-         (target-state (or new-state (ignore-errors (gptel--fsm-next fsm)))))
-    (when (or (eq target-state 'WAIT) (null target-state))
-      (let* ((info (macher-agent--extract-fsm-info fsm))
-             (ctx (plist-get info :macher-agent-context))
-             (pending (when ctx (macher-agent--get-context-data ctx :pending-media))))
+          (when pending
+            ;; Use let* so subsequent bindings can reference earlier ones sequentially
+            (let* ((macher-agent--in-media-injection t)
+                   (msg-plist (list :role "user"
+                                    :content "Tool execution complete. Here is the requested visual data:"))
+                   (prompts (list msg-plist))
+                   (gptel-context pending))
 
-        (when pending
-          (let* ((msg-plist (list :role "user"
-                                  :content "Tool execution complete. Here is the requested visual data:"))
-                 (prompts (list msg-plist))
-                 (gptel-context pending))
+              (when (fboundp 'gptel--inject-media)
+                (gptel--inject-media (plist-get info :backend) prompts))
 
-            (when (fboundp 'gptel--inject-media)
-              (gptel--inject-media (plist-get info :backend) prompts))
+              (when (fboundp 'gptel--inject-prompt)
+                (gptel--inject-prompt (plist-get info :backend)
+                                      (plist-get info :data)
+                                      (car prompts)))
 
-            (when (fboundp 'gptel--inject-prompt)
-              (gptel--inject-prompt (plist-get info :backend)
-                                    (plist-get info :data)
-                                    (car prompts)))
-
-            (macher-agent--set-context-data ctx :pending-media nil))))))
-  (apply orig-fun fsm args))
+              (macher-agent--set-context-data ctx :pending-media nil)))))
+      (apply orig-fun fsm args))))
 
 (advice-add 'gptel--fsm-transition :around #'macher-agent--inject-media-fsm-advice)
 
@@ -284,13 +284,23 @@ Return the result of ORIG-FUN."
   (when macher-agent--allow-gptel-restore
     (setq-local macher-agent--is-restored-session t)
     (let ((current-root (macher-agent-root default-directory)))
-      (when (and current-root (fboundp 'macher-agent--init-workspace-state))
+      (when current-root
         (macher-agent--init-workspace-state current-root)))
-    (let ((ctx (when (fboundp 'macher-agent-resolve-context)
-                 (macher-agent-resolve-context))))
-      (when ctx
-        (macher-agent-initialize-skills ctx)))
-    (apply orig-fun args)))
+    (let ((res (apply orig-fun args)))
+      (let* ((restored-ctx (bound-and-true-p macher-agent--persistent-context))
+             (ctx (or restored-ctx (ignore-errors (macher-agent-resolve-context))))
+             (current-root (macher-agent-root default-directory)))
+        (when ctx
+          (when current-root
+            (puthash (expand-file-name current-root) ctx macher-agent-active-workspaces)
+            (puthash (file-name-as-directory (expand-file-name current-root)) ctx macher-agent-active-workspaces)
+            (puthash (directory-file-name (expand-file-name current-root)) ctx macher-agent-active-workspaces))
+          (when-let* ((ctx-root (ignore-errors (macher-agent-context-root ctx))))
+            (puthash (expand-file-name ctx-root) ctx macher-agent-active-workspaces)
+            (puthash (file-name-as-directory (expand-file-name ctx-root)) ctx macher-agent-active-workspaces)
+            (puthash (directory-file-name (expand-file-name ctx-root)) ctx macher-agent-active-workspaces))
+          (macher-agent-initialize-skills ctx)))
+      res)))
 
 (advice-add 'gptel--restore-state :around #'macher-agent--gptel-restore-advice)
 

@@ -146,16 +146,168 @@ Return nil."
     (overlay-put ov 'display "")
     (overlay-put ov 'insert-behind-hooks '(ignore))))
 
-(cl-defmacro macher-agent-make-tool (name-symbol description &key category args command-fn success-fn output-filter-fn)
-  "Define a macher-agent tool compatible with gptel's tool framework.
+(defun macher-agent--extract-prop (obj key)
+  "Extract KEY from OBJ robustly handling plists, alists, and hash-tables.
+Strips leading colons and converts underscores to hyphens for seamless matching."
+  (let* ((key-str (if (keywordp key) (substring (symbol-name key) 1) (format "%s" key)))
+         (norm-key (replace-regexp-in-string "_" "-" key-str))
+         (res 'macher-missing))
+    (cond
+     ((hash-table-p obj)
+      (maphash (lambda (k v)
+                 (let ((k-str (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))))
+                   (when (equal (replace-regexp-in-string "_" "-" k-str) norm-key)
+                     (setq res v))))
+               obj))
+     ((listp obj)
+      (let ((tail obj))
+        (while (and (eq res 'macher-missing) tail (consp tail))
+          (let ((elem (car tail)))
+            (if (consp elem)
+                (let* ((k (car elem))
+                       (k-str (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))))
+                  (when (equal (replace-regexp-in-string "_" "-" k-str) norm-key)
+                    (setq res (cdr elem)))
+                  (setq tail (cdr tail)))
+              (let ((k-str (if (keywordp elem) (substring (symbol-name elem) 1) (format "%s" elem))))
+                (when (equal (replace-regexp-in-string "_" "-" k-str) norm-key)
+                  (setq res (cadr tail)))
+                (setq tail (cddr tail)))))))))
+    (if (eq res 'macher-missing) nil res)))
 
-NAME-SYMBOL is the symbol naming the tool variable.
-DESCRIPTION is the string describing the tool's purpose.
-CATEGORY is the optional classification category of the tool.
-ARGS is the list of argument specifications for the tool.
-COMMAND-FN is the function running the tool logic. Must accept (PAYLOAD CONTEXT ROOT).
-SUCCESS-FN is the function processing success results.
-OUTPUT-FILTER-FN is the optional function filtering tool output."
+(defun macher-agent--validate-schema (spec value &optional path)
+  "Recursively validate VALUE against JSON SPEC. PATH is for error messages."
+  (when (and (consp spec) (eq (car spec) 'quote))
+    (setq spec (cadr spec)))
+  (let* ((type (plist-get spec :type))
+         (name (or path (plist-get spec :name) "value")))
+    (when (and (consp type) (eq (car type) 'quote))
+      (setq type (cadr type)))
+    (cond
+     ((null value)
+      (unless (plist-get spec :optional)
+        (error "%s" (format "Missing required parameter: '%s'" name))))
+     ((eq value :null)
+      (unless (eq type 'null)
+        (error "%s" (format "The '%s' parameter cannot be null." name))))
+     (t
+      (let ((is-valid
+             (pcase type
+               ((or 'string "string")   (stringp value))
+               ((or 'number "number")   (numberp value))
+               ((or 'integer "integer") (integerp value))
+               ((or 'boolean "boolean") (memq value '(t :json-false)))
+               ((or 'array "array")     (vectorp value))
+               ((or 'object "object")   (or (listp value) (hash-table-p value)))
+               (_ (error "%s" (format "Unknown schema type: %S" type))))))
+        (unless is-valid
+          (error "%s" (format "The '%s' parameter must be an %s, not %s"
+                              name type (type-of value)))))
+
+      (pcase type
+        ((or 'array "array")
+         (let ((items-spec (plist-get spec :items)))
+           (when (and (consp items-spec) (eq (car items-spec) 'quote))
+             (setq items-spec (cadr items-spec)))
+           (when items-spec
+             (cl-loop for item across value
+                      for idx from 0
+                      do (macher-agent--validate-schema
+                          items-spec item (format "%s[%d]" name idx))))))
+        ((or 'object "object")
+         (let ((props (plist-get spec :properties))
+               (reqs (plist-get spec :required)))
+           (when (and (consp props) (eq (car props) 'quote))
+             (setq props (cadr props)))
+           (when (and (consp reqs) (eq (car reqs) 'quote))
+             (setq reqs (cadr reqs)))
+           ;; Convert JSON parsed arrays (vectors) into lists for `member` compatibility
+           (when (vectorp reqs)
+             (setq reqs (append reqs nil)))
+           (when props
+             (unless (and (listp props) (evenp (length props)))
+               (error "%s" (format "Schema properties for '%s' must be a flat plist, got %S" name props)))
+             (cl-loop for (k v-spec) on props by #'cddr
+                      for prop-name = (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))
+                      for child-val = (macher-agent--extract-prop value k)
+                      do (if child-val
+                             (macher-agent--validate-schema
+                              v-spec child-val (format "%s.%s" name prop-name))
+                           ;; JSON Schema leniency: ignore missing properties unless explicitly required
+                           (when (or (and reqs
+                                          (or (member prop-name reqs)
+                                              (member (intern prop-name) reqs)
+                                              (member (intern (concat ":" prop-name)) reqs)))
+                                     (and (not reqs)
+                                          (plist-member v-spec :optional)
+                                          (not (plist-get v-spec :optional))))
+                             (error "%s" (format "Missing required parameter: '%s.%s'" name prop-name)))))))))))))
+
+(defun macher-agent--extract-payload (tool-args args-spec)
+  "Normalise TOOL-ARGS against ARGS-SPEC into a flat keyword plist."
+  (if (and tool-args (keywordp (car tool-args)))
+      tool-args
+    (cl-loop for arg in tool-args
+             for spec in args-spec
+             for arg-name = (plist-get spec :name)
+             for key = (intern (concat ":" (if (symbolp arg-name)
+                                               (symbol-name arg-name)
+                                             arg-name)))
+             append (list key arg))))
+
+(defun macher-agent--validate-payload (payload args-spec)
+  "Validate PAYLOAD against ARGS-SPEC using the internal schema validator."
+  (cl-loop for spec in args-spec
+           for arg-name = (plist-get spec :name)
+           for key = (intern (concat ":" (if (symbolp arg-name)
+                                             (symbol-name arg-name)
+                                           arg-name)))
+           for arg-val = (plist-get payload key)
+           do (macher-agent--validate-schema spec arg-val)))
+
+(defun macher-agent--run-pre-hooks (name-sym payload)
+  "Execute pre-tool and permission hooks.  Return error string if blocked, else nil."
+  (let ((pre-blocked nil)
+        (pre-error nil))
+    (condition-case hook-err
+        (cond
+         ((and macher-agent-pre-tool-use-hook
+               (not (run-hook-with-args-until-failure 'macher-agent-pre-tool-use-hook name-sym payload)))
+          (setq pre-blocked "Execution blocked by macher-agent-pre-tool-use-hook"))
+         ((and macher-agent-permission-request-hook
+               (not (run-hook-with-args-until-failure 'macher-agent-permission-request-hook name-sym payload)))
+          (setq pre-blocked "Permission denied by macher-agent-permission-request-hook")))
+      (error
+       (setq pre-error (format "Execution blocked by error in macher-agent-pre-tool-use-hook: %s"
+                               (error-message-string hook-err)))))
+    (or pre-blocked pre-error)))
+
+(defmacro macher-agent--with-tool-error-handling (name-sym payload wrap-cb &rest body)
+  "Wrap BODY in a condition-case that catches and reports tool execution errors."
+  (declare (indent 3))
+  `(condition-case err
+       (progn ,@body)
+     (error
+      (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload err)
+      (funcall ,wrap-cb (list :status 'error :error (error-message-string err))))))
+
+(defmacro macher-agent--build-success-callback (name-sym payload success-fn output-filter-fn wrap-cb)
+  "Generate the success callback lambda for a tool execution."
+  `(lambda (res-obj)
+     (condition-case cb-err
+         (let* ((raw-payload (if (macher-agent-tool-response-p res-obj)
+                                 (macher-agent-tool-response-payload res-obj)
+                               res-obj))
+                (success-data (if ,success-fn (funcall ,success-fn raw-payload) raw-payload))
+                (final-data (if ,output-filter-fn (funcall ,output-filter-fn success-data) success-data)))
+           (run-hook-with-args 'macher-agent-post-tool-use-hook ,name-sym ,payload final-data)
+           (funcall ,wrap-cb (list :status 'success :data final-data)))
+       (error
+        (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload cb-err)
+        (funcall ,wrap-cb (list :status 'error :error (error-message-string cb-err)))))))
+
+(cl-defmacro macher-agent-make-tool (name-symbol description &key category args command-fn success-fn output-filter-fn)
+  "Define a macher-agent tool compatible with gptel's tool framework."
   (declare (indent 2))
   (let* ((stripped-name (replace-regexp-in-string "^macher-agent-\\|-tool$" "" (symbol-name name-symbol)))
          (name (replace-regexp-in-string "-" "_" stripped-name)))
@@ -164,67 +316,30 @@ OUTPUT-FILTER-FN is the optional function filtering tool output."
        (setq ,name-symbol
              (gptel-make-tool
               :name ,name
-              :description ,description 
-              :category ,(or category "macher-agent") 
-              :args ,args 
+              :description ,description
+              :category ,(or category "macher-agent")
+              :args ,args
               :async t
               :function
               (lambda (callback &rest tool-args)
-                ;; 1. gptel guarantees `callback` is ALWAYS arg 1 for async tools.
-                ;; 2. `tool-args` are ALWAYS positional, mapped perfectly to the `args` spec.
-                
-                ;; Zip the positional args into a plist deterministically
-                (let* ((payload (cl-loop for arg in tool-args
-                                         for spec in ,args
-                                         for arg-name = (plist-get spec :name)
-                                         for key = (intern (concat ":" (if (symbolp arg-name) 
-                                                                           (symbol-name arg-name) 
-                                                                         arg-name)))
-                                         append (list key arg)))
-                       (context (or (ignore-errors (macher-agent-resolve-context))
-                                    (bound-and-true-p macher-agent--persistent-context)))
-                       (root (if context (macher-agent-context-root context) default-directory))
-                       (wrap-cb (macher-agent--wrap-callback callback)))
-                  
-                  ;; Run pre-flight hooks with support for aborting on nil or errors.
-                  (condition-case pre-err
-                      (if (and macher-agent-pre-tool-use-hook
-                               (not (run-hook-with-args-until-failure 'macher-agent-pre-tool-use-hook ',name-symbol payload)))
-                          (funcall wrap-cb (list :status 'error :error "Execution blocked by macher-agent-pre-tool-use-hook"))
-                        (condition-case perm-err
-                            (if (and macher-agent-permission-request-hook
-                                     (not (run-hook-with-args-until-failure 'macher-agent-permission-request-hook ',name-symbol payload)))
-                                (funcall wrap-cb (list :status 'error :error "Permission denied by macher-agent-permission-request-hook"))
-                              (condition-case err
-                                  (let* ((action (funcall ,command-fn payload context root)))
-                                    
-                                    (unless (macher-agent-tool-response-p action)
-                                      (setq action (make-macher-agent-lisp-result-response
-                                                    :payload (if (stringp action) action (format "%S" action)))))
-                                    
-                                    (let ((on-success
-                                           (lambda (res-obj)
-                                             (condition-case cb-err
-                                                 (let* ((raw-payload (if (macher-agent-tool-response-p res-obj)
-                                                                         (macher-agent-tool-response-payload res-obj)
-                                                                       res-obj))
-                                                        (success-data (if ,success-fn (funcall ,success-fn raw-payload) raw-payload))
-                                                        (final-data (if ,output-filter-fn (funcall ,output-filter-fn success-data) success-data)))
-                                                   
-                                                   (run-hook-with-args 'macher-agent-post-tool-use-hook ',name-symbol payload final-data)
-                                                   (funcall wrap-cb (list :status 'success :data final-data)))
-                                               (error
-                                                (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ',name-symbol payload cb-err)
-                                                (funcall wrap-cb (list :status 'error :error (error-message-string cb-err))))))))
-                                      
-                                      (macher-agent-execute-response action context on-success wrap-cb)))
-                                (error
-                                 (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ',name-symbol payload err)
-                                 (funcall wrap-cb (list :status 'error :error (error-message-string err))))))
-                          (error
-                           (funcall wrap-cb (list :status 'error :error (format "Execution blocked by error in macher-agent-permission-request-hook: %s" (error-message-string perm-err)))))))
-                    (error
-                     (funcall wrap-cb (list :status 'error :error (format "Execution blocked by error in macher-agent-pre-tool-use-hook: %s" (error-message-string pre-err)))))))))))))
+                (let* ((wrap-cb (macher-agent--wrap-callback callback))
+                       (payload (macher-agent--extract-payload tool-args ,args)))
+                  (macher-agent--with-tool-error-handling ',name-symbol payload wrap-cb
+                    (macher-agent--validate-payload payload ,args)
+                    (let* ((context (or (ignore-errors (macher-agent-resolve-context))
+                                        (bound-and-true-p macher-agent--persistent-context)))
+                           (root (if context (macher-agent-context-root context) default-directory))
+                           (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
+                      (if hook-rejection
+                          (funcall wrap-cb (list :status 'error :error hook-rejection))
+                        (let* ((action (funcall ,command-fn payload context root))
+                               (action-res (if (macher-agent-tool-response-p action)
+                                               action
+                                             (make-macher-agent-lisp-result-response
+                                              :payload (if (stringp action) action (format "%S" action)))))
+                               (on-success (macher-agent--build-success-callback
+                                            ',name-symbol payload ,success-fn ,output-filter-fn wrap-cb)))
+                          (macher-agent-execute-response action-res context on-success wrap-cb))))))))))))
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-process-response) context on-success on-error)
   "Execute response RES within CONTEXT in a sandbox, then invoke ON-SUCCESS or ON-ERROR."
@@ -335,8 +450,6 @@ Return the file contents string, or nil."
      ((file-exists-p file-path)
       (with-temp-buffer (insert-file-contents file-path) (buffer-string)))
      (t nil))))
-
-
 
 (defvar-local macher-agent--pending-instructions-queue nil
   "List of instruction strings to append to the tool's return payload.")
