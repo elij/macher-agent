@@ -39,6 +39,9 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                            (resp (and queue-pair (pop (cdr queue-pair)))))
 
                       (plist-put info :macher-agent-context ctx)
+                      (when-let* ((buf (plist-get info :buffer)))
+                        (with-current-buffer buf
+                          (setq-local gptel--fsm-last fsm)))
 
                       ;; Run asynchronously to process background tool queues
                       (run-at-time 0.01 nil

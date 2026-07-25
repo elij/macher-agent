@@ -73,25 +73,6 @@ Return the MD5 hash string."
 
 (defvar-local macher-agent--persistent-context nil)
 
-(defun macher-agent--around-make-context (orig-fun &rest args)
-  "Intercept `macher--make-context` to return `macher-agent--persistent-context` if bound locally.
-
-ORIG-FUN is the original `macher--make-context` constructor function.
-ARGS represents keyword arguments passed to the constructor.
-
-Return the persistent context if bound and non-nil, otherwise call ORIG-FUN."
-  (let ((persistent-ctx (bound-and-true-p macher-agent--persistent-context)))
-    (if persistent-ctx
-        (progn
-          (when (plist-member args :prompt)
-            (setf (macher-context-prompt persistent-ctx) (plist-get args :prompt)))
-          (when (plist-member args :process-request-function)
-            (setf (macher-context-process-request-function persistent-ctx) (plist-get args :process-request-function)))
-          persistent-ctx)
-      (apply orig-fun args))))
-
-(advice-add 'macher--make-context :around #'macher-agent--around-make-context)
-
 (cl-defun macher-agent--make-vfs-context (&key workspace contents)
   "Create a native `macher-context` struct using `macher--make-context`.
 
@@ -251,7 +232,7 @@ DOCSTRING is the optional documentation string to use."
   "Get the active finite-state machine (FSM) if bound.
 
 Return the active finite-state machine struct, or nil."
-  (or (and (boundp 'macher-agent--active-fsm) macher-agent--active-fsm)
+  (or (bound-and-true-p macher--fsm-latest)
       (bound-and-true-p gptel--fsm)
       (bound-and-true-p gptel--fsm-last)))
 

@@ -189,25 +189,6 @@ Return nil."
       (goto-char (point-max))
       (gptel-send))))
 
-(defun macher-agent--setup-tools-pre-hook (&rest _args)
-  "Sync the VFS and inject the sandbox session before tools are executed.
-
-_ARGS represents the unused arguments passed to the hook.
-
-Return nil."
-  (let* ((fsm (or macher-agent--active-fsm
-                  (bound-and-true-p macher--fsm-latest)
-                  (bound-and-true-p gptel--fsm-last)))
-         (info (when fsm (gptel-fsm-info fsm)))
-         (ctx (ignore-errors (macher-agent-resolve-context fsm))))
-    (when ctx
-      (macher-agent--auto-sync-context ctx)
-      (when fsm
-        (let* ((info (gptel-fsm-info fsm))
-               (has-ctx (plist-get info :macher-agent-context)))
-          (unless has-ctx
-            (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-context ctx))))))))
-
 (defvar macher-agent--in-media-injection nil)
 
 (defun macher-agent--inject-media-fsm-advice (orig-fun fsm &rest args)
@@ -325,22 +306,6 @@ Return a cons cell (BACKEND . MODEL-FORMAT) if found, otherwise nil."
                     (setq result (cons backend m-raw)))))))))
       result)))
 
-(defvar macher-agent--active-fsm nil
-  "Dynamically bound to the active FSM during tool execution hooks.")
-
-(defun macher-agent--bind-active-fsm-advice (orig-fn fsm &rest args)
-  "Capture FSM dynamically so tool validators do not rely on lagging state variables.
-
-ORIG-FN is the original function being advised.
-FSM is the active finite-state machine object.
-ARGS represents additional arguments passed to ORIG-FN."
-  (let ((macher-agent--active-fsm fsm))
-    (apply orig-fn fsm args)))
-
-(advice-add 'gptel--handle-pre-tool :around #'macher-agent--bind-active-fsm-advice)
-(advice-add 'gptel--handle-tool-use :around #'macher-agent--bind-active-fsm-advice)
-(advice-add 'gptel--handle-post-tool :around #'macher-agent--bind-active-fsm-advice)
-
 (defun macher-agent--enforce-tool-scope (tool &optional fsm &rest _args)
   "Enforce that TOOL is explicitly within the authorised scope.
 If not, block execution to prevent hallucinated or globally-leaked tools.
@@ -351,7 +316,7 @@ _ARGS represents unused arguments passed from the hook.
 
 Return a block list if the tool is out of scope, otherwise nil."
   (let* ((canonical-name (macher-agent-canonical-tool-name tool))
-         (fsm-obj (or macher-agent--active-fsm
+         (fsm-obj (or fsm
                       (bound-and-true-p macher--fsm-latest)
                       (bound-and-true-p gptel--fsm-last)))
          (info (when fsm-obj (gptel-fsm-info fsm-obj)))
@@ -371,8 +336,7 @@ Return nil."
         (setq-local macher-agent-presets nil)
         (setq-local macher-agent--is-restored-session nil))
       (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
-      (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t)
-      (add-hook 'gptel-pre-tool-call-functions #'macher-agent--setup-tools-pre-hook nil t))))
+      (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t))))
 
 (add-hook 'gptel-mode-hook #'macher-agent-setup-gptel-buffer)
 
@@ -433,6 +397,18 @@ and securely inject the persistent VFS context."
     (macher--add-transition-handler fsm init-handler)
     (macher--add-termination-handler fsm termination-handler))
   (funcall callback))
+
+(defvar macher-agent--active-fsm nil
+  "Bound to the active FSM during tool execution hooks.")
+
+(defun macher-agent--bind-active-fsm-advice (orig-fn fsm &rest args)
+  "Capture FSM so tool validators do not rely on lagging state variables."
+  (let ((macher-agent--active-fsm fsm))
+    (apply orig-fn fsm args)))
+
+(advice-add 'gptel--handle-pre-tool :around #'macher-agent--bind-active-fsm-advice)
+(advice-add 'gptel--handle-tool-use :around #'macher-agent--bind-active-fsm-advice)
+(advice-add 'gptel--handle-post-tool :around #'macher-agent--bind-active-fsm-advice)
 
 (provide 'macher-agent-gptel-bridge)
 ;;; macher-agent-gptel-bridge.el ends here

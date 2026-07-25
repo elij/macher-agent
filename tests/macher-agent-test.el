@@ -169,7 +169,7 @@
                                     (with-current-buffer buf
                                       (setq-local macher-agent--is-workspace t)
                                       (setq-local macher-agent--persistent-context ctx)
-                                      (setq-local macher-agent--active-fsm nil))
+                                      (setq-local gptel--fsm-last nil))
 
                                     (with-current-buffer buf
                                       (macher-agent-apply-virtual-buffers))
@@ -377,10 +377,10 @@
                                         (it "permits access to valid media files inside the workspace without triggering VFS text security locks"
                                             (let* ((gptel-track-media t)
                                                    (ctx (macher--make-context :contents nil))
-                                                   (macher-agent--active-fsm (gptel-make-fsm))
-                                                   (mock-info (list :macher-agent-context ctx))
+                                                   (gptel--fsm-last (gptel-make-fsm))
+                                                   (mock-info (list :buffer (current-buffer) :macher-agent-context ctx))
                                                    (tool-fn (gptel-tool-function macher-agent-read-media-in-workspace-tool)))
-                                              (setf (gptel-fsm-info macher-agent--active-fsm) mock-info)
+                                              (setf (gptel-fsm-info gptel--fsm-last) mock-info)
                                               (spy-on 'macher-agent-resolve-context :and-return-value ctx)
                                               (spy-on 'macher-agent-context-classify-entry :and-return-value 'media)
                                               (spy-on 'file-exists-p :and-return-value t)
@@ -401,10 +401,10 @@
                                             (let* ((gptel-track-media t)
                                                    (gptel-context nil)
                                                    (ctx (macher--make-context :contents (list (macher-agent-vfs-make-entry "test.png" "" "img-data"))))
-                                                   (macher-agent--active-fsm (gptel-make-fsm))
-                                                   (mock-info (list :macher-agent-context ctx))
+                                                   (gptel--fsm-last (gptel-make-fsm))
+                                                   (mock-info (list :buffer (current-buffer) :macher-agent-context ctx))
                                                    (tool-fn (gptel-tool-function macher-agent-read-media-in-workspace-tool)))
-                                              (setf (gptel-fsm-info macher-agent--active-fsm) mock-info)
+                                              (setf (gptel-fsm-info gptel--fsm-last) mock-info)
                                               (spy-on 'macher-agent-resolve-context :and-return-value ctx)
                                               (spy-on 'mailcap-file-name-to-mime-type :and-return-value "image/png")
                                               (spy-on 'file-exists-p :and-return-value t)
@@ -590,7 +590,7 @@
                               (describe "Interactive Commands and State (macher-agent-orchestration.el)"
                                         (it "macher-agent-add-buffer-to-scope explicitly errors out if no existing session is found"
                                             (let ((buf (generate-new-buffer "lazy-target")))
-                                              (let ((macher-agent--active-fsm nil)
+                                              (let ((gptel--fsm-last nil)
                                                     (macher-agent-active-workspaces (make-hash-table :test 'equal))
                                                     (macher-agent--persistent-context nil))
                                                 (cl-letf (((symbol-function 'buffer-list) (lambda () nil)))

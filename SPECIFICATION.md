@@ -202,15 +202,11 @@ The system MUST intercept `gptel`'s private networking and stream insertion func
 * *Prompt transform input:* `(async-fn fsm)`.  The hook MUST operate strictly within the temporary transmission buffer.  It MUST read the original buffer state, parse and strip tags ephemerally within the temporary buffer, and invoke the pure composition engine (`macher-agent-compose-payload`).  Finally, it MUST apply the composed property list locally to the temporary buffer before transmission, leaving the original source buffer strictly immutable.
 * *Post response input:* `(beg end)`.  The integers defining the buffer region.  The hook MUST extract the string from these bounds to trigger `macher-agent-delegate-response` callbacks.
 
-#### 6.2.6 State restoration and active state machine binding
+#### 6.2.6 State restoration
 
 * **Target:** `gptel--restore-state`
 * **Interception:** `advice-add :around` (`#'macher-agent--gptel-restore-advice`)
 * **Behaviour:** Prevents uncoordinated state restoration unless `macher-agent--allow-gptel-restore` is set. Initialises workspace state and active skills upon restoration.
-
-* **Target:** `gptel--handle-pre-tool`, `gptel--handle-tool-use`, and `gptel--handle-post-tool`
-* **Interception:** `advice-add :around` (`#'macher-agent--bind-active-fsm-advice`)
-* **Behaviour:** Dynamically binds `macher-agent--active-fsm` during tool handling so downstream hooks and scope validators can inspect the active FSM property list without relying on global state variables.
 
 ---
 
@@ -225,14 +221,7 @@ Because `macher` relies on Emacs physical buffers and `macher-agent` uses pure-m
 * **Inputs received:** `(workspace &rest _args)` where `workspace` could be a `macher-agent-workspace` record, a cons cell `(agent . [record])`, a cons cell `(project . "/path")`, or a string.
 * **Invariant:** The original upstream function passes recursive records into Emacs' native `md5`, which causes Lisp nesting-depth crashes.  The override MUST extract the string path from the varying workspace formats and return `(md5 path)`.  It MUST NOT call the original function.
 
-#### 6.3.2 Context singleton intercept
-
-* **Target:** `macher--make-context`
-* **Interception:** `advice-add :around` (`#'macher-agent--around-make-context`)
-* **Inputs received:** `(orig-fun &rest args)`
-* **Behaviour:** Intercepts `macher--make-context` to check whether `macher-agent--persistent-context` is bound locally. If bound and non-nil, it returns the persistent context structure, ensuring the native setup transformer reuses the existing context state rather than instantiating a blank context.
-
-#### 6.3.3 The double-pass patch generation
+#### 6.3.2 The double-pass patch generation
 
 * **Target:** `macher-process-request-function`
 * **Processor:** `#'macher-agent-process-request`
@@ -251,13 +240,12 @@ Because `macher` relies on Emacs physical buffers and `macher-agent` uses pure-m
 1. **Nil response protection**: `gptel--insert-response` and `gptel-curl--stream-insert-response` are advised to gracefully handle empty (nil) streaming chunks without throwing Emacs type errors.
 2. **Media injection**: Handled during state machine transitions (`gptel--fsm-transition`) and prompt construction via `gptel-prompt-transform-functions` in `macher-agent-sync-prompt-transformer`. If the context contains `pending-media`, raw base64 data is injected directly into the prompt payload before transmission and cleared from the queue.
 3. **Base64 override**: The native `gptel--base64-encode` is intercepted to check the VFS first.  If the file exists in the agent's memory, it encodes the virtual string instead of reading the physical disk.
-4. **State restoration and FSM binding**: `gptel--restore-state` is advised to coordinate session initialisation, while tool execution handlers (`gptel--handle-pre-tool`, `gptel--handle-tool-use`, `gptel--handle-post-tool`) are advised to bind `macher-agent--active-fsm` dynamically.
+4. **State restoration**: `gptel--restore-state` is advised to coordinate session initialisation.
 
 ### 7.2 The macher bridge for patch generation
 
 Because `macher` expects separate updates and `macher-agent` uses both physical disk files and memory-based virtual buffers, the bridge orchestrates a double-pass patch generation sequence:
 
-1. **Context intercept:** `macher--make-context` is intercepted to return the global `macher-agent--persistent-context` singleton, ensuring the patch generator sees all virtual and physical edits in the active workspace.
-2. **Context splitting:** The context preprocessor `macher-agent-prepare-upstream-payloads` partitions active workspace edits into standard physical and virtual contexts.
-3. **Double-pass routing:** `macher-agent-process-request` delegates the formatting of each partitioned context back to the native `macher` engine via `macher--build-patch`.
-4. **Buffer separation:** Unique, isolated buffers are produced for physical and virtual updates with preserved workspace hashes and suffixes.
+1. **Context splitting:** The context preprocessor `macher-agent-prepare-upstream-payloads` partitions active workspace edits into standard physical and virtual contexts.
+2. **Double-pass routing:** `macher-agent-process-request` delegates the formatting of each partitioned context back to the native `macher` engine via `macher--build-patch`.
+3. **Buffer separation:** Unique, isolated buffers are produced for physical and virtual updates with preserved workspace hashes and suffixes.

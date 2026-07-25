@@ -105,7 +105,7 @@
                         (let* ((workspace (make-macher-agent-workspace :project-root "/mock/proj/"))
                                (ctx (macher--make-context :workspace workspace :contents nil))
                                (fsm (gptel-make-fsm))
-                               (macher-agent--active-fsm fsm))
+                               (gptel--fsm-last fsm))
                           
                           (setf (gptel-fsm-info fsm) (list :macher-agent-context ctx))
                           (macher-agent--set-context-data ctx :pending-media (list (list "mockbase64" :mime "image/png")))

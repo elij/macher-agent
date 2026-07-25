@@ -32,8 +32,10 @@ relative to the workspace root."))
 at: %s" abs-path))
 
                   (let* ((mime (mailcap-file-name-to-mime-type abs-path))
-                         (info (when (bound-and-true-p macher-agent--active-fsm)
-                                 (macher-agent--extract-fsm-info macher-agent--active-fsm))))
+                         (fsm (when (bound-and-true-p macher-agent--active-fsm)
+                                macher-agent--active-fsm))
+                         (info (when fsm
+                                 (macher-agent--extract-fsm-info fsm))))
                     (unless mime
                       (error "Could not determine MIME type for media: %s" abs-path))
 
@@ -52,7 +54,7 @@ at: %s" abs-path))
                           (macher-agent--set-context-data context :pending-media pending)
                           (when info
                             (unless (plist-get info :macher-agent-context)
-                              (setf (gptel-fsm-info macher-agent--active-fsm)
+                              (setf (gptel-fsm-info fsm)
                                     (plist-put info :macher-agent-context context)))))))
 
                     (make-macher-agent-lisp-result-response
