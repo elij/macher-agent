@@ -81,7 +81,9 @@ PASSED-CONTEXT is the context object passed in, which may be nil.
 Return the resolved context structure, or nil."
   (or passed-context
       (ignore-errors (macher-agent-current-context))
-      (when-let* ((fsm (or (bound-and-true-p macher--fsm-latest) (bound-and-true-p gptel--fsm-last)))
+      (when-let* ((fsm (or (bound-and-true-p macher-agent--active-fsm)
+                           (bound-and-true-p macher--fsm-latest)
+                           (bound-and-true-p gptel--fsm-last)))
                   (info (macher-agent--extract-fsm-info fsm)))
         (plist-get info :macher-agent-context))))
 

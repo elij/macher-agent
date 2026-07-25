@@ -317,6 +317,7 @@ _ARGS represents unused arguments passed from the hook.
 Return a block list if the tool is out of scope, otherwise nil."
   (let* ((canonical-name (macher-agent-canonical-tool-name tool))
          (fsm-obj (or fsm
+                      (bound-and-true-p macher-agent--active-fsm)
                       (bound-and-true-p macher--fsm-latest)
                       (bound-and-true-p gptel--fsm-last)))
          (info (when fsm-obj (gptel-fsm-info fsm-obj)))
