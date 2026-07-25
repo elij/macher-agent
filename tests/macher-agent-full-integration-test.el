@@ -168,7 +168,7 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                        (expect (buffer-string) :to-match "Final output: Hello Workspace")
 
                        (let ((vfs-entry (or (cl-find "target-buffer" (macher-agent--get-context-contents ctx) :key #'car :test #'equal)
-                                   (cl-find (expand-file-name "target-buffer") (macher-agent--get-context-contents ctx) :key #'car :test #'equal))))
+                                            (cl-find (expand-file-name "target-buffer") (macher-agent--get-context-contents ctx) :key #'car :test #'equal))))
                          (expect vfs-entry :not :to-be nil)
                          (when vfs-entry
                            (expect (macher-agent-vfs-entry-curr vfs-entry) :to-equal "Hello Workspace")))))
@@ -207,7 +207,7 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                        (expect (>= call-count 2) :to-be t)
 
                        (let ((vfs-entry (or (cl-find "sandbox_test.txt" (macher-agent--get-context-contents ctx) :key #'car :test #'equal)
-                                   (cl-find (expand-file-name "sandbox_test.txt") (macher-agent--get-context-contents ctx) :key #'car :test #'equal))))
+                                            (cl-find (expand-file-name "sandbox_test.txt") (macher-agent--get-context-contents ctx) :key #'car :test #'equal))))
                          (expect vfs-entry :not :to-be nil)
                          (expect (macher-agent-vfs-entry-curr vfs-entry) :to-equal "sandbox inflated content"))
 
@@ -261,7 +261,7 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                   (when (buffer-live-p parent-buffer) (kill-buffer parent-buffer))
                   (when (buffer-live-p target-buf) (kill-buffer target-buf)))))
 
-(it "interleaves macher-agent tools and macher tools seamlessly across turns"
+          (it "interleaves macher-agent tools and macher tools seamlessly across turns"
               (let ((call-count 0)
                     (parent-buffer (generate-new-buffer "*macher-test-interleave*")))
                 (unwind-protect
@@ -303,11 +303,22 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
 
                   (when (buffer-live-p parent-buffer) (kill-buffer parent-buffer)))))
 
-                    (it "writes a file via VFS write tool and reads it back via search_in_workspace"
-              (let ((call-count 0)
-                    (parent-buffer (generate-new-buffer "*macher-test-vfs-search*")))
+          (it "writes a file via VFS write tool and reads it back via search_in_workspace"
+              (let* ((call-count 0)
+                     (temp-dir (file-name-as-directory (make-temp-file "macher-test-" t)))
+                     (parent-buffer (generate-new-buffer "*macher-test-vfs-search*")))
+                
                 (unwind-protect
                     (with-current-buffer parent-buffer
+                      
+                      (setq default-directory temp-dir)
+                      
+                      (call-process "git" nil nil nil "init")
+                      
+                      (call-process "git" nil nil nil "config" "user.email" "test@example.com")
+                      (call-process "git" nil nil nil "config" "user.name" "Test User")
+                      (call-process "git" nil nil nil "commit" "--allow-empty" "-m" "Initial commit")
+
                       (when (fboundp 'markdown-mode) (markdown-mode))
                       (when (fboundp 'gptel-mode) (gptel-mode 1))
                       (when (fboundp 'macher-agent-mode) (macher-agent-mode 1))
@@ -316,7 +327,9 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
 
                       (with-macher-agent-test-context
                        '(("macher-test-vfs-search" .
-                          ((:text nil :tool-use (("write_buffer_in_workspace" "vfs-integration-target.txt" "findme_vfs_token_12345")))                           (:text nil :tool-use (("search_in_workspace" "findme_vfs_token_12345")))                           (:text "Found token in VFS search" :tool-use nil))))
+                          ((:text nil :tool-use (("write_buffer_in_workspace" "vfs-integration-target.txt" "findme_vfs_token_12345")))
+                           (:text nil :tool-use (("search_in_workspace" "findme_vfs_token_12345")))
+                           (:text "Found token in VFS search" :tool-use nil))))
                        call-count
 
                        (if (fboundp 'macher-agent-send)
@@ -324,14 +337,22 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                          (gptel-send))
 
                        (let ((timeout 100))
-                         (while (and (< call-count 3) (> timeout 0))
+                         (while (and (> timeout 0) 
+                                     (let ((current-fsm (macher-agent--get-fsm-latest)))
+                                       (or (not (string-match-p "Found token in VFS search" (buffer-string)))
+                                           (and current-fsm (not (eq (gptel-fsm-state current-fsm) 'STOP))))))
                            (accept-process-output nil 0.05)
                            (cl-decf timeout)))
 
                        (expect (>= call-count 3) :to-be t)
                        (expect (buffer-string) :to-match "Found token in VFS search"))
 
-                  (when (buffer-live-p parent-buffer) (kill-buffer parent-buffer)))))))
-
+                      (when (buffer-live-p parent-buffer)
+                        (when (fboundp 'gptel-abort)
+                          (gptel-abort parent-buffer))
+                        (kill-buffer parent-buffer))
+                      
+                      (when (file-directory-p temp-dir)
+                        (delete-directory temp-dir t)))))))
 (provide 'macher-agent-full-integration-test)
 ;;; macher-agent-full-integration-test.el ends here
