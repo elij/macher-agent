@@ -27,9 +27,7 @@ the background."
 execution completed with status: %s"
 										   (macher-agent-tool-response-buffer-name res)
 										   (macher-agent-tool-response-status res)))))
-					(make-macher-agent-lisp-result-response
-					 :payload (format "SUCCESS: Dispatched %d sub-agents in the background. \
-They are executing independently and asynchronously. Your current buffer remains unblocked \
-and you can proceed with other tasks immediately."
-							  (length normalized-tasks))
-					 :ptc-payload (mapcar (lambda (task) (plist-get task :buffer_name)) normalized-tasks)))))
+					(mapcar (lambda (task) (plist-get task :buffer_name)) normalized-tasks)))
+			:success-fn (lambda (buffer-names _payload)
+				      (format "SUCCESS: Dispatched %d sub-agents in the background. They are executing independently and asynchronously. Your current buffer remains unblocked and you can proceed with other tasks immediately."
+					      (length buffer-names))))

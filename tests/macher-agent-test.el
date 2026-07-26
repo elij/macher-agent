@@ -1013,24 +1013,22 @@
                 (let ((macher-agent--active-ptc-primitives '(unmatched-primitive)))
                   (expect (macher-agent--inject-ptc-prompt base-prompt) :to-equal base-prompt))))
 
-          (it "extracts ptc-payload when executing tools in PTC mode, falling back to payload"
-              (let* ((macher-agent--active-ptc-execution t)
-                     (res-with-ptc (make-macher-agent-lisp-result-response
-                                    :payload "Natural language string"
-                                    :ptc-payload '("lisp" "object" "list")))
-                     (res-legacy (make-macher-agent-lisp-result-response
-                                  :payload "Legacy string payload"
-                                  :ptc-payload nil))
-                     (cb-ptc-val nil)
-                     (cb-legacy-val nil)
-                     (cb1 (macher-agent--build-success-callback
-                           'test-tool nil nil nil (lambda (res) (setq cb-ptc-val (plist-get res :data)))))
-                     (cb2 (macher-agent--build-success-callback
-                           'test-tool nil nil nil (lambda (res) (setq cb-legacy-val (plist-get res :data))))))
-                (funcall cb1 res-with-ptc)
-                (expect cb-ptc-val :to-equal '("lisp" "object" "list"))
-                (funcall cb2 res-legacy)
-                (expect cb-legacy-val :to-equal "Legacy string payload")))
+          (it "extracts raw payload and applies success-fn formatting"
+              (let* ((res (make-macher-agent-lisp-result-response :payload "raw payload"))
+                     (cb-raw-val nil)
+                     (cb-formatted-val nil)
+                     (cb-raw (macher-agent--build-success-callback
+                              'test-tool nil nil nil
+                              (lambda (res) (setq cb-raw-val (plist-get res :data)))))
+                     (cb-fmt (macher-agent--build-success-callback
+                              'test-tool nil
+                              (lambda (p) (format "Formatted: %s" p))
+                              nil
+                              (lambda (res) (setq cb-formatted-val (plist-get res :data))))))
+                (funcall cb-raw res)
+                (expect cb-raw-val :to-equal "raw payload")
+                (funcall cb-fmt res)
+                (expect cb-formatted-val :to-equal "Formatted: raw payload")))
 
           (it "suppresses patch creation during request processing when patch suppression is active"
               (let* ((ws (make-macher-agent-workspace :project-root "/mock/proj/"))

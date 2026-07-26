@@ -10,6 +10,7 @@
 					(when context
 					  (let ((norm-key (macher-agent--normalize-path-key actual-name context)))
 					    (macher-agent--update-context-file context norm-key content)))
-					(make-macher-agent-lisp-result-response
-					 :payload (format "SUCCESS: Virtual edit recorded for buffer '%s'. A patch will be generated at the end of the turn." actual-name)
-					 :ptc-payload `((status . "success") (buffer . ,actual-name))))))
+					`((status . "success") (buffer . ,actual-name))))
+			:success-fn (lambda (res _payload)
+				      (format "SUCCESS: Virtual edit recorded for buffer '%s'. A patch will be generated at the end of the turn."
+					      (cdr (assoc 'buffer res)))))
