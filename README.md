@@ -160,7 +160,7 @@ And run `gptel` within this new workspace.
 
 Define custom tools declaratively using the `macher-agent-make-tool` macro. This DSL handles errors, formats responses, and automatically extracts the asynchronous callback function from either the front or the back of the argument list depending on the caller environment.
 
-Your `:command-fn` receives the parsed argument payload (and optionally the active VFS `context` and workspace `root` path) and returns pure data objects. Your `:success-fn` receives this result and generates presentation strings suitable for user display and context formatting. This design eliminates the `ptc-payload` key, allowing programmatic tool calling primitives to receive pure data directly from `:command-fn` while the interface and LLM receive presentation strings from `:success-fn`.
+Your `:command-fn` receives the parsed argument payload (and optionally the active VFS `context` and workspace `root` path) and returns pure data objects. Your `:success-fn` receives this result and generates presentation strings suitable for user display and context formatting. Allowing programmatic tool calling primitives to receive pure data directly from `:command-fn` while the interface and LLM receive presentation strings from `:success-fn`.
 
 ### Examples
 
@@ -241,7 +241,7 @@ Agent skills defined via `SKILL.md` files accept an optional `ptc-primitives` li
 
 PTC allows an agent to chain a number of tool uses in a single tool call (including with intermediate calculations in Emacs Lisp). This speeds up agent activity by allowing all calls to operate without a round trip and is token efficient. The sandbox yields to update the gptel user interface with the progress of each tool call.
 
-Tools created with `macher-agent-make-tool` return pure data objects directly from `:command-fn` for programmatic tool calling execution, while `:success-fn` generates presentation strings for display. This eliminates the `ptc-payload` key, ensuring raw execution data and presentation output remain cleanly separated.
+Tools created with `macher-agent-make-tool` return pure data objects directly from `:command-fn` for programmatic tool calling execution, while `:success-fn` generates presentation strings for display. Ensuring raw execution data and presentation output remain cleanly separated.
 
 ```elisp
 (:name "ptc_execution" :args (:script "(let* ((fr_agent (spawn-subagent \"France Expert\" nil))
