@@ -69,7 +69,7 @@ graph TD
     subgraph elisp-sandbox [Elisp Sandbox]
         direction LR
         evaluator[safe evaluator]
-        primitives[allowed primitives]
+        primitives[programmatic tool calling]
     end
 
     gptel --> |gated| world
