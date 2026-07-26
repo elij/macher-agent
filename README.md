@@ -171,7 +171,7 @@ An asynchronous process execution tool can be set up to run tasks in the backgro
   "Run 'cargo check' in the background to verify the project."
   :category "rust"
   :args nil
-  :command-fn (lambda (_payload)
+  :command-fn (lambda (_payload _context _root)
                 (make-macher-agent-process-response :payload "cargo check </dev/null 2>&1"))
   :success-fn (lambda (output)
                 (if (string-match-p "error\\[" output)
@@ -186,12 +186,16 @@ An Emacs Lisp VFS tool can be created to interact with the virtual file system m
   "Read a file from the virtual file system memory."
   :category "workspace"
   :args '((:name "path" :type string :description "File path relative to root"))
+  
   :command-fn (lambda (payload context _root)
                 (let* ((path (plist-get payload :path))
                        (content (macher-agent-context-read context path)))
                   (if content
-                      (make-macher-agent-lisp-result-response :payload content)
-                    (error "File not found in the virtual file system: %s" path)))))
+                      content ;; Return the raw string directly!
+                    (error "File not found in the virtual file system: %s" path))))
+                    
+  :success-fn (lambda (raw-content _payload)
+                (format "SUCCESS: File read complete.\n\n=== FILE CONTENT ===\n%s" raw-content)))
 ```
 
 ## Runtime sandboxing
