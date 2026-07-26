@@ -1,6 +1,6 @@
 # macher-agent
 
-An Emacs-native LLM agent harness with isolated sandboxing, asynchronous sub-agent orchestration, and a strict three-tier virtual file system.
+An Emacs-native LLM agent harness with isolated sandboxing, asynchronous sub-agent orchestration, and a strict three-tier virtual file system. `macher-agent` is tuned to multiplex dozens of agents in an active Emacs instance and keep feature parity with mainstream harnesses including the approach to memory, [programmatic tool calling](https://platform.claude.com/cookbook/tool-use-programmatic-tool-calling-ptc), tail call optimisation of large agent graphs etc. This is all done exclusively in elisp with direct LLM APIs (through gptel) and without depending on any other harness/middleware (no SDKs, ACP etc.).
 
 https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 
@@ -240,19 +240,35 @@ In this example, trying to call a restricted host primitive results in an error,
 
 ## Agent skills and registration
 
-Skills are organised as directories containing a `SKILL.md` markdown file. Each skill has YAML or JSON frontmatter specifying a name, description, an optional target model, and a list of authorised tools (`allowed-tools`). The rest of the markdown file serves as the system instruction prompt.
+### Programmatic tool calling primitives
 
-To prevent bloating the system prompt with thousands of tokens of redundant tool descriptions, the framework implements progressive disclosure for agent capabilities. Instead of registering every tool globally at session start, `macher-agent` parses the `SKILL.md` frontmatter to dynamically load metadata and inject allowed tools only when requested. 
+Agent skills defined via `SKILL.md` files accept an optional `ptc-primitives` list in their YAML frontmatter (for example, `ptc-primitives: ["spawn_subagent", "delegate_tasks_to_subagents"]`).
 
-* Tool auto-loading triggers if a skill requests a `gptel-tool-name` tool name (for example, `allowed-tools: ["run_pytest"]`), prompting `macher-agent` to look for `scripts/run_pytest.el` inside your skill directories and dynamically register it. Tools and their org macros are refreshed before every tool use.
-* Model binding occurs if a skill specifies a model (for example, `model: "Qwen3.6-35B-A3B"`), binding it to `gptel-model` whenever that agent is active, routing queries to the correct backend automatically.
-* Dynamic composition uses `@skill_name` tokens inside your chat buffer to dynamically merge that skill's system instructions, models, and authorised tools into the current session.
+PTC allows an agent to chain a number of tool uses in a single tool call (including with intermediate calulations in elisp). This speeds up agent activitity by allowing all calls to operate without a round trip and is token efficient. The sandbox yields to update the gptel UI with the progress of each tool call.
+
+PTC relies on ptc-payloads which are created with `macher-agent-make-tool` and unfortunately don't work with gptel tools as they return natural language rather than unlying returned primitives.
+
+```elisp
+(:name "ptc_execution" :args (:script "(let* ((fr_agent (spawn-subagent \"France Expert\" nil))
+       (es_agent (spawn-subagent \"Spain Expert\" nil))
+       (results (delegate-tasks-to-subagents
+                 (list
+                  (list :buffer_name fr_agent :instructions \"What is the capital of France?\")
+                  (list :buffer_name es_agent :instructions \"What is the capital of Spain?\")))))
+  (format \"Response from France Expert (%s): %s\\nResponse from Spain Expert (%s): %s\"
+          fr_agent
+          (car results)
+          es_agent
+          (cadr results)))"))
+
+Response from France Expert (France Expert): #s(macher-agent-tool-response nil success The capital of France is Paris. nil France Expert)
+Response from Spain Expert (Spain Expert): #s(macher-agent-tool-response nil success The capital of Spain is Madrid. nil Spain Expert)
+```
 
 ## Advanced context
 
 * Interactive steering allows for injecting thoughts mid-flight. If the agent is executing a long-running process in the background, you can use `M-x macher-agent-inject-thought`. Your guidance will be queued and automatically bundled into the next turn once the active process finishes.
-* Multi-modal media context means the agent can call media reading tools to read images or visual resources. 
-
+p
 ## Orchestrating workflows
 
 Workflows can be driven interactively, programmatically, or autonomously. Typical execution harnesses conceptualise these operations as specific multi-agent topologies and architectural patterns.

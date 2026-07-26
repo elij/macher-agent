@@ -11,6 +11,8 @@
 (require 'macher-agent-macher-bridge)
 (require 'gptel nil t)
 (require 'macher-agent-vfs-client)
+(require 'macher-agent-gptel-tools)
+(require 'generator)
 (require 'subr-x)
 
 (declare-function macher-agent-gptel-transmit "macher-agent-gptel-bridge" (task-context callbacks))
@@ -21,7 +23,11 @@
 (declare-function macher-agent--init-workspace-state "macher-agent-vfs-client")
 (declare-function macher-agent--auto-sync-context "macher-agent-vfs-client" (&optional ctx fsm))
 (declare-function macher-agent-normalize-tools "macher-agent-api" (tools))
+(declare-function macher-agent-resolve-tool "macher-agent-api" (tool-name tools-registry &optional dir-context context))
 (declare-function macher-agent-initialize-skills "macher-agent-api" (&optional context dir))
+(declare-function macher-agent-sandbox--eval-iter "macher-agent-sandbox" (ast env))
+(declare-function macher-agent--read-file-vfs-aware "macher-agent-gptel-tools" (file-path context))
+(declare-function macher-agent-context-root "macher-agent-vfs-client" (context))
 
 (defvar macher-agent-submit-task-result-tool)
 
@@ -142,18 +148,17 @@ Return the unified state property list."
 
            (when (plist-get spec :exclusive)
              (setq state (plist-put state :system nil))
-             (setq state (plist-put state :tools nil)))
+             (setq state (plist-put state :tools nil))
+             (setq state (plist-put state :ptc-primitives nil)))
 
            (when-let* ((sys-spec (or (plist-get spec :system) (plist-get spec :system-message))))
              (if (stringp sys-spec)
                  (let ((current-sys (plist-get state :system)))
-                   ;; Safely flatten any existing list into a string
                    (setq current-sys (if (listp current-sys) (string-join current-sys "\n---\n") (or current-sys "")))
                    (setq state (plist-put state :system
                                           (concat current-sys
                                                   (if (string-empty-p current-sys) "" "\n---\n")
                                                   (format "### Skill: %s\n%s\n" sym sys-spec)))))
-               ;; Fallback for non-string modifiers
                (setq state (plist-put state :system
                                       (gptel--modify-value (plist-get state :system) sys-spec)))))
 
@@ -164,6 +169,12 @@ Return the unified state property list."
                                                collect (if (stringp t-obj)
                                                            (or (ignore-errors (gptel-get-tool t-obj)) t-obj)
                                                          t-obj))))))
+
+           (when-let* ((ptc-spec (plist-get spec :ptc-primitives)))
+             (let ((current-ptc (plist-get state :ptc-primitives))
+                   (ptc-list (if (listp ptc-spec) ptc-spec (list ptc-spec))))
+               (setq state (plist-put state :ptc-primitives
+                                      (cl-delete-duplicates (append current-ptc ptc-list) :test #'equal)))))
 
            (dolist (key '(:model :temperature :max-tokens))
              (when-let* ((val (plist-get spec key)))
@@ -194,7 +205,9 @@ Return nil."
     (when (plist-member payload :model) (setq-local gptel-model (plist-get payload :model)))
     (when (plist-member payload :temperature) (setq-local gptel-temperature (plist-get payload :temperature)))
     (when (plist-member payload :max-tokens) (setq-local gptel-max-tokens (plist-get payload :max-tokens)))
-    (when (plist-member payload :tools) (setq-local gptel-tools (plist-get payload :tools)))))
+    (when (plist-member payload :tools) (setq-local gptel-tools (plist-get payload :tools)))
+    (when (plist-member payload :ptc-primitives)
+      (setq-local macher-agent--active-ptc-primitives (plist-get payload :ptc-primitives)))))
 
 (defun macher-agent--apply-preset (preset-or-presets)
   "Polymorphic wrapper to safely route legacy calls into the modern compositor.
@@ -232,6 +245,12 @@ Return nil."
 (defvar-local macher-agent--resume-callback nil
   "The saved callback of the suspended parent orchestrator.")
 
+(defvar-local macher-agent--active-ptc-primitives nil
+  "List of active PTC primitives (symbols or strings with underscores) for the current buffer.")
+
+(defvar-local macher-agent--suppress-patch nil
+  "Non-nil if patch review generation should be suppressed for this sub-agent buffer.")
+
 (put 'macher-agent--is-subagent 'permanent-local t)
 (put 'macher-agent--ready-to-reap 'permanent-local t)
 (put 'macher-agent-presets 'permanent-local t)
@@ -239,6 +258,37 @@ Return nil."
 (put 'macher-agent--pending-children 'permanent-local t)
 (put 'macher-agent--child-results 'permanent-local t)
 (put 'macher-agent--resume-callback 'permanent-local t)
+(put 'macher-agent--active-ptc-primitives 'permanent-local t)
+(put 'macher-agent--suppress-patch 'permanent-local t)
+
+(defun macher-agent--ptc-primitive-p (sym)
+  "Check if SYM is an active PTC primitive.
+Matches both direct symbol equivalence and dynamic translation between
+hyphens and underscores."
+  (let* ((sym-name (symbol-name sym))
+         (norm-sym (replace-regexp-in-string "_" "-" sym-name))
+         (underscore-sym (replace-regexp-in-string "-" "_" sym-name))
+         (active (bound-and-true-p macher-agent--active-ptc-primitives))
+         (tools (bound-and-true-p gptel-tools)))
+    (and (or (memq sym active)
+             (cl-some (lambda (prim)
+                        (let* ((prim-name (if (symbolp prim) (symbol-name prim) prim))
+                               (norm-prim (replace-regexp-in-string "_" "-" prim-name)))
+                          (string= norm-sym norm-prim)))
+                      active)
+             (and (null active)
+                  (or (cl-some (lambda (tool)
+                                 (let* ((t-name (if (gptel-tool-p tool)
+                                                    (gptel-tool-name tool)
+                                                  (if (stringp tool) tool
+                                                    (format "%s" tool))))
+                                        (norm-tool (replace-regexp-in-string "_" "-" t-name)))
+                                   (string= norm-sym norm-tool)))
+                               tools)
+                      (let ((resolved (ignore-errors
+                                        (macher-agent-resolve-tool underscore-sym nil nil (and (fboundp 'macher-agent-resolve-context) (macher-agent-resolve-context))))))
+                        (and resolved (not (equal resolved underscore-sym)))))))
+         t)))
 
 (defun macher-agent-execute-lisp-task (payload callback)
   "Execute an async Lisp PAYLOAD in a dedicated, isolated buffer.
@@ -281,6 +331,7 @@ Return nil."
          (instructions (if (listp task) (plist-get task :instructions) ""))
          (presets (if (listp task) (or (plist-get task :presets) (plist-get task :preset)) nil))
          (is-background (and (listp task) (plist-get task :background)))
+         (suppress-patch (and (listp task) (plist-get task :suppress_patch)))
          (callback-fired nil))
     (if-let* ((buf (get-buffer buf-name)))
         (let* ((parent-active-presets (with-current-buffer parent-buf (bound-and-true-p macher-agent-presets)))
@@ -293,6 +344,7 @@ Return nil."
 
             (setq-local macher-agent--is-subagent t)
             (setq-local macher-agent--parent-buffer parent-buf)
+            (setq-local macher-agent--suppress-patch suppress-patch)
 
             (setq-local macher-agent--parent-callback
                         (lambda (res)

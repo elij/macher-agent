@@ -90,6 +90,8 @@ When a delegated sub-agent buffer is spawned (`macher-agent-add-subagent`), its 
 3. **Tool aggregation:** The sub-agent MUST inherit the base `gptel-tools`, but MUST append and deduplicate any additional tools explicitly required by the composed presets.
 4. **Buffer-local presets:** The system MUST store active presets in a buffer-local variable `macher-agent-presets` for initialisation seeding.  On prompt transformations, any buffer-local presets MUST be automatically passed to the pure composition engine along with dynamic prompt tags to compute the transmission state ephemerally.
 5. **Agent tagging:** The buffer MUST be permanently marked via the local variable `macher-agent--is-subagent` to ensure standard buffer-kill commands cannot bypass the agent reaper.
+6. **Patch suppression:** Tasks created during blocking delegation (`delegate_tasks_to_subagents`) set `:suppress_patch t` on the task object, which sets the buffer-local `macher-agent--suppress-patch` to non-nil in the sub-agent buffer.
+7. **Active Programmatic Tool Calling primitives:** Active Programmatic Tool Calling (PTC) primitives (`macher-agent--active-ptc-primitives`) MUST be aggregated and deduplicated during skill composition (`macher-agent-compose-payload`) from frontmatter `ptc-primitives` keys, and applied buffer-locally via `macher-agent--apply-payload-locally`.
 
 ### 4.2 Parallel execution
 
@@ -110,20 +112,22 @@ When an agent flags its execution as complete via `macher-agent-submit-task-resu
 
 ### 5.1 Skill definition and composition
 
-1. **Parsing**: Skills defined in `SKILL.md` MUST contain YAML frontmatter specifying `name`, `description`, `model`, and `allowed-tools`.  The markdown body is treated as the system prompt.
-2. **Composition (`@skill`)**: The pre-request hook MUST parse the prompt for `@skill_name` tokens.  If found, it MUST dynamically merge the requested skill's system prompt, tools, and model overrides into the current execution.
-3. **Queue formatting**: System directives injected mid-flight via `macher-agent-inject-thought` MUST be appended directly to the next tool's string output, preceded by `=== SYSTEM DIRECTIVE ===`.
+1. **Parsing**: Skills defined in `SKILL.md` MUST contain YAML frontmatter specifying `name`, `description`, `model`, `allowed-tools`, and optional `ptc-primitives` parsed via `macher-agent-parse-skill-file`.  The markdown body is treated as the system prompt.
+2. **Composition (`@skill`)**: The pre-request hook MUST parse the prompt for `@skill_name` tokens.  If found, it MUST dynamically merge the requested skill's system prompt, tools, model overrides, and PTC primitives into the current execution.
+3. **Programmatic Tool Calling prompt injection**: Dynamic PTC prompt injection (`macher-agent--inject-ptc-prompt`) inspects buffer-local active primitives (`macher-agent--active-ptc-primitives`), converts underscore names to hyphenated Lisp symbols, generates idiomatic Lisp docstrings from matching `gptel-tool` definitions, and appends the PTC instruction block to the system prompt.  If zero primitives match in the current buffer context, the PTC instruction block is omitted.
+4. **Queue formatting**: System directives injected mid-flight via `macher-agent-inject-thought` MUST be appended directly to the next tool's string output, preceded by `=== SYSTEM DIRECTIVE ===`.
 
 ### 5.2 Tool abstract syntax tree security
 
 1. When loading `.el` tool scripts from the workspace, the system MUST parse the Lisp Abstract Syntax Tree (AST).
 2. The evaluator MUST reject and refuse to load any tool containing top-level mutative forms (`defun`, `defvar`, `defcustom`, `defmacro`, `cl-defun`).  *(Note: Enforced strictly at the AST root).*
 
-### 5.3 Execution scope enforcement
+### 5.3 Execution scope enforcement and sandbox evaluation
 
 1. Before any tool executes, `macher-agent--enforce-tool-scope` MUST run.
 2. The enforcer MUST check if the requested tool exists in the specific FSM's authorised tool list or the buffer-local `gptel-tools` by comparing their canonical string names resolved via `macher-agent-canonical-tool-name`, eliminating multiple type-checking routines in execution hooks.
 3. If the tool is not explicitly authorised for that sub-agent, execution MUST be blocked, returning an out-of-scope error to the LLM.
+4. Dynamic PTC primitive checking in `macher-agent-sandbox--eval-iter` verifies whether a symbol is an active PTC primitive via `macher-agent--ptc-primitive-p`, replacing static whitelists.
 
 ### 5.4 Tool lifecycle and hook architecture
 
@@ -230,6 +234,7 @@ Because `macher` relies on Emacs physical buffers and `macher-agent` uses pure-m
   1. **Partitioning:** The function MUST partition active workspace edits into standard physical and virtual contexts using `macher-agent-prepare-upstream-payloads`.
   2. **Delegate formatting:** Instead of using shadow buffers, the function delegates formatting back to the native `macher` engine by calling `macher--build-patch` with each partitioned context.
   3. **Unique suffixes:** It extracts the original workspace buffer using `macher-patch-buffer` and dynamically applies a physical (`*macher-physical-patch...*`) or virtual (`*macher-virtual-patch...*`) buffer name prefix while retaining unique workspace suffixes.
+  4. **Patch suppression:** The function `macher-agent-process-request` MUST check `macher-agent--suppress-patch` and suppress patch creation (`macher--build-patch`) when non-nil.
 
 ---
 
