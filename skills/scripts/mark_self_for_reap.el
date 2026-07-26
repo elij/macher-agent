@@ -5,7 +5,6 @@ have completely finished your assigned task."
 			:args nil
 			:command-fn (lambda (_payload _context _root)
 				      (setq-local macher-agent--ready-to-reap t)
-				      (make-macher-agent-lisp-result-response
-				       :payload "Success. This buffer has been marked for reaping and will be \
-terminated shortly. Please finish your response."
-				       :ptc-payload t)))
+				      t)
+			:success-fn (lambda (_res _payload)
+				      "Success. This buffer has been marked for reaping and will be terminated shortly. Please finish your response."))

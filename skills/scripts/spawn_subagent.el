@@ -6,9 +6,8 @@
 SKILL.md presets to apply" :optional t))
 			:command-fn (lambda (payload context root)
 				      (let* ((name (plist-get payload :name))
-					     (preset-list (append (plist-get payload :presets) nil))
-					     (buf (macher-agent-add-subagent name root nil context preset-list)))
-					(make-macher-agent-lisp-result-response
-					 :payload (format "SUCCESS: Sub-agent created. The EXACT buffer name to \
-use is '%s'." (buffer-name buf))
-					 :ptc-payload (buffer-name buf)))))
+					     (preset-list (append (plist-get payload :presets) nil)))
+					(macher-agent-add-subagent name root nil context preset-list)))
+			:success-fn (lambda (raw-buffer _payload)
+				      (format "SUCCESS: Sub-agent created. The EXACT buffer name to use is '%s'."
+					      (buffer-name raw-buffer))))

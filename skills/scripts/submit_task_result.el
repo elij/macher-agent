@@ -16,6 +16,5 @@ summary of completed work."))
 
 					(setq-local macher-agent-task-finished t)
 
-					(make-macher-agent-lisp-result-response
-					 :payload "SUCCESS: Result submitted."
-					 :ptc-payload final_answer))))
+					final_answer))
+			:success-fn (lambda (_res _payload) "SUCCESS: Result submitted."))

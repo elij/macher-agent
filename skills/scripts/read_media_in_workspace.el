@@ -57,7 +57,7 @@ at: %s" abs-path))
 						    (setf (gptel-fsm-info fsm)
 							  (plist-put info :macher-agent-context context)))))))
 
-					  (make-macher-agent-lisp-result-response
-					   :payload (format "SUCCESS: Media '%s' has been successfully read and \
-attached to this response. You may now analyse it immediately." actual-name)
-					   :ptc-payload `((status . "success") (media_path . ,actual-name) (mime . ,mime)))))))
+					  `((status . "success") (media_path . ,actual-name) (mime . ,mime)))))
+			:success-fn (lambda (res _payload)
+				      (format "SUCCESS: Media '%s' has been successfully read and attached to this response. You may now analyse it immediately."
+					      (cdr (assoc 'media_path res)))))

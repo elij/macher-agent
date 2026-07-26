@@ -26,8 +26,7 @@
   status
   data
   error
-  buffer-name
-  ptc-payload)
+  buffer-name)
 
 (defvar macher-agent-ptc-raw-mode nil
   "When non-nil, macher-agent tools bypass string formatting and return raw Lisp objects.")
@@ -52,10 +51,7 @@ ON-ERROR is the callback called on execution failure.")
 (cl-defmethod macher-agent-execute-response (res _context on-success _on-error)
   "Fallback method for raw Lisp objects, structs, or direct values."
   (if (macher-agent-tool-response-p res)
-      (funcall on-success (if (and (bound-and-true-p macher-agent--active-ptc-execution)
-                                   (macher-agent-tool-response-ptc-payload res))
-                              (macher-agent-tool-response-ptc-payload res)
-                            (macher-agent-tool-response-payload res)))
+      (funcall on-success (macher-agent-tool-response-payload res))
     (funcall on-success res)))
 
 (defvar macher-agent-allowed-tools nil
@@ -307,20 +303,20 @@ Strips leading colons and converts underscores to hyphens for seamless matching.
   "Generate the success callback lambda for a tool execution."
   `(lambda (res-obj)
      (condition-case cb-err
-         (let* ((in-ptc (and (bound-and-true-p macher-agent--active-ptc-execution)
-                             (not (eq ',name-sym 'macher-agent-nohup-tool))))
-                (has-ptc-payload (and (macher-agent-tool-response-p res-obj)
-                                      (macher-agent-tool-response-ptc-payload res-obj)))
+         (let* ((s-fn ,success-fn)
+                (f-fn ,output-filter-fn)
                 (raw-payload (if (macher-agent-tool-response-p res-obj)
-                                 (if in-ptc
-                                     (or (macher-agent-tool-response-ptc-payload res-obj)
-                                         (macher-agent-tool-response-payload res-obj))
-                                   (macher-agent-tool-response-payload res-obj))
+                                 (macher-agent-tool-response-payload res-obj)
                                res-obj))
-                (success-data (if (and in-ptc has-ptc-payload)
-                                  raw-payload
-                                (if ,success-fn (funcall ,success-fn raw-payload) raw-payload)))
-                (final-data (if ,output-filter-fn (funcall ,output-filter-fn success-data) success-data)))
+                (success-data (if s-fn
+                                  (condition-case nil
+                                      (if (>= (car (func-arity s-fn)) 2)
+                                          (funcall s-fn raw-payload payload)
+                                        (funcall s-fn raw-payload))
+                                    (wrong-number-of-arguments
+                                     (funcall s-fn raw-payload payload)))
+                                raw-payload))
+                (final-data (if f-fn (funcall f-fn success-data) success-data)))
            (run-hook-with-args 'macher-agent-post-tool-use-hook ,name-sym ,payload final-data)
            (funcall ,wrap-cb (list :status 'success :data final-data)))
        (error
@@ -357,8 +353,7 @@ Strips leading colons and converts underscores to hyphens for seamless matching.
 								                                     (action-res (if (macher-agent-tool-response-p action)
 										                                             action
 										                                           (make-macher-agent-lisp-result-response
-										                                            :payload (if (stringp action) action (format "%S" action))
-										                                            :ptc-payload action)))
+										                                            :payload action)))
 								                                     (on-success (macher-agent--build-success-callback
 										                                          ',name-symbol payload ,success-fn ,output-filter-fn wrap-cb)))
 								                                (macher-agent-execute-response action-res context on-success wrap-cb))))))))))))
@@ -381,13 +376,6 @@ Strips leading colons and converts underscores to hyphens for seamless matching.
    (macher-agent-tool-response-payload res)
    (lambda (sub-agent-results)
      (setf (macher-agent-tool-response-payload res) sub-agent-results)
-     (setf (macher-agent-tool-response-ptc-payload res)
-           (cl-loop for sub-res across (if (vectorp sub-agent-results) sub-agent-results (vconcat sub-agent-results))
-                    collect (list :buffer (macher-agent-tool-response-buffer-name sub-res)
-                                  :status (macher-agent-tool-response-status sub-res)
-                                  :data (if (eq (macher-agent-tool-response-status sub-res) 'success)
-                                            (macher-agent-tool-response-data sub-res)
-                                          (macher-agent-tool-response-error sub-res)))))
      (funcall on-success res))))
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-nohup-response) _context on-success _on-error)
@@ -506,6 +494,8 @@ and alists to flat plists for objects, ensuring native validation passes."
                             (if (null spec) val
                               (let ((type (plist-get spec :type)))
                                 (cond
+                                 ((and (member type '(string "string")) (bufferp val))
+                                  (buffer-name val))
                                  ((and (member type '(array "array")) (listp val))
                                   (vconcat (cl-loop for item in val
                                                     collect (coerce-val item (plist-get spec :items)))))
@@ -566,24 +556,39 @@ and alists to flat plists for objects, ensuring native validation passes."
                                           (let ((lisp-res (apply tool-lisp-sym args)))
                                             (funcall ptc-callback
                                                      (if (macher-agent-tool-response-p lisp-res)
-                                                         (or (macher-agent-tool-response-ptc-payload lisp-res)
-                                                             (macher-agent-tool-response-payload lisp-res))
+                                                         (macher-agent-tool-response-payload lisp-res)
                                                        lisp-res)))
                                         (if-let*
                                             (((macher-tool-valid-p resolved-tool))
                                              (tool-fn (gptel-tool-function resolved-tool)))
-                                            (let ((coerced-args (coerce-ptc-args args resolved-tool))
-                                                  (orig-execute (symbol-function 'macher-agent-execute-response)))
+                                            (let ((coerced-args (coerce-ptc-args args resolved-tool)))
                                               (cl-letf (((symbol-function 'macher-agent-execute-response)
                                                          (lambda (action-res ctx _on-succ _on-err)
-                                                           (funcall orig-execute action-res ctx
-                                                                    (lambda (res-obj)
-                                                                      (funcall ptc-callback
-                                                                               (if (macher-agent-tool-response-p res-obj)
-                                                                                   (or (macher-agent-tool-response-ptc-payload res-obj)
-                                                                                       (macher-agent-tool-response-payload res-obj))
-                                                                                 res-obj)))
-                                                                    on-error))))
+                                                           (if (macher-agent-delegate-response-p action-res)
+                                                               (macher-agent-execute-parallel
+                                                                (macher-agent-tool-response-payload action-res)
+                                                                (lambda (sub-agent-results)
+                                                                  (funcall ptc-callback
+                                                                           (cl-loop for sub-res across (if (vectorp sub-agent-results) sub-agent-results (vconcat sub-agent-results))
+                                                                                    collect (list :buffer (cond
+                                                                                                           ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-buffer-name sub-res))
+                                                                                                           ((listp sub-res) (plist-get sub-res :buffer))
+                                                                                                           (t (format "%s" sub-res)))
+                                                                                                  :status (cond
+                                                                                                           ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-status sub-res))
+                                                                                                           ((listp sub-res) (plist-get sub-res :status))
+                                                                                                           (t 'success))
+                                                                                                  :data (cond
+                                                                                                         ((macher-agent-tool-response-p sub-res)
+                                                                                                          (if (eq (macher-agent-tool-response-status sub-res) 'success)
+                                                                                                              (macher-agent-tool-response-data sub-res)
+                                                                                                            (macher-agent-tool-response-error sub-res)))
+                                                                                                         ((listp sub-res) (plist-get sub-res :data))
+                                                                                                         (t sub-res)))))))
+                                                             (funcall ptc-callback
+                                                                      (if (macher-agent-tool-response-p action-res)
+                                                                          (macher-agent-tool-response-payload action-res)
+                                                                        action-res))))))
                                                 (apply tool-fn (lambda (err-res) (funcall ptc-callback err-res)) coerced-args)))
                                           (setq iterator nil)
                                           (funcall

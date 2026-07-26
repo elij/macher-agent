@@ -15,7 +15,5 @@
 												      (replace-regexp-in-string "'" "'\\''" trimmed))))
 										     (setq output
 											   (shell-command-to-string cmd))))
-					    (make-macher-agent-lisp-result-response
-					     :payload output
-					     :ptc-payload output))
+					    output)
 					(error "Regex pattern too broad. Provide a more specific search term."))))

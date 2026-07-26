@@ -44,6 +44,4 @@
 							    raw-str))))
 					  (let ((res-str (macher--read-string
 							  content parsed-offset parsed-limit show_line_numbers)))
-					    (make-macher-agent-lisp-result-response
-					     :payload res-str
-					     :ptc-payload res-str))))))
+					    res-str)))))

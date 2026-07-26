@@ -42,6 +42,7 @@
 											 new-text replace-all-bool))))
 					(when context
 					  (macher-agent--update-context-file context norm-key content))
-					(make-macher-agent-lisp-result-response
-					 :payload (format "SUCCESS: Virtual multi-edit recorded for buffer '%s'. A patch will be generated at the end of the turn." actual-name)
-					 :ptc-payload `((status . "success") (buffer . ,actual-name) (edits-applied . ,(length (append edits nil))))))))
+					`((status . "success") (buffer . ,actual-name) (edits-applied . ,(length (append edits nil))))))
+			:success-fn (lambda (res _payload)
+				      (format "SUCCESS: Virtual multi-edit recorded for buffer '%s'. A patch will be generated at the end of the turn."
+					      (cdr (assoc 'buffer res)))))
