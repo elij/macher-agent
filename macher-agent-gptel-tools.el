@@ -342,21 +342,21 @@ Strips leading colons and converts underscores to hyphens for seamless matching.
                 (let* ((wrap-cb (macher-agent--wrap-callback callback))
                        (payload (macher-agent--extract-payload tool-args ,args)))
                   (macher-agent--with-tool-error-handling ',name-symbol payload wrap-cb
-							                              (macher-agent--validate-payload payload ,args)
-							                              (let* ((context (or (ignore-errors (macher-agent-resolve-context))
-									                                          (bound-and-true-p macher-agent--persistent-context)))
-								                                 (root (if context (macher-agent-context-root context) default-directory))
-								                                 (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
-							                                (if hook-rejection
-								                                (funcall wrap-cb (list :status 'error :error hook-rejection))
-							                                  (let* ((action (funcall ,command-fn payload context root))
-								                                     (action-res (if (macher-agent-tool-response-p action)
-										                                             action
-										                                           (make-macher-agent-lisp-result-response
-										                                            :payload action)))
-								                                     (on-success (macher-agent--build-success-callback
-										                                          ',name-symbol payload ,success-fn ,output-filter-fn wrap-cb)))
-								                                (macher-agent-execute-response action-res context on-success wrap-cb))))))))))))
+					(macher-agent--validate-payload payload ,args)
+					(let* ((context (or (ignore-errors (macher-agent-resolve-context))
+									    (bound-and-true-p macher-agent--persistent-context)))
+						   (root (if context (macher-agent-context-root context) default-directory))
+						   (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
+					  (if hook-rejection
+						  (funcall wrap-cb (list :status 'error :error hook-rejection))
+						(let* ((action (funcall ,command-fn payload context root))
+							   (action-res (if (macher-agent-tool-response-p action)
+										       action
+										     (make-macher-agent-lisp-result-response
+										      :payload action)))
+							   (on-success (macher-agent--build-success-callback
+										    ',name-symbol payload ,success-fn ,output-filter-fn wrap-cb)))
+						  (macher-agent-execute-response action-res context on-success wrap-cb))))))))))))
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-process-response) context on-success on-error)
   "Execute response RES within CONTEXT in a sandbox, then invoke ON-SUCCESS or ON-ERROR."
@@ -484,142 +484,147 @@ and alists to flat plists for objects, ensuring native validation passes."
 
 (cl-defmethod macher-agent-execute-response ((res macher-agent-ptc-response) context on-success on-error)
   "Execute the PTC script in RES, dynamically dispatching to host tools with GUI feedback."
-  (let ((macher-agent--active-ptc-execution t))
-    (if-let* ((script-string (macher-agent-tool-response-payload res))
-              (ast (macroexpand-all (read script-string)))
-              (target-buf (or (macher-agent-tool-response-buffer-name res) (current-buffer))))
-        (with-current-buffer target-buf
-          (if-let* ((iterator (macher-agent-sandbox--eval-iter ast nil)))
-              (cl-labels ((coerce-val (val spec)
-                            (if (null spec) val
-                              (let ((type (plist-get spec :type)))
-                                (cond
-                                 ((and (member type '(string "string")) (bufferp val))
-                                  (buffer-name val))
-                                 ((and (member type '(array "array")) (listp val))
-                                  (vconcat (cl-loop for item in val
-                                                    collect (coerce-val item (plist-get spec :items)))))
-                                 ((and (member type '(object "object")) (listp val))
-                                  (let* ((normalized-val
-                                          (if (and val (consp (car val)))
-                                              (cl-loop for cell in val append (list (car cell) (cdr cell)))
-                                            val))
-                                         (props (plist-get spec :properties)))
-                                    (if props
-                                        (cl-loop for (k v) on normalized-val by #'cddr
-                                                 for p-name = (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))
-                                                 for p-spec = (plist-get props (intern (concat ":" p-name)))
-                                                 append (list k (coerce-val v p-spec)))
-                                      normalized-val)))
-                                 (t val)))))
-                          (coerce-ptc-args (args tool)
-                            (if (not (macher-tool-valid-p tool))
-                                args
-                              (let ((schema (gptel-tool-args tool))
-                                    (coerced-args nil))
-                                (if (and args (keywordp (car args)))
-                                    (cl-loop for (k v) on args by #'cddr
-                                             for spec = (cl-find-if (lambda (s)
-                                                                      (let ((n (plist-get s :name)))
-                                                                        (string= (replace-regexp-in-string "_" "-" (if (symbolp n) (symbol-name n) n))
-                                                                                 (substring (symbol-name k) 1))))
-                                                                    schema)
-                                             do (progn (push k coerced-args)
-                                                       (push (if spec (coerce-val v spec) v) coerced-args)))
-                                  (cl-loop for arg in args
-                                           for spec in schema
-                                           do (push (coerce-val arg spec) coerced-args)))
-                                (nreverse coerced-args)))))
-                (letrec
-                    ((ptc-resume-loop
-                      (lambda (last-result)
-                        (with-current-buffer target-buf
-                          (when-let* ((_ iterator))
-                            (condition-case iter-err
-                                (let ((yielded-val (iter-next iterator last-result)))
-                                  (if-let*
-                                      (((consp yielded-val))
-                                       ((eq (plist-get yielded-val :interrupt) 'tool-call))
-                                       (tool-lisp-sym (plist-get yielded-val :name))
-                                       (args (plist-get yielded-val :args))
-                                       (tool-info (macher-agent--display-ptc-tool-execution
-                                                   tool-lisp-sym args context))
-                                       (original-name-str (car tool-info))
-                                       (resolved-tool (cdr tool-info))
-                                       (ptc-callback
-                                        (lambda (res-data)
-                                          (macher-agent--insert-ptc-tool-result
-                                           original-name-str args res-data)
-                                          (funcall ptc-resume-loop res-data))))
-                                      
-                                      (if (fboundp tool-lisp-sym)
-                                          (let ((lisp-res (apply tool-lisp-sym args)))
-                                            (funcall ptc-callback
-                                                     (if (macher-agent-tool-response-p lisp-res)
-                                                         (macher-agent-tool-response-payload lisp-res)
-                                                       lisp-res)))
-                                        (if-let*
-                                            (((macher-tool-valid-p resolved-tool))
-                                             (tool-fn (gptel-tool-function resolved-tool)))
-                                            (let ((coerced-args (coerce-ptc-args args resolved-tool)))
-                                              (cl-letf (((symbol-function 'macher-agent-execute-response)
-                                                         (lambda (action-res ctx _on-succ _on-err)
-                                                           (if (macher-agent-delegate-response-p action-res)
-                                                               (macher-agent-execute-parallel
-                                                                (macher-agent-tool-response-payload action-res)
-                                                                (lambda (sub-agent-results)
-                                                                  (funcall ptc-callback
-                                                                           (cl-loop for sub-res across (if (vectorp sub-agent-results) sub-agent-results (vconcat sub-agent-results))
-                                                                                    collect (list :buffer (cond
-                                                                                                           ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-buffer-name sub-res))
-                                                                                                           ((listp sub-res) (plist-get sub-res :buffer))
-                                                                                                           (t (format "%s" sub-res)))
-                                                                                                  :status (cond
-                                                                                                           ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-status sub-res))
-                                                                                                           ((listp sub-res) (plist-get sub-res :status))
-                                                                                                           (t 'success))
-                                                                                                  :data (cond
-                                                                                                         ((macher-agent-tool-response-p sub-res)
-                                                                                                          (if (eq (macher-agent-tool-response-status sub-res) 'success)
-                                                                                                              (macher-agent-tool-response-data sub-res)
-                                                                                                            (macher-agent-tool-response-error sub-res)))
-                                                                                                         ((listp sub-res) (plist-get sub-res :data))
-                                                                                                         (t sub-res)))))))
-                                                             (funcall ptc-callback
-                                                                      (if (macher-agent-tool-response-p action-res)
-                                                                          (macher-agent-tool-response-payload action-res)
-                                                                        action-res))))))
-                                                (apply tool-fn (lambda (err-res) (funcall ptc-callback err-res)) coerced-args)))
+  (condition-case general-err
+      (let ((macher-agent--active-ptc-execution t))
+        (if-let* ((script-string (macher-agent-tool-response-payload res))
+                  (ast (macroexpand-all (read script-string)))
+                  (target-buf (or (macher-agent-tool-response-buffer-name res) (current-buffer))))
+            (with-current-buffer target-buf
+              (if-let* ((iterator (macher-agent-sandbox--eval-iter ast nil)))
+                  (cl-labels ((coerce-val (val spec)
+                                (if (null spec) val
+                                  (let ((type (plist-get spec :type)))
+                                    (cond
+                                     ((and (member type '(string "string")) (bufferp val))
+                                      (buffer-name val))
+                                     ((and (member type '(array "array")) (listp val))
+                                      (vconcat (cl-loop for item in val
+                                                        collect (coerce-val item (plist-get spec :items)))))
+                                     ((and (member type '(object "object")) (listp val))
+                                      (let* ((normalized-val
+                                              (if (and val (consp (car val)))
+                                                  (cl-loop for cell in val append (list (car cell) (cdr cell)))
+                                                val))
+                                             (props (plist-get spec :properties)))
+                                        (if props
+                                            (cl-loop for (k v) on normalized-val by #'cddr
+                                                     for p-name = (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))
+                                                     for p-spec = (plist-get props (intern (concat ":" p-name)))
+                                                     append (list k (coerce-val v p-spec)))
+                                          normalized-val)))
+                                     (t val)))))
+                              (coerce-ptc-args (args tool)
+                                (if (not (macher-tool-valid-p tool))
+                                    args
+                                  (let ((schema (gptel-tool-args tool))
+                                        (coerced-args nil))
+                                    (if (and args (keywordp (car args)))
+                                        (cl-loop for (k v) on args by #'cddr
+                                                 for spec = (cl-find-if (lambda (s)
+                                                                          (let ((n (plist-get s :name)))
+                                                                            (string= (replace-regexp-in-string "_" "-" (if (symbolp n) (symbol-name n) n))
+                                                                                     (substring (symbol-name k) 1))))
+                                                                        schema)
+                                                 do (progn (push k coerced-args)
+                                                           (push (if spec (coerce-val v spec) v) coerced-args)))
+                                      (cl-loop for arg in args
+                                               for spec in schema
+                                               do (push (coerce-val arg spec) coerced-args)))
+                                    (nreverse coerced-args)))))
+                    (letrec
+                        ((ptc-resume-loop
+                          (lambda (last-result)
+                            (with-current-buffer target-buf
+                              (when-let* ((_ iterator))
+                                (condition-case iter-err
+                                    (let ((yielded-val (iter-next iterator last-result)))
+                                      (if-let*
+                                          (((consp yielded-val))
+                                           ((eq (plist-get yielded-val :interrupt) 'tool-call))
+                                           (tool-lisp-sym (plist-get yielded-val :name))
+                                           (args (plist-get yielded-val :args))
+                                           (tool-info (macher-agent--display-ptc-tool-execution
+                                                       tool-lisp-sym args context))
+                                           (original-name-str (car tool-info))
+                                           (resolved-tool (cdr tool-info))
+                                           (ptc-callback
+                                            (lambda (res-data)
+                                              (macher-agent--insert-ptc-tool-result
+                                               original-name-str args res-data)
+                                              (funcall ptc-resume-loop res-data))))
+                                          
+                                          (if (fboundp tool-lisp-sym)
+                                              (let ((lisp-res (apply tool-lisp-sym args)))
+                                                (funcall ptc-callback
+                                                         (if (macher-agent-tool-response-p lisp-res)
+                                                             (macher-agent-tool-response-payload lisp-res)
+                                                           lisp-res)))
+                                            (if-let*
+                                                (((macher-tool-valid-p resolved-tool))
+                                                 (tool-fn (gptel-tool-function resolved-tool)))
+                                                (let ((coerced-args (coerce-ptc-args args resolved-tool)))
+                                                  (cl-letf (((symbol-function 'macher-agent-execute-response)
+                                                             (lambda (action-res ctx _on-succ _on-err)
+                                                               (if (macher-agent-delegate-response-p action-res)
+                                                                   (macher-agent-execute-parallel
+                                                                    (macher-agent-tool-response-payload action-res)
+                                                                    (lambda (sub-agent-results)
+                                                                      (funcall ptc-callback
+                                                                               (cl-loop for sub-res across (if (vectorp sub-agent-results) sub-agent-results (vconcat sub-agent-results))
+                                                                                        collect (list :buffer (cond
+                                                                                                               ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-buffer-name sub-res))
+                                                                                                               ((listp sub-res) (plist-get sub-res :buffer))
+                                                                                                               (t (format "%s" sub-res)))
+                                                                                                      :status (cond
+                                                                                                               ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-status sub-res))
+                                                                                                               ((listp sub-res) (plist-get sub-res :status))
+                                                                                                               (t 'success))
+                                                                                                      :data (cond
+                                                                                                             ((macher-agent-tool-response-p sub-res)
+                                                                                                              (if (eq (macher-agent-tool-response-status sub-res) 'success)
+                                                                                                                  (macher-agent-tool-response-data sub-res)
+                                                                                                                (macher-agent-tool-response-error sub-res)))
+                                                                                                             ((listp sub-res) (plist-get sub-res :data))
+                                                                                                             (t sub-res)))))))
+                                                                 (funcall ptc-callback
+                                                                          (if (macher-agent-tool-response-p action-res)
+                                                                              (macher-agent-tool-response-payload action-res)
+                                                                            action-res))))))
+                                                    (if (gptel-tool-async resolved-tool)
+                                                        (apply tool-fn (lambda (err-res) (funcall ptc-callback err-res)) coerced-args)
+                                                      (let ((sync-result (apply tool-fn coerced-args)))
+                                                        (funcall ptc-callback sync-result)))))
+                                              (setq iterator nil)
+                                              (funcall
+                                               on-error
+                                               (list
+                                                :status 'error
+                                                :error
+                                                (format "Unknown PTC primitive requested: %s" original-name-str)))))
+                                        
+                                        (progn
                                           (setq iterator nil)
                                           (funcall
                                            on-error
                                            (list
                                             :status 'error
                                             :error
-                                            (format "Unknown PTC primitive requested: %s" original-name-str)))))
-                                    
-                                    (progn
-                                      (setq iterator nil)
-                                      (funcall
-                                       on-error
-                                       (list
-                                        :status 'error
-                                        :error
-                                        (format "Unexpected yield from PTC sandbox: %S" yielded-val))))))
-                              (iter-end-of-sequence
-                               (setq iterator nil)
-                               (when-let* (((fboundp 'gptel--update-status)))
-                                 (gptel--update-status " PTC: Complete" 'success))
-                               (funcall on-success (cdr iter-err)))
-                              (error
-                               (setq iterator nil)
-                               (funcall
-                                on-error
-                                (list :status 'error :error (error-message-string iter-err))))))))))
-                  (funcall ptc-resume-loop nil)))
-            (funcall
-             on-error (list :status 'error :error "Failed to initialise PTC iterator"))))
-      (funcall on-error (list :status 'error :error "Invalid PTC script payload")))))
+                                            (format "Unexpected yield from PTC sandbox: %S" yielded-val))))))
+                                  (iter-end-of-sequence
+                                   (setq iterator nil)
+                                   (when-let* (((fboundp 'gptel--update-status)))
+                                     (gptel--update-status " PTC: Complete" 'success))
+                                   (funcall on-success (cdr iter-err)))
+                                  (error
+                                   (setq iterator nil)
+                                   (funcall
+                                    on-error
+                                    (list :status 'error :error (error-message-string iter-err))))))))))
+                      (funcall ptc-resume-loop nil)))
+                (funcall on-error (list :status 'error :error "Failed to initialise PTC iterator"))))
+          (funcall on-error (list :status 'error :error "Invalid PTC script payload"))))
+    (error
+     (funcall on-error (list :status 'error :error (error-message-string general-err))))))
 
 (defun macher-agent--run-async-cmd (name cmd dir callback)
   "Executes a command using explicit lexical capture for background safety.
