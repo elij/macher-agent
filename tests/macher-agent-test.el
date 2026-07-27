@@ -621,12 +621,55 @@
                                               (kill-buffer buf)))
 
                                         (it "clears persistent context upon user request"
-                                            (let ((buf (generate-new-buffer "active-session")))
+                                            (let* ((ws (make-macher-agent-workspace :project-root "/mock/proj/"))
+                                                   (ctx (macher--make-context :workspace ws :contents (list (macher-agent-vfs-make-entry "file.txt" "orig" "mod"))))
+                                                   (buf (generate-new-buffer "active-session")))
                                               (with-current-buffer buf
-                                                (setq-local macher-agent--persistent-context 'some-data)
+                                                (setq-local macher-agent--persistent-context ctx)
                                                 (macher-agent-clear-context)
-                                                (expect macher-agent--persistent-context :to-be nil))
+                                                (expect (macher-agent--get-context-contents macher-agent--persistent-context) :to-be nil))
                                               (kill-buffer buf)))
+
+                                        (it "isolates subagent context from workspace and merges changes on completion"
+                                            (let* ((temp-dir (file-name-as-directory (make-temp-file "isolated-proj-" t)))
+                                                   (doc-file (expand-file-name "doc.txt" temp-dir)))
+                                              (unwind-protect
+                                                  (progn
+                                                    (with-temp-file doc-file (insert "v1"))
+                                                    (let* ((ws (make-macher-agent-workspace :project-root temp-dir))
+                                                           (parent-ctx (macher-agent--make-vfs-context :workspace ws :contents (list (macher-agent-vfs-make-entry "doc.txt" "v1" "v1"))))
+                                                           (parent-buf (generate-new-buffer "parent-agent")))
+                                                      (unwind-protect
+                                                          (progn
+                                                            (puthash (expand-file-name temp-dir) parent-ctx macher-agent-active-workspaces)
+                                                            (with-current-buffer parent-buf
+                                                              (setq-local default-directory temp-dir)
+                                                              (setq-local macher-agent--persistent-context parent-ctx)
+                                                              (let ((sub-buf (macher-agent-add-subagent "child-agent" temp-dir nil parent-ctx)))
+                                                                (with-current-buffer sub-buf
+                                                                  ;; Verify child has an isolated cloned context
+                                                                  (expect (eq macher-agent--persistent-context parent-ctx) :to-be nil)
+                                                                  ;; Mutate child context
+                                                                  (macher-agent--update-context-file macher-agent--persistent-context "doc.txt" "v2")
+                                                                  ;; Parent remains unchanged before completion
+                                                                  (expect (macher-agent-vfs-read parent-ctx "doc.txt") :to-equal "v1")
+                                                                  ;; Clearing child context resets child without affecting parent
+                                                                  (macher-agent-clear-context)
+                                                                  (expect (macher-agent-vfs-read macher-agent--persistent-context "doc.txt") :to-equal "v1")
+                                                                  ;; Update child context again
+                                                                  (macher-agent--update-context-file macher-agent--persistent-context "doc.txt" "v3"))
+                                                                
+                                                                ;; Trigger completion callback on task execution
+                                                                (with-current-buffer parent-buf
+                                                                  (macher-agent-spawn-task
+                                                                   "child-agent"
+                                                                   (lambda (_res)
+                                                                     ;; Verify parent context now reflects child modifications
+                                                                     (expect (macher-agent-vfs-read parent-ctx "doc.txt") :to-equal "v3"))))
+                                                                (funcall (with-current-buffer sub-buf macher-agent--parent-callback) "Done")
+                                                                (kill-buffer sub-buf))))
+                                                        (kill-buffer parent-buf))))
+                                                (delete-directory temp-dir t))))
 
                                         (it "clears active presets during setup if the restored session tag is present"
                                             (let ((buf (generate-new-buffer "restored-session-buf"))
@@ -663,29 +706,29 @@
                                         (describe "Tool Schema Validation and Lifecycle Hooks"
                                                   (before-all
                                                    (macher-agent-make-tool mock-async-contract-tool
-									   "Mock async tool"
-									   :category "test"
-									   :args (list (list :name "arg1" :type 'string) (list :name "arg2" :type 'string))
-									   :command-fn (lambda (payload _context _root)
-											 (make-macher-agent-lisp-result-response :payload (format "Async %s %s" (plist-get payload :arg1) (plist-get payload :arg2)))))
+									                   "Mock async tool"
+									                 :category "test"
+									                 :args (list (list :name "arg1" :type 'string) (list :name "arg2" :type 'string))
+									                 :command-fn (lambda (payload _context _root)
+											                       (make-macher-agent-lisp-result-response :payload (format "Async %s %s" (plist-get payload :arg1) (plist-get payload :arg2)))))
 
                                                    (macher-agent-make-tool mock-sync-contract-tool
-									   "Mock sync tool"
-									   :category "test"
-									   :args (list (list :name "arg1" :type 'string))
-									   :command-fn (lambda (payload _context _root)
-											 (make-macher-agent-lisp-result-response :payload (format "Sync %s" (plist-get payload :arg1)))))
+									                   "Mock sync tool"
+									                 :category "test"
+									                 :args (list (list :name "arg1" :type 'string))
+									                 :command-fn (lambda (payload _context _root)
+											                       (make-macher-agent-lisp-result-response :payload (format "Sync %s" (plist-get payload :arg1)))))
 
                                                    (macher-agent-make-tool mock-complex-schema-tool
-									   "Mock complex schema tool"
-									   :category "test"
-									   :args (list (list :name "tasks"
-											     :type 'array
-											     :items '(:type object
-													    :properties (:name (:type string)
-															       :presets (:type array :items (:type string))))))
-									   :command-fn (lambda (_payload _context _root)
-											 (make-macher-agent-lisp-result-response :payload "Valid schema"))))
+									                   "Mock complex schema tool"
+									                 :category "test"
+									                 :args (list (list :name "tasks"
+											                           :type 'array
+											                           :items '(:type object
+													                                  :properties (:name (:type string)
+															                                             :presets (:type array :items (:type string))))))
+									                 :command-fn (lambda (_payload _context _root)
+											                       (make-macher-agent-lisp-result-response :payload "Valid schema"))))
 
                                                   (it "validates schema parameters correctly for valid payloads"
                                                       (let ((callback-result nil))
@@ -782,11 +825,11 @@
 
                                                   (it "runs post-tool-use-failure-hook if the tool body throws an error"
                                                       (macher-agent-make-tool mock-error-tool
-									      "Mock error tool"
-									      :category "test"
-									      :args (list (list :name "arg1" :type 'string))
-									      :command-fn (lambda (_payload _context _root)
-											    (error "Failing intentionally")))
+									                      "Mock error tool"
+									                    :category "test"
+									                    :args (list (list :name "arg1" :type 'string))
+									                    :command-fn (lambda (_payload _context _root)
+											                          (error "Failing intentionally")))
                                                       (let ((failure-called nil)
                                                             (callback-result nil))
                                                         (add-hook 'macher-agent-post-tool-use-failure-hook
@@ -1048,6 +1091,19 @@
                 (expect (plist-get yield1 :interrupt) :to-equal 'tool-call)
                 (expect (plist-get yield1 :name) :to-equal 'spawn-subagent)
                 (expect (plist-get yield1 :args) :to-equal '("agent-alpha"))))
+
+          (it "converts alist arguments passed to PTC primitives to plists on tool call interrupts"
+              (let* ((macher-agent--active-ptc-primitives '(spawn-subagent))
+                     (iter1 (macher-agent-sandbox--funcall-iter 'spawn-subagent '((path . "/tmp") (name . "test"))))
+                     (yield1 (iter-next iter1))
+                     (iter2 (macher-agent-sandbox--funcall-iter 'spawn-subagent '(((path . "/tmp") (name . "test")))))
+                     (yield2 (iter-next iter2)))
+                (expect (plist-get yield1 :interrupt) :to-equal 'tool-call)
+                (expect (plist-get yield1 :name) :to-equal 'spawn-subagent)
+                (expect (plist-get yield1 :args) :to-equal '(:path "/tmp" :name "test"))
+                (expect (plist-get yield2 :interrupt) :to-equal 'tool-call)
+                (expect (plist-get yield2 :name) :to-equal 'spawn-subagent)
+                (expect (plist-get yield2 :args) :to-equal '(:path "/tmp" :name "test"))))
 
           (it "matches PTC primitives bidirectionally and falls back to gptel-tools when active list is nil"
               (let ((macher-agent--active-ptc-primitives '(spawn-subagent)))

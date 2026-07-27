@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.0.72
+;; Version: 0.8.0.75
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -28,22 +28,50 @@
 (require 'macher-agent-sandbox)
 
 (defgroup macher-agent nil
-  "Agent tools within the macher edit context ."
+  "Agent tools within the macher edit context."
   :group 'gptel
   :prefix "macher-agent-")
 
 (defvar macher-agent-active-subagents nil
-  "Alist of active sub-agents and their locked directories.")
+  "Store active sub-agents and their locked directories as an alist.
+
+Each entry is a cell mapping sub-agent buffer instances or identifiers
+to their designated sandbox directory paths.
+
+Return an association list mapping sub-agent buffers to sandbox paths, or nil.
+
+Side effects: Global variable storing active sub-agent mappings.")
 
 (defun macher-agent-inject-thought (instruction)
-  "Interactively inject a directive while the agent is processing a tool.
+  "Inject a user directive while the agent is processing a tool.
 
-INSTRUCTION is a string representing the user directive to inject.
+INSTRUCTION is a string representing the user directive to inject into
+the pending queue.
 
-Return nil."
+Side effects: Appends INSTRUCTION formatted as a user override to the
+pending instructions list for the current session.
+
+Return the result message string displayed in the echo area."
   (interactive "sSteer the agent: ")
   (macher-agent-add-pending-instruction (format "USER OVERRIDE: %s" instruction))
   (message "Instruction queued! The agent will see this when its current tool finishes."))
+
+(defun macher-agent--master-gptel-setup ()
+  "Initialise `macher-agent' configuration in `gptel' buffers.
+
+Perform the complete setup sequence for gptel integration by executing
+`macher-agent-gptel-mode-setup', `macher-agent-setup-gptel-buffer',
+and wrapping available macher tools with `macher-agent--wrap-macher-tools'.
+
+Side effects: Configures buffer-local variables, mode hooks, and tool
+wrappers for `gptel-mode'.
+
+Return the result of `macher-agent--wrap-macher-tools'."
+  (macher-agent-gptel-mode-setup)
+  (macher-agent-setup-gptel-buffer)
+  (macher-agent--wrap-macher-tools))
+
+(add-hook 'gptel-mode-hook #'macher-agent--master-gptel-setup)
 
 (provide 'macher-agent)
 ;;; macher-agent.el ends here
