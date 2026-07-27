@@ -239,6 +239,8 @@ In this example, trying to call a restricted host primitive results in an error,
 
 Agent skills defined via `SKILL.md` files accept an optional `ptc-primitives` list in their YAML frontmatter (for example, `ptc-primitives: ["spawn_subagent", "delegate_tasks_to_subagents"]`).
 
+<img width="741" height="858" alt="PTC-execution" src="https://github.com/user-attachments/assets/bac858ef-61e0-439f-87ee-9b950d30ebe3" />
+
 PTC allows an agent to chain a number of tool uses in a single tool call (including with intermediate calculations in Emacs Lisp). This speeds up agent activity by allowing all calls to operate without a round trip and is token efficient. The sandbox yields to update the gptel user interface with the progress of each tool call.
 
 Tools created with `macher-agent-make-tool` return pure data objects directly from `:command-fn` for programmatic tool calling execution, while `:success-fn` generates presentation strings for display. Ensuring raw execution data and presentation output remain cleanly separated.
