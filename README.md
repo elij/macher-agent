@@ -20,10 +20,20 @@ The default context is orphaned as it is inaccessible within a capture block. Al
 
 ## Installation
 
+### Dependencies
+
+Ensure the following utilities and packages are installed
+
+* Emacs 29.1 or higher
+* `gptel` and `macher` packages
+* git
+* rsync
+
 You can install and configure the package using `use-package`.
 
 ```elisp
 (use-package macher-agent
+  :vc "https://github.com/elij/macher-agent/"
   :ensure t
   :after (gptel macher))
 
