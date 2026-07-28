@@ -4,7 +4,7 @@ https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 
 The macher-agent project is a *fully* Emacs native agentic harness. At its core, it is a collection of gptel presets and integrations with macher and gptel.
 
-A truly native Emacs harness relies on buffers rather than terminal user interfaces with captures and Elisp over slash commands. Tools and subagents act as sentinels operating in their own buffers. Subagents communicate via Elisp callbacks for one-to-one interactions or through hooks for broadcasting messages. Programmatic tool calling happens within an Elisp sandbox, integrating tool calls directly with Elisp. The `macher-agent-make-tool` function returns primitive types first and presentation second, fully utilising Emacs as a customisable multiplexing environment.
+A truly native Emacs harness relies on buffers rather than terminal user interfaces with captures and Elisp over slash commands (no external middleware, SDKs, ACPs etc.). Tools and subagents act as sentinels operating in their own buffers. Subagents communicate via Elisp callbacks for one-to-one interactions or through hooks for broadcasting messages. Programmatic tool calling happens within an Elisp sandbox, integrating tool calls directly with Elisp. The `macher-agent-make-tool` function returns primitive types first and presentation second, fully utilising Emacs as a customisable multiplexing environment.
 
 ## Approach to subagents
 
