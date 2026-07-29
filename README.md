@@ -33,7 +33,7 @@ You can install and configure the package using `use-package`.
 
 ```elisp
 (use-package macher-agent
-  :vc "https://github.com/elij/macher-agent/"
+  :vc (:url "https://github.com/elij/macher-agent/")
   :ensure t
   :after (gptel macher))
 
