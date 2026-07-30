@@ -79,8 +79,7 @@ Side effects: Mutates the PRIMITIVES hash-table."
   "Initialise the sandbox environment.
 
 Set up primitives, functions, and globals hash-tables if not already
-initialised, and populate them with standard pure host operations and mapcar
-and mapc helpers.
+initialised, and populate them with standard pure host operations.
 
 EXTRA-OPERATIONS is an optional list of additional primitive symbols to permit.
 
@@ -92,49 +91,10 @@ Side effects: Initialises and mutates buffer-local sandbox state variables."
     (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)
           macher-agent-sandbox--functions (make-hash-table :test 'eq)
           macher-agent-sandbox--globals (make-hash-table :test 'eq))
-    (macher-agent-sandbox--populate-pure-primitives macher-agent-sandbox--primitives)
-    (puthash 'mapcar (lambda (f seq)
-                       (mapcar (lambda (item) (macher-agent-sandbox--funcall f (list item))) seq))
-             macher-agent-sandbox--primitives)
-    (puthash 'mapc (lambda (f seq)
-                     (mapc (lambda (item) (macher-agent-sandbox--funcall f (list item))) seq) seq)
-             macher-agent-sandbox--primitives))
+    (macher-agent-sandbox--populate-pure-primitives macher-agent-sandbox--primitives))
   (when extra-operations
     (dolist (op extra-operations)
       (puthash op op macher-agent-sandbox--primitives))))
-
-(defun macher-agent-sandbox--step-sync (iterator yield-val)
-  "Advance ITERATOR with YIELD-VAL by one step synchronously.
-
-Evaluate one step of ITERATOR passing YIELD-VAL as input.  Signal an error
-if the step yields an asynchronous PTC tool call interrupt.
-
-ITERATOR is the generator object being stepped.
-YIELD-VAL is the value sent to the iterator on this step.
-
-Return the result form returned or yielded by ITERATOR.
-Side effects: May signal an error if an asynchronous tool call is attempted."
-  (let ((res (iter-next iterator yield-val)))
-    (if (and (consp res) (eq (plist-get res :interrupt) 'tool-call))
-        (error "Execution Error: Script attempted to call async PTC tool '%s' inside a synchronous evaluation context"
-               (plist-get res :name))
-      res)))
-
-(defun macher-agent-sandbox--run-sync (iterator)
-  "Pump ITERATOR to completion synchronously.
-
-Drive ITERATOR step by step until completion, catching `iter-end-of-sequence`
-to extract and return the final value safely.
-
-ITERATOR is the generator object to drive to completion.
-
-Return the final value produced by ITERATOR upon completion.
-Side effects: May signal an error if ITERATOR attempts an asynchronous yield."
-  (condition-case err
-      (let ((yield-val nil))
-        (while t
-          (setq yield-val (macher-agent-sandbox--step-sync iterator yield-val))))
-    (iter-end-of-sequence (cdr err))))
 
 (iter-defun macher-agent-sandbox--eval-args-iter (args env)
   "Evaluate a list of ARGS in ENV using the generator evaluator.
@@ -150,19 +110,6 @@ Side effects: May mutate global sandbox state during evaluation."
   (let ((evaled nil))
     (dolist (arg args (nreverse evaled))
       (push (iter-yield-from (macher-agent-sandbox--eval-iter arg env)) evaled))))
-
-(defun macher-agent-sandbox--eval-args (args env)
-  "Evaluate a list of ARGS in ENV synchronously.
-
-Evaluate each argument form in ARGS sequentially in environment ENV
-and return the resulting list of evaluated values.
-
-ARGS is a list of expressions to evaluate.
-ENV is the current lexical environment alist.
-
-Return a list of evaluated argument values.
-Side effects: May mutate global sandbox state during evaluation."
-  (macher-agent-sandbox--run-sync (macher-agent-sandbox--eval-args-iter args env)))
 
 (iter-defun macher-agent-sandbox--apply-closure-iter (closure arguments)
   "Execute CLOSURE with ARGUMENTS as a generator.
@@ -182,19 +129,6 @@ Side effects: May mutate global sandbox state during execution."
       (push (cons (pop params) (pop arguments)) new-env))
     (dolist (form (caddr closure) result)
       (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
-
-(defun macher-agent-sandbox--apply-closure (closure arguments)
-  "Execute CLOSURE with ARGUMENTS synchronously.
-
-Bind CLOSURE parameters to evaluated ARGUMENTS in a new environment and
-run the closure body forms to completion synchronously.
-
-CLOSURE is a closure structure (closure PARAMS BODY ENV).
-ARGUMENTS is a list of evaluated argument values to bind.
-
-Return the result of evaluating the final body form in CLOSURE.
-Side effects: May mutate global sandbox state during execution."
-  (macher-agent-sandbox--run-sync (macher-agent-sandbox--apply-closure-iter closure arguments)))
 
 (defun macher-agent-sandbox--normalize-args-to-plist (args)
   "Normalise ARGS into a standard plist for tool calls.
@@ -285,19 +219,6 @@ Side effects: May yield an interrupt or mutate global sandbox state."
    (t
     (error "Invalid function target: %s" func))))
 
-(defun macher-agent-sandbox--funcall (func eval-args)
-  "Execute function FUNC with EVAL-ARGS synchronously.
-
-Dispatch and execute function FUNC with evaluated arguments EVAL-ARGS
-synchronously to completion.
-
-FUNC is a function symbol or closure structure.
-EVAL-ARGS is the list of evaluated argument values.
-
-Return the result of invoking FUNC with EVAL-ARGS.
-Side effects: May mutate global sandbox state during execution."
-  (macher-agent-sandbox--run-sync (macher-agent-sandbox--funcall-iter func eval-args)))
-
 (iter-defun macher-agent-sandbox--eval-single-binding-iter (binding eval-env)
   "Evaluate a single BINDING specification in EVAL-ENV.
 
@@ -334,20 +255,6 @@ Side effects: May mutate global sandbox state during binding evaluation."
                     (macher-agent-sandbox--eval-single-binding-iter binding eval-env))))
         (setq new-env (cons pair new-env))))))
 
-(defun macher-agent-sandbox--bind (bindings env is-star)
-  "Process BINDINGS to extend ENV synchronously.
-
-Evaluate BINDINGS synchronously to construct an extended lexical
-environment from ENV.
-
-BINDINGS is a list of binding specifications.
-ENV is the base lexical environment alist.
-IS-STAR is non-nil for sequential let* binding, or nil for parallel let binding.
-
-Return the extended lexical environment alist.
-Side effects: May mutate global sandbox state during binding evaluation."
-  (macher-agent-sandbox--run-sync (macher-agent-sandbox--bind-iter bindings env is-star)))
-
 (iter-defun macher-agent-sandbox--eval-and-or-iter (args env is-or)
   "Evaluate boolean logic forms ARGS in ENV.
 
@@ -365,20 +272,6 @@ Side effects: May mutate global sandbox state during evaluation."
       (setq result (iter-yield-from (macher-agent-sandbox--eval-iter (pop args) env))))
     result))
 
-(defun macher-agent-sandbox--eval-and-or (args env is-or)
-  "Evaluate boolean logic forms ARGS in ENV synchronously.
-
-Evaluate expressions in ARGS synchronously using short-circuit logic,
-driven by IS-OR for logical OR or logical AND behaviour.
-
-ARGS is a list of conditional expressions.
-ENV is the lexical environment alist.
-IS-OR is non-nil for or forms, or nil for and forms.
-
-Return the result of short-circuit evaluation.
-Side effects: May mutate global sandbox state during evaluation."
-  (macher-agent-sandbox--run-sync (macher-agent-sandbox--eval-and-or-iter args env is-or)))
-
 (iter-defun macher-agent-sandbox--eval-let-iter (args env is-star)
   "Evaluate let or let* form ARGS in ENV.
 
@@ -395,20 +288,6 @@ Side effects: May mutate global sandbox state during evaluation."
         (result nil))
     (dolist (form (cdr args) result)
       (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
-
-(defun macher-agent-sandbox--eval-let (args env is-star)
-  "Evaluate let or let* form ARGS in ENV synchronously.
-
-Bind variables in (car ARGS) and execute body forms in (cdr ARGS)
-synchronously to completion.
-
-ARGS is a list starting with bindings list followed by body forms.
-ENV is the current lexical environment alist.
-IS-STAR is non-nil for let* binding, or nil for standard let binding.
-
-Return the value of the final body form.
-Side effects: May mutate global sandbox state during evaluation."
-  (macher-agent-sandbox--run-sync (macher-agent-sandbox--eval-let-iter args env is-star)))
 
 (iter-defun macher-agent-sandbox--eval-setq-iter (args env)
   "Evaluate setq form ARGS in ENV.
@@ -433,8 +312,47 @@ Side effects: Mutates variable bindings in ENV or `macher-agent-sandbox--globals
           (puthash var val macher-agent-sandbox--globals))))
     val))
 
+(iter-defun macher-agent-sandbox--eval-mapcar-iter (args env)
+  "Evaluate mapcar form ARGS in ENV.
+
+Evaluate function and sequence expressions in ARGS within environment ENV,
+then map the function over sequence items sequentially.
+
+ARGS is a list starting with function expression followed by sequence.
+ENV is the current lexical environment alist.
+
+Return a list of mapped elements.
+Side effects: May yield tool call interrupts or mutate global sandbox state."
+  (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
+        (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env)))
+        (result nil))
+    (unless (listp seq)
+      (error "Execution error (mapcar): Wrong type argument: listp, %s" seq))
+    (dolist (item seq (nreverse result))
+      (push (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))) result))))
+
+(iter-defun macher-agent-sandbox--eval-mapc-iter (args env)
+  "Evaluate mapc form ARGS in ENV.
+
+Evaluate function and sequence expressions in ARGS within environment ENV,
+then apply the function to sequence items sequentially.
+
+ARGS is a list starting with function expression followed by sequence.
+ENV is the current lexical environment alist.
+
+Return the sequence argument SEQ.
+Side effects: May yield tool call interrupts or mutate global sandbox state."
+  (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
+        (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env))))
+    (unless (listp seq)
+      (error "Execution error (mapc): Wrong type argument: listp, %s" seq))
+    (dolist (item seq seq)
+      (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))))))
+
 (defvar-local macher-agent-sandbox--special-forms
   `((quote . ,(iter-lambda (args _env) (car args)))
+    (mapcar . ,(iter-lambda (args env) (iter-yield-from (macher-agent-sandbox--eval-mapcar-iter args env))))
+    (mapc . ,(iter-lambda (args env) (iter-yield-from (macher-agent-sandbox--eval-mapc-iter args env))))
     (function . ,(iter-lambda (args env)
                    (let ((fn-target (car args)))
                      (if (symbolp fn-target)
@@ -639,36 +557,6 @@ Side effects: May initialise sandbox state and yield on tool interrupts."
     (macher-agent-sandbox--eval-symbol expression environment))
    ((consp expression)
     (iter-yield-from (macher-agent-sandbox--eval-compound-iter expression environment)))))
-
-(defun macher-agent-sandbox--eval (expression environment)
-  "Evaluate EXPRESSION in ENVIRONMENT synchronously.
-
-Evaluate Lisp form EXPRESSION synchronously to completion in ENVIRONMENT.
-
-EXPRESSION is the Lisp form to evaluate.
-ENVIRONMENT is the current lexical environment alist.
-
-Return the evaluated result of EXPRESSION.
-Side effects: May initialise sandbox state and mutate global state."
-  (macher-agent-sandbox--run-sync (macher-agent-sandbox--eval-iter expression environment)))
-
-(defun macher-agent-sandbox--run (expression extra-operations)
-  "Expand EXPRESSION and execute in a sandboxed environment.
-
-Macroexpand EXPRESSION fully, reinitialise sandbox environment tables,
-and evaluate the expanded form in a fresh top-level environment.
-
-EXPRESSION is the Lisp form to expand and evaluate.
-EXTRA-OPERATIONS is an optional list of additional primitive symbols to permit.
-
-Return the result of evaluating EXPRESSION.
-Side effects: Resets and initialises sandbox environment state tables."
-  (let ((expanded-expression (macroexpand-all expression)))
-    (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)
-          macher-agent-sandbox--functions (make-hash-table :test 'eq)
-          macher-agent-sandbox--globals (make-hash-table :test 'eq))
-    (macher-agent-sandbox--init extra-operations)
-    (macher-agent-sandbox--eval expanded-expression nil)))
 
 (provide 'macher-agent-sandbox)
 ;;; macher-agent-sandbox.el ends here

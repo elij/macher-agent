@@ -1009,13 +1009,15 @@
                                                    (:buffer "agent-beta" :status success :data "result-beta")))))
 
           (it "safely evaluates synchronous expressions without leaking iter-end-of-sequence"
-              (let ((val (macher-agent-sandbox--eval '(+ 10 20) nil)))
+              (let ((val (macher-agent-sandbox-run '(+ 10 20) nil)))
                 (expect val :to-equal 30)))
 
-          (it "blocks async PTC yields when evaluated in a synchronous context"
-              (let ((macher-agent--active-ptc-primitives '(spawn-subagent)))
-                (expect (macher-agent-sandbox--eval '(spawn-subagent "test" nil) nil)
-                        :to-throw 'error)))
+          (it "yields PTC tool interrupts when evaluated via eval-iter"
+              (let* ((macher-agent--active-ptc-primitives '(spawn-subagent))
+                     (iter (macher-agent-sandbox--eval-iter '(spawn-subagent "test" nil) nil))
+                     (yield-val (iter-next iter)))
+                (expect (plist-get yield-val :interrupt) :to-equal 'tool-call)
+                (expect (plist-get yield-val :name) :to-equal 'spawn-subagent)))
 
           (it "guards against sentinel double-invocation during async tool callbacks"
               (let* ((macher-agent--active-ptc-primitives '(spawn-subagent delegate-tasks-to-subagents read-file))

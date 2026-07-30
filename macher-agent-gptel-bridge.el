@@ -841,8 +841,8 @@ Side effects: None."
          (authorised-names (mapcar #'macher-agent-canonical-tool-name fsm-tools)))
     (unless (and canonical-name (member canonical-name authorised-names))
       (list
-       :block (format "ERROR: Tool '%s' is out of scope. It was not provided to this \
-sub-agent." (or canonical-name tool))))))
+       :block (format "ERROR: Tool '%s' is not accessible in this context or is no longer available. Please select another tool or approach."
+                      (or canonical-name tool))))))
 
 (defun macher-agent-setup-gptel-buffer ()
   "Set up a gptel buffer with macher-agent capabilities.

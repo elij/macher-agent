@@ -68,7 +68,8 @@ Side effects: None.")
   "Represent a Programmatic Tool Calling response structure.
 
 Return a new `macher-agent-ptc-response' struct instance.
-Side effects: None.")
+Side effects: None."
+  primitives)
 
 ;;; Customisation Variables
 
@@ -684,11 +685,16 @@ Side effects: Evaluates Lisp AST and dispatches tool calls with feedback."
   (condition-case general-err
       (let ((macher-agent--active-ptc-execution t)
             (script-string (macher-agent-tool-response-payload res))
+            (extra-primitives (macher-agent-ptc-response-primitives res))
             (target-buf (or (macher-agent-tool-response-buffer-name res) (current-buffer))))
         (if (not script-string)
             (funcall on-error (list :status 'error :error "Invalid PTC script payload"))
           (let ((ast (macroexpand-all (read script-string))))
             (with-current-buffer target-buf
+              (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)
+                    macher-agent-sandbox--functions (make-hash-table :test 'eq)
+                    macher-agent-sandbox--globals (make-hash-table :test 'eq))
+              (macher-agent-sandbox--init extra-primitives)
               (let ((iterator (macher-agent-sandbox--eval-iter ast nil)))
                 (if (not iterator)
                     (funcall on-error (list :status 'error :error "Failed to initialise PTC iterator"))
@@ -734,7 +740,11 @@ Side effects: Updates mode-line status and executes pre-tool-call hooks."
                  original-name-str)))
     (message "PTC Executing: %s" desc)
     (when (fboundp 'gptel--update-status)
-      (gptel--update-status (format " PTC: %s..." original-name-str) 'mode-line-emphasis))
+      (gptel--update-status
+       (concat
+        (propertize " Calling PTC tool (" 'face 'mode-line-emphasis)
+        (propertize (format "%s" tool-sym) 'face 'font-lock-keyword-face)
+        (propertize ")" 'face 'mode-line-emphasis))))
     (when (bound-and-true-p gptel-pre-tool-call-functions)
       (run-hook-wrapped 'gptel-pre-tool-call-functions
                         (lambda (f)
@@ -940,7 +950,8 @@ Side effects: Invokes target primitive function or tool callback."
       (when stop-iter-fn (funcall stop-iter-fn))
       (funcall on-error
                (list :status 'error
-                     :error (format "Unknown PTC primitive requested: %s" original-name-str))))))
+                     :error (format "ERROR: Tool '%s' is not accessible in this context or is no longer available. Please select another tool or approach."
+                                    original-name-str))))))
 
 (defun macher-agent--ptc-handle-yielded-value (yielded-val context ptc-resume-loop on-error stop-iter-fn)
   "Handle YIELDED-VAL returned during PTC execution.
