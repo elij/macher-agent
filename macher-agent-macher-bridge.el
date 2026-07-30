@@ -508,19 +508,25 @@ Side effects: Switches current buffer to BUFFER and triggers request completion.
         (macher-agent--with-protected-context-contents agent-ctx
           (funcall process-fn 'complete agent-ctx fsm))))))
 
+(defvar macher-agent--inhibit-patch-hook nil)
+
 (defun macher-agent--trigger-patch-on-complete (fsm &rest _)
-  "Trigger patch generation when FSM transitions to DONE state.
+  "rigger patch generation when FSM transitions to DONE state.
 
 Inspect finite-state machine FSM state upon transition.  If state is DONE, resolve
-target buffer and invoke `macher-agent--process-completed-fsm-buffer'.
+target buffer and invoke `macher-agent--process-completed-fsm-buffer'. Ignores errors when
+session in aborted state.
 
 Return nil.
-
 Side effects: May trigger patch generation and buffer display upon completion."
-  (when (eq (gptel-fsm-state fsm) 'DONE)
-    (let* ((info (gptel-fsm-info fsm))
-           (buffer (plist-get info :buffer)))
-      (macher-agent--process-completed-fsm-buffer buffer fsm))))
+  (ignore-errors
+    (unless macher-agent--inhibit-patch-hook
+      (let ((macher-agent--inhibit-patch-hook t))
+        (when (eq (gptel-fsm-state fsm) 'DONE)
+          (let* ((info (gptel-fsm-info fsm))
+                 (buffer (plist-get info :buffer)))
+            (with-current-buffer buffer
+              (macher-agent--process-completed-fsm-buffer buffer fsm))))))))
 
 (advice-add 'gptel--fsm-transition :after #'macher-agent--trigger-patch-on-complete)
 

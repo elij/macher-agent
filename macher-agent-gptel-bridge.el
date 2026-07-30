@@ -882,8 +882,16 @@ ARGS represents additional arguments passed to ORIG-FN.
 
 Return result of calling ORIG-FN.
 Side effects: Dynamically binds `macher-agent--active-fsm'."
-  (let ((macher-agent--active-fsm fsm))
-    (apply orig-fn fsm args)))
+  (let* ((macher-agent--active-fsm fsm)
+         (tool (car-safe args)))
+
+    (if (and args (not tool))
+        (let ((dummy (gptel-make-tool :name "unavailable_tool"
+                                      :function #'ignore
+                                      :description "")))
+          (apply orig-fn fsm dummy (cdr args)))
+
+      (apply orig-fn fsm args))))
 
 (advice-add 'gptel--handle-pre-tool :around #'macher-agent--bind-active-fsm-advice)
 (advice-add 'gptel--handle-tool-use :around #'macher-agent--bind-active-fsm-advice)
