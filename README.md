@@ -48,7 +48,7 @@ git init
 
 ```
 
-Next, capture a discussion buffer using `macher-discuss` or standard `gptel-mode`. From within this buffer, you can interact with the language model and spin up agents to handle workspace tasks.
+Next, capture a discussion buffer using `macher-discuss` or standard `gptel`. From within this buffer, you can interact with the language model and spin up agents to handle workspace tasks.
 
 ## Documentation and wiki
 

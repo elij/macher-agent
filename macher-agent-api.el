@@ -1300,7 +1300,16 @@ Return the result of evaluating EXPRESSION.
 
 Side effects: Evaluates sandboxed Lisp expression."
   (declare (ftype (function (t list) t)))
-  (macher-agent-sandbox--run expression extra-operations))
+  (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)
+        macher-agent-sandbox--functions (make-hash-table :test 'eq)
+        macher-agent-sandbox--globals (make-hash-table :test 'eq))
+  (macher-agent-sandbox--init extra-operations)
+  (let ((iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
+        (yield-val nil))
+    (condition-case err
+        (while t
+          (setq yield-val (iter-next iterator yield-val)))
+      (iter-end-of-sequence (cdr err)))))
 
 (provide 'macher-agent-api)
 ;;; macher-agent-api.el ends here

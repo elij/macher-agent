@@ -508,7 +508,7 @@ Side effects: Switches current buffer to BUFFER and triggers request completion.
         (macher-agent--with-protected-context-contents agent-ctx
           (funcall process-fn 'complete agent-ctx fsm))))))
 
-(defun macher-agent--trigger-patch-on-complete (fsm)
+(defun macher-agent--trigger-patch-on-complete (fsm &rest _)
   "Trigger patch generation when FSM transitions to DONE state.
 
 Inspect finite-state machine FSM state upon transition.  If state is DONE, resolve
