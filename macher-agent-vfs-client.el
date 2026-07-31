@@ -855,7 +855,9 @@ Return the canonical key path string, or PATH if non-string."
            (is-pure-buffer (and buf (null (buffer-file-name buf)))))
       (if (and ws-root (not is-pure-buffer) (not (string-prefix-p "*" path)))
           (expand-file-name path ws-root)
-        path))))
+        (if (and (string-prefix-p "*" path) (not (string-suffix-p "*" path)))
+            (concat path "*")
+          path)))))
 
 (defun macher-agent--get-buffer-content-stateless (path workspace-root)
   "Read buffer content statelessly using an explicit WORKSPACE-ROOT.
