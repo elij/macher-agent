@@ -563,21 +563,21 @@ Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
                 (let* ((wrap-cb (macher-agent--wrap-callback callback))
                        (payload (macher-agent--extract-payload tool-args ,args)))
                   (macher-agent--with-tool-error-handling ',name-symbol payload wrap-cb
-                    (macher-agent--validate-payload payload ,args)
-                    (let* ((context (or (ignore-errors (macher-agent-resolve-context))
-                                        (bound-and-true-p macher-agent--persistent-context)))
-                           (root (if context (macher-agent-context-root context) default-directory))
-                           (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
-                      (if hook-rejection
-                          (funcall wrap-cb (list :status 'error :error hook-rejection))
-                        (let* ((action (funcall ,command-fn payload context root))
-                               (action-res (if (macher-agent-tool-response-p action)
-                                               action
-                                             (make-macher-agent-lisp-result-response
-                                              :payload action)))
-                               (on-success (macher-agent--build-success-callback
-                                            ',name-symbol payload ,success-fn ,output-filter-fn wrap-cb)))
-                          (macher-agent-execute-response action-res context on-success wrap-cb))))))))))))
+                                                          (macher-agent--validate-payload payload ,args)
+                                                          (let* ((context (or (ignore-errors (macher-agent-resolve-context))
+                                                                              (bound-and-true-p macher-agent--persistent-context)))
+                                                                 (root (if context (macher-agent-context-root context) default-directory))
+                                                                 (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
+                                                            (if hook-rejection
+                                                                (funcall wrap-cb (list :status 'error :error hook-rejection))
+                                                              (let* ((action (funcall ,command-fn payload context root))
+                                                                     (action-res (if (macher-agent-tool-response-p action)
+                                                                                     action
+                                                                                   (make-macher-agent-lisp-result-response
+                                                                                    :payload action)))
+                                                                     (on-success (macher-agent--build-success-callback
+                                                                                  ',name-symbol payload ,success-fn ,output-filter-fn wrap-cb)))
+                                                                (macher-agent-execute-response action-res context on-success wrap-cb))))))))))))
 
 ;;; Response Execution Methods
 
@@ -739,7 +739,7 @@ Side effects: Updates mode-line status and executes pre-tool-call hooks."
                    (gptel-tool-description resolved-tool)
                  original-name-str))
          (block-reason nil))
-    
+
     (when (bound-and-true-p gptel-pre-tool-call-functions)
       (run-hook-wrapped 'gptel-pre-tool-call-functions
                         (lambda (f)
@@ -748,7 +748,7 @@ Side effects: Updates mode-line status and executes pre-tool-call hooks."
                             (when (and res (listp res) (plist-get res :block))
                               (setq block-reason (plist-get res :block))
                               t)))))
-    
+
     (if block-reason
         (error "%s" block-reason)
       (message "PTC Executing: %s"

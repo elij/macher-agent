@@ -46,41 +46,50 @@ CALL-COUNTER is a symbol bound in the calling environment that increments upon F
                       ;; Run asynchronously to process background tool queues
                       (run-at-time 0.01 nil
                                    (lambda ()
-                                     (plist-put info :http-status "200")
-                                     (plist-put info :status "200 OK")
-                                     (gptel--fsm-transition fsm) ;; WAIT -> TYPE
+                                     ;; FIX: Prevent use-after-free if the test suite already killed the buffer!
+                                     (when (buffer-live-p (plist-get info :buffer))
+                                       (plist-put info :http-status "200")
+                                       (plist-put info :status "200 OK")
+                                       (gptel--fsm-transition fsm) ;; WAIT -> TYPE
 
-                                     (if resp
-                                         (progn
-                                           (when (plist-get resp :tool-use)
-                                             ;; Dynamically map our positional mock values to the correct 
-                                             ;; schema keys declared by the tool.
-                                             (let ((tool-use-list nil))
-                                               (cl-loop for tool-req in (plist-get resp :tool-use)
-                                                        for i from 1
-                                                        do
-                                                        (let* ((tool-name (car tool-req))
-                                                               (tool-vals (cdr tool-req))
-                                                               (tool-spec (cl-find-if (lambda (ts) (equal (gptel-tool-name ts) tool-name))
-                                                                                      (plist-get info :tools)))
-                                                               (expected-args (gptel-tool-args tool-spec))
-                                                               (args-plist nil))
-                                                          (cl-loop for arg in expected-args
-                                                                   for val in tool-vals
-                                                                   do (setq args-plist (plist-put args-plist (intern (concat ":" (if (symbolp (plist-get arg :name)) (symbol-name (plist-get arg :name)) (plist-get arg :name)))) val)))
-                                                          (push (list :id (format "call_%s_%d" current-buf i)
-                                                                      :name tool-name
-                                                                      :args args-plist)
-                                                                tool-use-list)))
-                                               (plist-put info :tool-use (nreverse tool-use-list))))
+                                       (if resp
+                                           (progn
+                                             (when (plist-get resp :tool-use)
+                                               ;; map our positional mock values to the correct 
+                                               ;; schema keys declared by the tool.
+                                               (let ((tool-use-list nil))
+                                                 (cl-loop for tool-req in (plist-get resp :tool-use)
+                                                          for i from 1
+                                                          do
+                                                          (let* ((tool-name (car tool-req))
+                                                                 (tool-vals (cdr tool-req))
+                                                                 (tool-spec (or (cl-find-if (lambda (ts) (equal (gptel-tool-name ts) tool-name))
+                                                                                            (plist-get info :tools))
+                                                                                (ignore-errors (gptel-get-tool tool-name))))
+                                                                 (expected-args (when tool-spec (gptel-tool-args tool-spec)))
+                                                                 (args-plist nil))
+                                                            
+                                                            (when tool-spec
+                                                              (unless (cl-find-if (lambda (ts) (equal (gptel-tool-name ts) tool-name)) (plist-get info :tools))
+                                                                (setq info (plist-put info :tools (append (plist-get info :tools) (list tool-spec))))
+                                                                (setf (gptel-fsm-info fsm) info)))
 
-                                           (if (plist-get resp :text)
-                                               (funcall callback (plist-get resp :text) info)
-                                             (funcall callback nil info)))
-                                       (funcall callback "Fallback mock response." info))
+                                                            (cl-loop for arg in expected-args
+                                                                     for val in tool-vals
+                                                                     do (setq args-plist (plist-put args-plist (intern (concat ":" (if (symbolp (plist-get arg :name)) (symbol-name (plist-get arg :name)) (plist-get arg :name)))) val)))
+                                                            (push (list :id (format "call_%s_%d" current-buf i)
+                                                                        :name tool-name
+                                                                        :args args-plist)
+                                                                  tool-use-list)))
+                                                 (plist-put info :tool-use (nreverse tool-use-list))))
 
-                                     (gptel--fsm-transition fsm) ;; TYPE -> TOOL or DONE
-                                     (cl-incf ,call-counter))))))
+                                             (if (plist-get resp :text)
+                                                 (funcall callback (plist-get resp :text) info)
+                                               (funcall callback nil info)))
+                                         (funcall callback "Fallback mock response." info))
+
+                                       (gptel--fsm-transition fsm) ;; TYPE -> TOOL or DONE
+                                       (cl-incf ,call-counter)))))))
                  ;; Map curl fetcher to the exact same mock to guarantee coverage
                  ((symbol-function 'gptel-curl-get-response)
                   (symbol-function 'gptel--url-get-response)))

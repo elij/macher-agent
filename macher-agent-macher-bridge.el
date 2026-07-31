@@ -244,7 +244,7 @@ Side effects: Generates and displays patch buffers and updates CTX prompt."
                    ((and context (not (macher-context-p context))) context)
                    (fsm fsm)
                    (t (macher-agent--get-fsm-latest)))))
-    
+
     (when (and ctx (null (macher-agent--get-context-prompt ctx)))
       (when-let* ((info (when (and fsm-obj (fboundp 'gptel-fsm-info))
                           (ignore-errors (gptel-fsm-info fsm-obj))))
@@ -450,7 +450,7 @@ Side effects: Mutates function slot of TOOL and updates `macher-agent--wrapped-t
                     (when-let* ((user-prompt (macher-context-prompt orphaned-context)))
                       (ignore-errors (setf (macher-context-prompt agent-ctx) user-prompt))
                       (macher-agent--set-context-data agent-ctx :prompt user-prompt)))
-                  
+
                   (macher-agent--inject-context-into-fsm-info agent-ctx))
                 (with-current-buffer target-buf
                   (apply orig-fn (or agent-ctx orphaned-context) callback args)))))
@@ -505,7 +505,7 @@ Side effects: Switches current buffer to BUFFER and triggers request completion.
       (when-let* ((agent-ctx (bound-and-true-p macher-agent--persistent-context))
                   (process-fn (bound-and-true-p macher-process-request-function)))
         (macher-agent--with-protected-context-contents agent-ctx
-          (funcall process-fn 'complete agent-ctx fsm))))))
+                                                       (funcall process-fn 'complete agent-ctx fsm))))))
 
 (defvar macher-agent--inhibit-patch-hook nil)
 
