@@ -471,74 +471,90 @@ Return the result of ASYNC-FN."
             (when (looking-at "[ \t]+")
               (replace-match "")))))
 
-      (unless matched-skills
-        (let ((active-sys (with-current-buffer orig-buf gptel-system-prompt))
-              (directives (with-current-buffer orig-buf gptel-directives)))
-          (when-let* ((sym (cl-loop for (s . sys) in directives
-                                    when (equal sys active-sys) return s)))
-            (push sym matched-skills))))
+      (when matched-skills
+        (with-current-buffer orig-buf
+          (setq-local macher-agent-presets 
+                      (delete-dups (append (bound-and-true-p macher-agent-presets) 
+                                           (reverse matched-skills))))))
 
-      (let ((redirected-skill nil))
-        (when inline-preset-used
-          (let ((remaining-text (buffer-substring-no-properties prompt-start (point-max))))
-            (unless (string-match-p "[A-Za-z]" remaining-text)
-              (setq redirected-skill (pop matched-skills)))))
+      (let* ((active-presets (with-current-buffer orig-buf (bound-and-true-p macher-agent-presets)))
+             (active-sys (with-current-buffer orig-buf gptel-system-prompt))
+             (directives (with-current-buffer orig-buf gptel-directives))
+             (clean-sys (if (and active-sys (string-match "\\`\\(\\(?:.\\|\n\\)*?\\)\n\n=== PROGRAMMATIC TOOL CALLING" active-sys))
+                            (string-trim (match-string 1 active-sys))
+                          active-sys)))
 
-        (when (let ((base-state
-                     (with-current-buffer orig-buf
-                       (list :model gptel-model
-                             :system gptel-system-prompt
-                             :temperature (bound-and-true-p gptel-temperature)
-                             :max-tokens (bound-and-true-p gptel-max-tokens)
-                             :tools gptel-tools
-                             :known-presets (bound-and-true-p gptel--known-presets)))))
-                (let* ((remaining-skills (nreverse matched-skills))
-                       (all-skills (if redirected-skill
-                                       (append remaining-skills (list redirected-skill))
-                                     remaining-skills))
-                       (payload (when all-skills
-                                  (macher-agent-compose-payload base-state all-skills))))
+        (unless matched-skills
+          (if active-presets
+              (setq matched-skills (if (listp active-presets)
+                                       (append matched-skills active-presets)
+                                     (append matched-skills (list active-presets))))
+            (when-let* ((sym (cl-loop for (s . sys) in directives
+                                      when (equal sys clean-sys) return s)))
+              (push sym matched-skills))))
 
-                  (when payload
-                    (let*
-                        ((sys-payload
-                          (when remaining-skills
-                            (macher-agent-compose-payload base-state remaining-skills)))
-                         (final-sys-prompt (if sys-payload
-                                               (plist-get sys-payload :system)
-                                             (plist-get base-state :system)))
-                         (composed-active (plist-get payload :ptc-primitives))
-                         (composed-tools (plist-get payload :tools)))
+        (let ((redirected-skill nil))
+          (when inline-preset-used
+            (let ((remaining-text (buffer-substring-no-properties prompt-start (point-max))))
+              (unless (string-match-p "[A-Za-z]" remaining-text)
+                (setq redirected-skill (pop matched-skills)))))
 
-                      (setq payload
-                            (plist-put payload
-                                       :system
-                                       (macher-agent--inject-ptc-prompt
-                                        final-sys-prompt composed-active composed-tools))))
+          (when (let ((base-state
+                       (with-current-buffer orig-buf
+                         (list :model gptel-model
+                               :system clean-sys 
+                               :temperature (bound-and-true-p gptel-temperature)
+                               :max-tokens (bound-and-true-p gptel-max-tokens)
+                               :tools gptel-tools
+                               :known-presets (bound-and-true-p gptel--known-presets))))))
+            
+            (let* ((remaining-skills (nreverse matched-skills))
+                   (all-skills (if redirected-skill
+                                   (append remaining-skills (list redirected-skill))
+                                 remaining-skills))
+                   (payload (when all-skills
+                              (macher-agent-compose-payload base-state all-skills))))
 
-                    (macher-agent--apply-payload-locally payload)
+              (when payload
+                (let*
+                    ((sys-payload
+                      (when remaining-skills
+                        (macher-agent-compose-payload base-state remaining-skills)))
+                     (final-sys-prompt (if sys-payload
+                                           (plist-get sys-payload :system)
+                                         (plist-get base-state :system)))
+                     (composed-active (plist-get payload :ptc-primitives))
+                     (composed-tools (plist-get payload :tools)))
 
-                    (when fsm
-                      (let ((new-info (copy-sequence (gptel-fsm-info fsm))))
-                        (dolist (key '(:system :model :temperature :max-tokens :tools))
-                          (when (plist-member payload key)
-                            (setq new-info (plist-put new-info key (plist-get payload key)))))
-                        (setf (gptel-fsm-info fsm) new-info))))
+                  (setq payload
+                        (plist-put payload
+                                   :system
+                                   (macher-agent--inject-ptc-prompt
+                                    final-sys-prompt composed-active composed-tools))))
 
-                  (when redirected-skill
-                    (when-let* ((dummy-base (plist-put (copy-sequence base-state) :system ""))
-                                (dummy-payload
-                                 (macher-agent-compose-payload dummy-base
-                                                               (list redirected-skill)))
-                                (sys-prompt (plist-get dummy-payload :system))
-                                ((stringp sys-prompt))
-                                ((not (string-empty-p sys-prompt))))
-                      (delete-region prompt-start (point-max))
-                      (insert sys-prompt)
-                      (when fsm
-                        (setf (gptel-fsm-info fsm)
-                              (plist-put (gptel-fsm-info fsm) :prompt sys-prompt))))))
-                t))
+                (macher-agent--apply-payload-locally payload)
+
+                (when fsm
+                  (let ((new-info (copy-sequence (gptel-fsm-info fsm))))
+                    (dolist (key '(:system :model :temperature :max-tokens :tools))
+                      (when (plist-member payload key)
+                        (setq new-info (plist-put new-info key (plist-get payload key)))))
+                    (setf (gptel-fsm-info fsm) new-info))))
+
+              (when redirected-skill
+                (when-let* ((dummy-base (plist-put (copy-sequence base-state) :system ""))
+                            (dummy-payload
+                             (macher-agent-compose-payload dummy-base
+                                                           (list redirected-skill)))
+                            (sys-prompt (plist-get dummy-payload :system))
+                            ((stringp sys-prompt))
+                            ((not (string-empty-p sys-prompt))))
+                  (delete-region prompt-start (point-max))
+                  (insert sys-prompt)
+                  (when fsm
+                    (setf (gptel-fsm-info fsm)
+                          (plist-put (gptel-fsm-info fsm) :prompt sys-prompt))))))
+            t))
 
         (when-let* ((fn async-fn)
                     ((functionp fn)))

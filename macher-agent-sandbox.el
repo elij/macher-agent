@@ -187,6 +187,7 @@ Return the result of the function call or yield a tool call interrupt.
 Side effects: May yield an interrupt or mutate global sandbox state."
   (let ((prim (and macher-agent-sandbox--primitives (gethash func macher-agent-sandbox--primitives)))
         (closure (and macher-agent-sandbox--functions (gethash func macher-agent-sandbox--functions))))
+
     (cond
      ((and (fboundp 'macher-agent--ptc-primitive-p)
            (macher-agent--ptc-primitive-p func))
@@ -211,6 +212,7 @@ EVAL-ARGS is the list of evaluated argument values.
 
 Return the result of invoking FUNC with EVAL-ARGS.
 Side effects: May yield an interrupt or mutate global sandbox state."
+  ;;(message func)
   (cond
    ((and (consp func) (eq (car func) 'closure))
     (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))

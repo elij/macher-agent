@@ -737,20 +737,29 @@ Side effects: Updates mode-line status and executes pre-tool-call hooks."
          (resolved-tool (macher-agent-resolve-tool original-name-str nil nil context))
          (desc (if (macher-tool-valid-p resolved-tool)
                    (gptel-tool-description resolved-tool)
-                 original-name-str)))
-    (message "PTC Executing: %s" desc)
-    (when (fboundp 'gptel--update-status)
-      (gptel--update-status
-       (concat
-        (propertize " Calling PTC tool (" 'face 'mode-line-emphasis)
-        (propertize (format "%s" tool-sym) 'face 'font-lock-keyword-face)
-        (propertize ")" 'face 'mode-line-emphasis))))
+                 original-name-str))
+         (block-reason nil))
+    
     (when (bound-and-true-p gptel-pre-tool-call-functions)
       (run-hook-wrapped 'gptel-pre-tool-call-functions
                         (lambda (f)
-                          (ignore-errors
-                            (funcall f (list :name original-name-str :args args :buffer (buffer-name) :model (bound-and-true-p gptel-model)))))))
-    (cons original-name-str resolved-tool)))
+                          (let ((res (ignore-errors
+                                       (funcall f (list :name original-name-str :args args :buffer (buffer-name) :model (bound-and-true-p gptel-model))))))
+                            (when (and res (listp res) (plist-get res :block))
+                              (setq block-reason (plist-get res :block))
+                              t)))))
+    
+    (if block-reason
+        (error "%s" block-reason)
+      (message "PTC Executing: %s"
+               (or desc original-name-str))
+      (when (fboundp 'gptel--update-status)
+        (gptel--update-status
+         (concat
+          (propertize " Calling PTC tool (" 'face 'mode-line-emphasis)
+          (propertize (format "%s" tool-sym) 'face 'font-lock-keyword-face)
+          (propertize ")" 'face 'mode-line-emphasis))))
+      (cons original-name-str resolved-tool))))
 
 (defun macher-agent--format-ptc-result-block (truncated-call call-str str-res)
   "Format PTC result block string for display in buffer.

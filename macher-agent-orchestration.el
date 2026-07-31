@@ -422,7 +422,6 @@ Return t if SYM is an active primitive, otherwise nil.
 Side effects: None."
   (let* ((sym-name (symbol-name sym))
          (norm-sym (replace-regexp-in-string "_" "-" sym-name))
-         (underscore-sym (replace-regexp-in-string "-" "_" sym-name))
          (active (bound-and-true-p macher-agent--active-ptc-primitives))
          (tools (bound-and-true-p gptel-tools)))
     (and (or (memq sym active)
@@ -432,17 +431,14 @@ Side effects: None."
                           (string= norm-sym norm-prim)))
                       active)
              (and (null active)
-                  (or (cl-some (lambda (tool)
-                                 (let* ((t-name (if (gptel-tool-p tool)
-                                                    (gptel-tool-name tool)
-                                                  (if (stringp tool) tool
-                                                    (format "%s" tool))))
-                                        (norm-tool (replace-regexp-in-string "_" "-" t-name)))
-                                   (string= norm-sym norm-tool)))
-                               tools)
-                      (let ((resolved (ignore-errors
-                                        (macher-agent-resolve-tool underscore-sym nil nil (and (fboundp 'macher-agent-resolve-context) (macher-agent-resolve-context))))))
-                        (and resolved (not (equal resolved underscore-sym)))))))
+                  (cl-some (lambda (tool)
+                             (let* ((t-name (if (gptel-tool-p tool)
+                                                (gptel-tool-name tool)
+                                              (if (stringp tool) tool
+                                                (format "%s" tool))))
+                                    (norm-tool (replace-regexp-in-string "_" "-" t-name)))
+                               (string= norm-sym norm-tool)))
+                           tools)))
          t)))
 
 (defun macher-agent--make-lisp-task-callback (buf callback)

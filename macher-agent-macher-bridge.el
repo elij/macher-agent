@@ -446,7 +446,6 @@ Side effects: Mutates function slot of TOOL and updates `macher-agent--wrapped-t
                                      (current-buffer)))
                      (agent-ctx (macher-agent--get-buffer-persistent-context target-buf)))
                 (when agent-ctx
-                  ;; Transfer the true user prompt from Macher's orphaned context
                   (when (and orphaned-context (macher-context-p orphaned-context))
                     (when-let* ((user-prompt (macher-context-prompt orphaned-context)))
                       (ignore-errors (setf (macher-context-prompt agent-ctx) user-prompt))
