@@ -252,6 +252,52 @@ Side effects: None."
     (let ((raw-name (macher-agent--extract-raw-tool-name tool)))
       (format "%s" (if (symbolp raw-name) (symbol-name raw-name) raw-name)))))
 
+(defun macher-agent-log-tool-intent (context type target args)
+  "Log tool execution intent entry to CONTEXT audit log.
+
+CONTEXT is the active context structure.
+TYPE is the invocation type string, such as gptel-tool or ptc.
+TARGET is the tool identifier name string or PTC primitive symbol.
+ARGS is the list of parameters passed to the tool.
+
+Return the updated audit log list.
+
+Side effects: Mutates CONTEXT audit log property list."
+  (when context
+    (let* ((log (macher-agent--get-context-data context :audit-log))
+           (preset-sym (bound-and-true-p macher-agent--active-skill-sym))
+           (preset-str (if preset-sym
+                           (if (symbolp preset-sym)
+                               (symbol-name preset-sym)
+                             (format "%s" preset-sym))
+                         "unknown"))
+           (entry `((timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S"))
+                    (buffer . ,(buffer-name))
+                    (preset . ,preset-str)
+                    (type . ,type)
+                    (target . ,target)
+                    (args . ,args))))
+      (macher-agent--set-context-data context :audit-log (append log (list entry))))))
+
+(defun macher-agent--log-gptel-pre-tool (tool &optional _fsm &rest args)
+  "Log GPTEL pre-tool call intent to context audit log.
+
+TOOL is the tool structure or property list.
+_FSM is the optional state machine object.
+ARGS represents additional arguments passed to the tool call.
+
+Return nil.
+
+Side effects: Appends tool call entry to active context audit log."
+  (let ((context (ignore-errors (macher-agent-resolve-context)))
+        (tool-name (macher-agent-canonical-tool-name tool))
+        (tool-args (if (and (listp tool) (plist-member tool :args))
+                       (plist-get tool :args)
+                     args)))
+    (macher-agent-log-tool-intent context "gptel-tool" tool-name tool-args)))
+
+(add-hook 'gptel-pre-tool-call-functions #'macher-agent--log-gptel-pre-tool)
+
 (defun macher-agent--cache-tool (tool registry)
   "Cache TOOL in REGISTRY using its canonical string name.
 
@@ -921,6 +967,8 @@ Side effects: None."
                 if (equal prompt sys-msg)
                 return (symbol-name sym))))))
 
+(make-obsolete 'macher-agent--get-system-message-name nil "0.4.0")
+
 (defun macher-agent-initialize-skills (&optional context dir)
   "Initialise agent skills from all registered directories and contexts.
 
@@ -974,10 +1022,7 @@ Side effects: Registers skills, configures directives, and sets up menus."
                     (setf (alist-get sym gptel-directives) system-prompt)
                     (let ((preset-spec (list :description (or desc (format "Agent Profile: %s" sym))
                                              :system system-prompt)))
-                      (when exclusive
-                        (setq preset-spec (plist-put preset-spec :exclusive t)))
                       (when model (setq preset-spec (plist-put preset-spec :model model)))
-                      (when ptc-primitives (setq preset-spec (plist-put preset-spec :ptc-primitives ptc-primitives)))
                       (when tool-names
                         (setq preset-spec (plist-put preset-spec :tools
                                                      (if exclusive
@@ -1283,10 +1328,18 @@ Side effects: Creates new chat buffer and sets buffer-local agent variables."
 
       (setq-local macher-agent-parent-buffer parent-name)
 
-      (when active-backend (setq-local gptel-backend active-backend))
-      (when active-model (setq-local gptel-model active-model))
-      (when active-sys (setq-local gptel-system-prompt active-sys))
-      (when active-skill (setq-local macher-agent--active-skill-sym active-skill))
+      (when-let* ((backend active-backend))
+        (setq-local gptel-backend backend))
+      (when-let* ((model active-model))
+        (setq-local gptel-model model))
+      (when-let* ((sys active-sys))
+        (setq-local gptel-system-prompt sys))
+      (when-let* ((skill active-skill))
+        (setq-local macher-agent--active-skill-sym skill))
+
+      (setq-local macher-agent-presets (with-current-buffer parent-buf macher-agent-presets))
+      (setq-local macher-agent--active-ptc-primitives (with-current-buffer parent-buf macher-agent--active-ptc-primitives))
+      (setq-local gptel-tools (with-current-buffer parent-buf gptel-tools))
 
       (switch-to-buffer (current-buffer)))))
 
@@ -1304,11 +1357,20 @@ Side effects: Evaluates sandboxed Lisp expression."
         macher-agent-sandbox--functions (make-hash-table :test 'eq)
         macher-agent-sandbox--globals (make-hash-table :test 'eq))
   (macher-agent-sandbox--init extra-operations)
-  (let ((iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
-        (yield-val nil))
+  (let ((context (ignore-errors (macher-agent-resolve-context)))
+        (iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
+        (yield-val nil)
+        (next-yield nil))
     (condition-case err
         (while t
-          (setq yield-val (iter-next iterator yield-val)))
+          (setq next-yield (iter-next iterator yield-val))
+          (when (consp next-yield)
+            (let ((target (or (plist-get next-yield :target)
+                              (plist-get next-yield :name)
+                              (car next-yield)))
+                  (args (plist-get next-yield :args)))
+              (macher-agent-log-tool-intent context "ptc" target args)))
+          (setq yield-val next-yield))
       (iter-end-of-sequence (cdr err)))))
 
 (provide 'macher-agent-api)
