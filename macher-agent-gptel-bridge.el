@@ -411,11 +411,14 @@ Side effects: Truncates context history in temporary prompt buffer."
                   (setq safe-pt end-pt)
                   (setq found t)))))
           (when (> safe-pt safe-min)
-            (delete-region safe-min safe-pt)
-            (goto-char safe-min)
-            (insert "\n[... macher-agent truncated early history to conserve tokens ...]\n\n")
-            (when (looking-at "^[ \t\n\r]+")
-              (replace-match "")))))))
+            (let ((lines-deleted (count-lines safe-min safe-pt)))
+              (delete-region safe-min safe-pt)
+              (goto-char safe-min)
+              
+              (insert (format "\n[... SYSTEM ALERT: macher-agent truncated %d lines of early history to conserve tokens. If you need this context, use the `search_conversation_history` tool ...]\n\n" lines-deleted))
+              
+              (when (looking-at "^[ \t\n\r]+")
+                (replace-match ""))))))))
   (when-let* ((fn async-fn)
               ((functionp fn)))
     (funcall fn)))
@@ -549,6 +552,15 @@ Side effects: Modifies ORIG-BUF local variables, current buffer region, and FSM 
                                  base-state)))
         (setq effective-payload
               (plist-put effective-payload :system (plist-get sys-only-payload :system)))))
+
+    (when (and (numberp macher-agent-max-context-chars)
+               (> (buffer-size) macher-agent-max-context-chars))
+      (let ((mem-tool (ignore-errors (macher-agent-resolve-tool "search_conversation_history" nil nil nil))))
+        (when (macher-tool-valid-p mem-tool)
+          (setq effective-payload
+                (plist-put effective-payload :tools
+                           (append (plist-get effective-payload :tools) (list mem-tool)))))))
+    
     (let* ((compiled-sys (macher-agent--inject-ptc-prompt
                           (plist-get effective-payload :system)
                           (plist-get effective-payload :ptc-primitives)
