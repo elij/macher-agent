@@ -10,7 +10,7 @@
   (should (fboundp 'macher-agent-context-read))
   (should (fboundp 'macher-agent-context-update))
   (should (fboundp 'macher-agent-scope-add-file))
-  (should (fboundp 'macher-agent-execute-parallel))
+  (should (fboundp 'macher-agent-a2a-dispatch))
   (should (fboundp 'macher-agent-prepare-instructions))
   (should (fboundp 'macher-agent-submit-task-result))
   (should (fboundp 'macher-agent-sandbox-run))

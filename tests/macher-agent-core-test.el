@@ -172,16 +172,42 @@
 
           (describe "6. Agent Orchestration and Sub-agent Delegation"
 
-                    (it "handles missing buffers gracefully and returns the buffer_name in the error payload"
+                    (it "dispatches point-to-point A2A payloads and invokes completion callback"
                         (spy-on 'macher-agent-resolve-context :and-return-value nil)
-                        (spy-on 'macher-agent-add-subagent :and-return-value nil)
                         (let* ((callback-result nil)
-                               (task '(:buffer_name "non_existent_agent" :instructions "Do something"))
+                               (sub-buf (get-buffer-create "sub-agent-buf"))
+                               (payloads (list (list :type 'SEND_MESSAGE
+                                                     :task-id "task-001"
+                                                     :message "Do something"
+                                                     :metadata (list :buffer_name "sub-agent-buf" :background t))))
                                (callback (lambda (res) (setq callback-result res))))
-                          (macher-agent-spawn-task task callback)
-                          (expect (macher-agent-tool-response-status callback-result) :to-be 'error)
-                          (expect (macher-agent-tool-response-buffer-name callback-result) :to-equal "non_existent_agent")
-                          (expect (macher-agent-tool-response-error callback-result) :to-match "ERROR: Sub-agent buffer 'non_existent_agent' not found."))))
+                          (unwind-protect
+                              (progn
+                                (cl-letf (((symbol-function 'gptel-send)
+                                           (lambda ()
+                                             (let ((cb (bound-and-true-p macher-agent--a2a-callback))
+                                                   (task-id (bound-and-true-p macher-agent--current-task-id)))
+                                               (when cb
+                                                 (funcall cb (list :status 'success :data "Done" :task-id task-id)))))))
+                                  (macher-agent-a2a-dispatch payloads callback))
+                                (expect (length callback-result) :to-equal 1)
+                                (expect (plist-get (aref callback-result 0) :status) :to-be 'success)
+                                (with-current-buffer sub-buf
+                                  (expect (bound-and-true-p macher-agent--ready-to-reap) :to-be nil)))
+                            (kill-buffer sub-buf))))
+
+                    (it "returns a controlled error state when dispatching to a missing or invalid sub-agent buffer"
+                        (let* ((callback-result nil)
+                               (payloads (list (list :type 'SEND_MESSAGE
+                                                     :task-id "task-err-001"
+                                                     :message "Do something"
+                                                     :metadata (list :buffer_name "non-existent-buffer"))))
+                               (callback (lambda (res) (setq callback-result res))))
+                          (macher-agent-a2a-dispatch payloads callback)
+                          (expect (length callback-result) :to-equal 1)
+                          (expect (plist-get (aref callback-result 0) :status) :to-be 'error)
+                          (expect (plist-get (aref callback-result 0) :error)
+                                  :to-equal "ERROR: Sub-agent buffer 'non-existent-buffer' not found."))))
 
           (describe "7. Prompt Transformer Pipeline and Media Watcher"
                     (it "deduplicates tool usage blocks keeping the most recent occurrences"
@@ -225,7 +251,7 @@
                             (put-text-property 0 (length resp) 'gptel 'response resp)
                             (insert resp))
                           (insert "Latest user query content")
-                          (let ((macher-agent-max-context-chars 25))
+                          (let ((macher-agent-max-context-chars '((nil . 25))))
                             (macher-agent-transformer-snip-context nil nil))
                           (expect (buffer-string) :to-match "Latest user query content")))
 
@@ -236,7 +262,7 @@
                             (put-text-property 0 (length resp) 'gptel 'response resp)
                             (insert resp))
                           (insert "Latest user query content")
-                          (let ((macher-agent-max-context-chars 25))
+                          (let ((macher-agent-max-context-chars '((nil . 25))))
                             (macher-agent-transformer-snip-context nil nil))
                           (expect (buffer-string) :to-match "^---\nkey: value\n---")))
 
@@ -255,5 +281,59 @@
                           (macher-agent--set-context-data ctx :pending-media (list "data"))
                           (spy-on 'macher-agent--perform-pending-media-injection)
                           (macher-agent--inject-media-fsm-advice (lambda (&rest _) nil) fsm 'WAIT)
-                          (expect 'macher-agent--perform-pending-media-injection :to-have-been-called-with fsm)))))
+                          (expect 'macher-agent--perform-pending-media-injection :to-have-been-called-with fsm))))
+
+          (describe "8. Buffer Resolution and User Interface Delegation (Phase 4)"
+                    (describe "macher-agent--resolve-buffer-name"
+                              (it "resolves buffer objects to buffer name string"
+                                  (let ((buf (get-buffer-create "test-resolve-buf-obj")))
+                                    (unwind-protect
+                                        (expect (macher-agent--resolve-buffer-name buf) :to-equal "test-resolve-buf-obj")
+                                      (kill-buffer buf))))
+
+                              (it "resolves string buffer name when buffer exists"
+                                  (let ((buf (get-buffer-create "test-resolve-buf-str")))
+                                    (unwind-protect
+                                        (expect (macher-agent--resolve-buffer-name "test-resolve-buf-str") :to-equal "test-resolve-buf-str")
+                                      (kill-buffer buf))))
+
+                              (it "resolves file paths to buffer names via native get-file-buffer"
+                                  (let* ((temp-file (make-temp-file "macher-resolve-test"))
+                                         (buf (find-file-noselect temp-file)))
+                                    (unwind-protect
+                                        (progn
+                                          (expect (macher-agent--resolve-buffer-name temp-file) :to-equal (buffer-name buf))
+                                          (expect (macher-agent--resolve-buffer-name (expand-file-name temp-file)) :to-equal (buffer-name buf)))
+                                      (when (buffer-live-p buf) (kill-buffer buf))
+                                      (when (file-exists-p temp-file) (delete-file temp-file)))))
+
+                              (it "returns original name string when buffer or file buffer is unmapped"
+                                  (expect (macher-agent--resolve-buffer-name "/tmp/nonexistent-file-path-xyz.el")
+                                          :to-equal "/tmp/nonexistent-file-path-xyz.el")))
+
+                    (describe "macher-agent-ui-show"
+                              (it "invokes macher-agent-display-subagent-fn with target buffer"
+                                  (let* ((buf (get-buffer-create "test-ui-show-buf"))
+                                         (displayed-buf nil)
+                                         (macher-agent-display-subagent-fn (lambda (b) (setq displayed-buf b))))
+                                    (unwind-protect
+                                        (progn
+                                          (macher-agent-ui-show buf)
+                                          (expect displayed-buf :to-be buf))
+                                      (kill-buffer buf))))
+
+                              (it "defaults target buffer to current-buffer when omitted"
+                                  (let* ((displayed-buf nil)
+                                         (macher-agent-display-subagent-fn (lambda (b) (setq displayed-buf b))))
+                                    (with-temp-buffer
+                                      (let ((cur (current-buffer)))
+                                        (macher-agent-ui-show)
+                                        (expect displayed-buf :to-be cur)))))
+
+                              (it "handles nil display function gracefully without throwing"
+                                  (let ((macher-agent-display-subagent-fn nil))
+                                    (expect (macher-agent-ui-show) :to-be nil)))
+
+                              (it "confirms redundant macher-agent--show-ui function is removed"
+                                  (expect (fboundp 'macher-agent--show-ui) :to-be nil)))))
 

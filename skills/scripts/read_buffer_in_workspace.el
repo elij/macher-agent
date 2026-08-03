@@ -23,10 +23,11 @@
            (actual-name (macher-agent--resolve-buffer-name buffer_name))
            (parsed-offset (when (numberp offset) (round offset)))
            (parsed-limit (when (numberp limit) (round limit))))
-      (macher-agent--ensure-access context actual-name)
+      (when context
+        (macher-agent--ensure-access context actual-name))
       (let*
-          ((norm-key (macher-agent--normalize-path-key actual-name context))
-           (contents (macher-agent--get-context-contents context))
+          ((norm-key (if context (macher-agent--normalize-path-key actual-name context) actual-name))
+           (contents (when context (macher-agent--get-context-contents context)))
            (entry (or (cl-find norm-key contents :key #'car :test #'equal)
                       (cl-find actual-name contents :key #'car :test #'equal)))
            (content

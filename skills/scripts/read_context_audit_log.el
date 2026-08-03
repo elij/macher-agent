@@ -1,3 +1,5 @@
+;;; read_context_audit_log.el --- Read context audit log -*- lexical-binding: t; -*-
+
 (macher-agent-make-tool
     macher-agent-read-context-audit-log-tool
     "Read the ephemeral tool-intent log from the current task context to evaluate past subagent behaviour. Analyses parameters to determine why previous tasks failed."

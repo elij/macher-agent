@@ -9,13 +9,8 @@
 (require 'macher)
 (require 'cl-lib)
 (require 'subr-x)
-
-(declare-function macher-agent-workspace-project-root "macher-agent-vfs-client")
-(declare-function macher-agent-workspace-p "macher-agent-vfs-client")
-(declare-function macher-agent-resolve-context "macher-agent-vfs-client")
-(declare-function macher-agent--set-context-data "macher-agent-vfs-client" (ctx key val))
-(declare-function macher-agent--partition-vfs-entries "macher-agent-vfs-client" (contents &optional root-dir))
-(declare-function macher-context-shadow-buffers "macher" (ctx))
+(require 'macher-agent-core)
+(require 'macher-agent-vfs-client)
 
 (defun macher-agent--get-workspace-root (ws)
   "Resolve the absolute project root of WS.
@@ -40,21 +35,6 @@ Side effects: None."
       (cdr ws)
     ws))
 
-(defun macher-agent--get-workspace-name (ws)
-  "Retrieve a human-readable name for workspace WS.
-
-Extract or derive a display name string for workspace object WS based on its
-project root or upstream identifier.
-
-Return the workspace name string, or nil if unavailable.
-
-Side effects: None."
-  (let ((unwrapped (macher-agent--unwrap-workspace ws)))
-    (cond
-     ((macher-agent-workspace-p unwrapped)
-      (file-name-nondirectory (directory-file-name (macher-agent-workspace-project-root unwrapped))))
-     (t (ignore-errors (macher--workspace-name ws))))))
-
 (defun macher-agent--pure-virtual-entry-p (entry)
   "Determine whether VFS ENTRY represents a pure virtual buffer.
 
@@ -66,23 +46,6 @@ Side effects: None."
   (let* ((name (car entry))
          (live-buf (get-buffer name)))
     (and live-buf (null (buffer-file-name live-buf)))))
-
-(defun macher-agent--split-vfs-contents (contents)
-  "Split raw VFS CONTENTS into pure virtual and physical lists.
-
-Partition the list of VFS entry structures CONTENTS into pure virtual buffer
-entries and physical file entries.
-
-Return a cons cell of (VIRTUAL-CONTENTS . PHYSICAL-CONTENTS).
-
-Side effects: None."
-  (let ((virtual-contents nil)
-        (physical-contents nil))
-    (dolist (entry contents)
-      (if (macher-agent--pure-virtual-entry-p entry)
-          (push entry virtual-contents)
-        (push entry physical-contents)))
-    (cons (nreverse virtual-contents) (nreverse physical-contents))))
 
 (defun macher-agent--safe-workspace-hash (workspace &rest _args)
   "Compute a safe MD5 hash for WORKSPACE without recursive traversal.
@@ -105,23 +68,18 @@ Side effects: None."
 
 (advice-add 'macher--workspace-hash :override #'macher-agent--safe-workspace-hash)
 
-(defvar-local macher-agent--persistent-context nil
-  "Store the buffer-local persistent VFS context structure.
-
-Hold the `macher-context' instance bound to the current buffer across agent turns.
-
-Return the `macher-context' struct, or nil if unset.
-
-Side effects: Buffer-local variable.")
-
 (cl-defun macher-agent--make-vfs-context (&key workspace contents prompt)
-  "Create a native `macher-context' struct using `macher--make-context'.
+  "Create a native `macher-context' struct using
+`macher--make-context'.
 
-Construct a new context structure with WORKSPACE, CONTENTS, and PROMPT.
+Construct a new context structure with WORKSPACE, CONTENTS, and
+PROMPT.
 
 Return the newly created `macher-context' struct.
 
-Side effects: Dynamically binds `macher-agent--persistent-context' to nil during construction."
+Side effects: Dynamically binds
+`macher-agent--persistent-context' to nil during
+construction."
   (let ((macher-agent--persistent-context nil))
     (macher--make-context :workspace workspace :contents contents :prompt prompt)))
 
@@ -199,17 +157,22 @@ resulting patch buffer using PATCH-TYPE, for example, \"physical\" or \"virtual\
 Return the renamed patch buffer if generated, or nil.
 
 Side effects: Creates or renames patch buffers in the Emacs runtime."
-  (when (and (not (bound-and-true-p macher-agent--suppress-patch))
-             (macher-agent--context-has-changes-p ctx))
-    (macher--build-patch ctx fsm-obj)
-    (when-let* ((buf (macher-patch-buffer (macher-context-workspace ctx)))
-                (name (buffer-name buf)))
-      (let ((new-name (if (string-match "^\\*macher-patch\\(.*\\)\\*$" name)
-                          (concat "*macher-" patch-type "-patch" (match-string 1 name) "*")
-                        (concat "*macher-" patch-type "-patch*"))))
-        (with-current-buffer buf
-          (rename-buffer new-name t)
-          (current-buffer))))))
+  (let* ((target-buf (when (and fsm-obj (fboundp 'gptel-fsm-info))
+                       (ignore-errors (plist-get (gptel-fsm-info fsm-obj) :buffer))))
+         (suppress-patch (if (buffer-live-p target-buf)
+                             (buffer-local-value 'macher-agent--suppress-patch target-buf)
+                           (bound-and-true-p macher-agent--suppress-patch))))
+    (when (and (not suppress-patch)
+               (macher-agent--context-has-changes-p ctx))
+      (macher--build-patch ctx fsm-obj)
+      (when-let* ((buf (macher-patch-buffer (macher-context-workspace ctx)))
+                  (name (buffer-name buf)))
+        (let ((new-name (if (string-match "^\\*macher-patch\\(.*\\)\\*$" name)
+                            (concat "*macher-" patch-type "-patch" (match-string 1 name) "*")
+                          (concat "*macher-" patch-type "-patch*"))))
+          (with-current-buffer buf
+            (rename-buffer new-name t)
+            (current-buffer)))))))
 
 (defun macher-agent--display-patch-buffers (generated-buffers)
   "Display GENERATED-BUFFERS in split windows if multiple buffers exist.
@@ -253,16 +216,19 @@ Side effects: Generates and displays patch buffers and updates CTX prompt."
         (macher-agent--set-context-data ctx :prompt fsm-prompt)))
 
     (when ctx
-      (let* ((payloads (macher-agent-prepare-upstream-payloads ctx))
-             (p-ctx (car payloads))
-             (v-ctx (cdr payloads))
-             (generated-buffers nil))
-        (when-let* ((p-buf (macher-agent--build-and-rename-patch p-ctx fsm-obj "physical")))
-          (push p-buf generated-buffers))
-        (when-let* ((v-buf (macher-agent--build-and-rename-patch v-ctx fsm-obj "virtual")))
-          (push v-buf generated-buffers))
-        (when generated-buffers
-          (macher-agent--display-patch-buffers generated-buffers))))))
+      (when (macher-agent--get-context-dirty-p ctx)
+        (let* ((payloads (macher-agent-prepare-upstream-payloads ctx))
+               (p-ctx (car payloads))
+               (v-ctx (cdr payloads))
+               (generated-buffers nil))
+          (when-let* ((p-buf (macher-agent--build-and-rename-patch p-ctx fsm-obj "physical")))
+            (push p-buf generated-buffers))
+          (when-let* ((v-buf (macher-agent--build-and-rename-patch v-ctx fsm-obj "virtual")))
+            (push v-buf generated-buffers))
+          (when generated-buffers
+            (macher-agent--display-patch-buffers generated-buffers)))
+
+        (macher-agent--set-context-dirty-p ctx nil)))))
 
 (defun macher-agent--vfs-entry-modified-p (entry)
   "Determine whether VFS ENTRY contains modifications.
@@ -279,7 +245,8 @@ Side effects: None."
 (defun macher-agent--context-has-changes-p (context)
   "Determine whether CONTEXT contains actual VFS modifications.
 
-Inspect all VFS entries within CONTEXT to verify if any entries have been modified.
+Inspect all VFS entries within CONTEXT to verify if any entries
+have been modified.
 
 Return non-nil if CONTEXT has modified VFS entries, or nil otherwise.
 
@@ -307,55 +274,57 @@ Side effects: None."
     ctx)
    (t nil)))
 
-(defun macher-agent--set-context-workspace (ctx ws)
-  "Set the workspace on CTX to WS.
-
-Update the workspace slot of context structure CTX with WS.
-
-Return nil.
-
-Side effects: Mutates the workspace slot of CTX."
-  (when (and ctx (macher-context-p ctx))
-    (setf (macher-context-workspace ctx) ws)))
-
 (defmacro macher-agent--def-context-accessor (name accessor &optional setter-name docstring)
-  "Define a safe accessor and optional setter for a Macher context struct.
+  "Define a safe accessor and optional setter for a Macher
+context struct.
 
-Generate a getter function NAME and optional setter function SETTER-NAME for
-field ACCESSOR on a `macher-context' structure, using DOCSTRING if provided.
+Generate a getter function NAME and optional setter function
+SETTER-NAME for field ACCESSOR on a `macher-context' structure,
+using DOCSTRING if provided.
 
 Return expanded macro defun form.
 
 Side effects: Defines new function symbols in Emacs runtime."
-  (let ((getter `(defun ,name (ctx)
-                   ,(format "Safely access `%s' on CTX.\n\n%s\n\nReturn field value, or nil.\n\nSide effects: None."
-                            accessor
-                            (or docstring (format "Safely access `%s' on CTX." accessor)))
-                   (and ctx
-                        (macher-context-p ctx)
-                        (fboundp ',accessor)
-                        (,accessor ctx)))))
+  (let
+      ((getter
+        `(defun ,name (ctx)
+           ,(format
+             "Safely access `%s' on CTX.\n\n%s\n\nReturn field value, or nil.\n\nSide effects: None."
+             accessor
+             (or docstring (format "Safely access `%s' on CTX." accessor)))
+           (and ctx
+                (macher-context-p ctx)
+                (fboundp ',accessor)
+                (,accessor ctx)))))
     (if setter-name
         `(progn
            ,getter
            (defun ,setter-name (ctx val)
-             ,(format "Safely set `%s' on CTX.\n\nMutate field `%s' on context CTX with VAL.\n\nReturn new value VAL, or nil.\n\nSide effects: Mutates CTX structure." accessor accessor)
+             ,(format "Safely set `%s' on CTX.\n\nMutate field `%s' on context CTX with VAL.\n\nReturn \
+new value VAL, or nil.\n\nSide effects: Mutates CTX structure." accessor accessor)
              (when (and ctx
                         (macher-context-p ctx)
                         (fboundp ',accessor))
                (ignore-errors (with-no-warnings (setf (,accessor ctx) val))))))
       getter)))
 
-(macher-agent--def-context-accessor macher-agent--get-context-contents macher-context-contents macher-agent--set-context-contents)
-(macher-agent--def-context-accessor macher-agent--get-context-dirty-p macher-context-dirty-p macher-agent--set-context-dirty-p)
-(macher-agent--def-context-accessor macher-agent--get-context-prompt macher-context-prompt macher-agent--set-context-prompt)
-(macher-agent--def-context-accessor macher-agent--get-context-shadow-buffers macher-context-shadow-buffers macher-agent--set-context-shadow-buffers "Safely retrieve shadow buffers if defined upstream.")
+(macher-agent--def-context-accessor
+ macher-agent--get-context-contents macher-context-contents macher-agent--set-context-contents)
+(macher-agent--def-context-accessor
+ macher-agent--get-context-dirty-p macher-context-dirty-p macher-agent--set-context-dirty-p)
+(macher-agent--def-context-accessor
+ macher-agent--get-context-prompt macher-context-prompt macher-agent--set-context-prompt)
+(macher-agent--def-context-accessor
+ macher-agent--get-context-shadow-buffers
+ macher-context-shadow-buffers
+ macher-agent--set-context-shadow-buffers "Safely retrieve shadow buffers if defined upstream.")
 
 (defun macher-agent--get-fsm-latest ()
   "Get the active finite-state machine (FSM) if bound.
 
-Locate and return the active finite-state machine instance from package global
-variables `macher--fsm-latest', `gptel--fsm', or `gptel--fsm-last'.
+Locate and return the active finite-state machine instance
+from package global variables `macher--fsm-latest',
+`gptel--fsm', or `gptel--fsm-last'.
 
 Return the active FSM structure, or nil if none is bound.
 
@@ -367,8 +336,9 @@ Side effects: None."
 (defun macher-agent--get-buffer-persistent-context (&optional buf)
   "Get the buffer-local persistent context for BUF.
 
-Retrieve `macher-agent--persistent-context' from buffer BUF, defaulting BUF to
-the target buffer associated with `gptel--fsm' or current buffer.
+Retrieve `macher-agent--persistent-context' from buffer BUF,
+defaulting BUF to the target buffer associated with `gptel--fsm'
+or current buffer.
 
 Return the context structure, or nil if unset or buffer is dead.
 
@@ -383,8 +353,9 @@ Side effects: None."
 (defun macher-agent--inject-context-into-fsm-info (agent-ctx &optional fsm)
   "Inject AGENT-CTX into FSM info property list.
 
-Store AGENT-CTX in the info plist of finite-state machine FSM under keys
-`:macher--context' and `:macher-agent-context'.  FSM defaults to active `gptel--fsm'.
+Store AGENT-CTX in the info plist of finite-state machine FSM
+under keys `:macher--context' and `:macher-agent-context'.
+FSM defaults to active `gptel--fsm'.
 
 Return non-nil if injected successfully, or nil otherwise.
 
@@ -397,31 +368,11 @@ Side effects: Mutates the info property list of FSM."
     (setf (gptel-fsm-info fsm-obj) (plist-put info :macher-agent-context agent-ctx))
     t))
 
-(defun macher-agent--inject-context-into-tool (orig-fn callback &rest args)
-  "Intercept tool execution to ensure persistent context is active.
-
-Execute ORIG-FN with CALLBACK and ARGS while ensuring the buffer-local
-`macher-agent--persistent-context' is injected into active FSM info.
-
-Return the result of invoking ORIG-FN.
-
-Side effects: Injects persistent context into active FSM info property list."
-  (let* ((target-buf (or (and (boundp 'gptel--fsm) gptel--fsm
-                              (plist-get (gptel-fsm-info gptel--fsm) :buffer))
-                         (current-buffer)))
-         (agent-ctx (macher-agent--get-buffer-persistent-context target-buf)))
-    (if agent-ctx
-        (progn
-          (macher-agent--inject-context-into-fsm-info agent-ctx)
-          (with-current-buffer target-buf
-            (apply orig-fn callback args)))
-      (apply orig-fn callback args))))
-
 (defvar macher-agent--wrapped-tools-hash (make-hash-table :test 'eq)
   "Track wrapped `gptel-tool' instances in a hash table.
 
-Store `gptel-tool' objects that have already been wrapped by Macher Agent to
-prevent duplicate tool wrapping.
+Store `gptel-tool' objects that have already been wrapped
+by Macher Agent to prevent duplicate tool wrapping.
 
 Return the hash table instance.
 
@@ -430,41 +381,50 @@ Side effects: Global variable storing hash table state.")
 (defun macher-agent--wrap-single-tool (tool)
   "Wrap single TOOL to intercept orphaned context.
 
-Modify function slot of `gptel-tool' structure TOOL to intercept calls, transfer
-user prompt from orphaned context to sub-agent persistent context, and inject
+Modify function slot of `gptel-tool' structure TOOL to
+intercept calls, transfer user prompt from orphaned
+context to sub-agent persistent context, and inject
 context into active FSM.
 
-Return non-nil if TOOL was wrapped, or nil if already wrapped.
+Return non-nil if TOOL was wrapped, or nil if already
+wrapped.
 
-Side effects: Mutates function slot of TOOL and updates `macher-agent--wrapped-tools-hash'."
+Side effects: Mutates function slot of TOOL and updates
+`macher-agent--wrapped-tools-hash'."
   (let ((orig-fn (gptel-tool-function tool)))
     (when (and orig-fn (not (gethash tool macher-agent--wrapped-tools-hash)))
       (setf (gptel-tool-function tool)
             (lambda (orphaned-context callback &rest args)
-              (let* ((target-buf (or (and (boundp 'gptel--fsm) gptel--fsm
-                                          (plist-get (gptel-fsm-info gptel--fsm) :buffer))
+              (let* ((fsm (or (bound-and-true-p macher-agent--active-fsm)
+                              (macher-agent--get-fsm-latest)))
+                     (target-buf (or (when (and fsm (fboundp 'gptel-fsm-info))
+                                       (ignore-errors (plist-get (gptel-fsm-info fsm) :buffer)))
                                      (current-buffer)))
                      (agent-ctx (macher-agent--get-buffer-persistent-context target-buf)))
-                (when agent-ctx
-                  (when (and orphaned-context (macher-context-p orphaned-context))
-                    (when-let* ((user-prompt (macher-context-prompt orphaned-context)))
-                      (ignore-errors (setf (macher-context-prompt agent-ctx) user-prompt))
-                      (macher-agent--set-context-data agent-ctx :prompt user-prompt)))
-
-                  (macher-agent--inject-context-into-fsm-info agent-ctx))
-                (with-current-buffer target-buf
-                  (apply orig-fn (or agent-ctx orphaned-context) callback args)))))
+                (if agent-ctx
+                    (progn
+                      (when (and orphaned-context (macher-context-p orphaned-context))
+                        (when-let* ((user-prompt (macher-context-prompt orphaned-context)))
+                          (ignore-errors (setf (macher-context-prompt agent-ctx) user-prompt))
+                          (macher-agent--set-context-data agent-ctx :prompt user-prompt)))
+                      (macher-agent--inject-context-into-fsm-info agent-ctx fsm)
+                      (with-current-buffer target-buf
+                        (apply orig-fn agent-ctx callback args)))
+                  (with-current-buffer target-buf
+                    (apply orig-fn orphaned-context callback args))))))
       (puthash tool t macher-agent--wrapped-tools-hash))))
 
 (defun macher-agent--wrap-macher-tools ()
   "Wrap all Macher tools to inject persistent VFS context.
 
-Iterate through tools registered under the \"macher\" category in `gptel--known-tools'
-and apply `macher-agent--wrap-single-tool' to each tool.
+Iterate through tools registered under the \"macher\"
+category in `gptel--known-tools' and apply
+`macher-agent--wrap-single-tool' to each tool.
 
 Return nil.
 
-Side effects: Mutates tool functions in `gptel--known-tools' and populates `macher-agent--wrapped-tools-hash'."
+Side effects: Mutates tool functions in `gptel--known-tools' and populates
+`macher-agent--wrapped-tools-hash'."
   (when-let* ((macher-tools
                (alist-get "macher" (bound-and-true-p gptel--known-tools) nil nil #'equal)))
     (dolist (item macher-tools)
@@ -474,12 +434,14 @@ Side effects: Mutates tool functions in `gptel--known-tools' and populates `mach
 (defmacro macher-agent--with-protected-context-contents (ctx &rest body)
   "Execute BODY preserving the VFS contents of CTX.
 
-Capture a copy of the VFS contents of context CTX prior to executing BODY and
-restore the original contents via `unwind-protect' upon completion or non-local exit.
+Capture a copy of the VFS contents of context CTX prior to
+executing BODY and restore the original contents via
+`unwind-protect' upon completion or non-local exit.
 
 Return the result of evaluating BODY.
 
-Side effects: Restores original VFS contents on CTX after BODY executes."
+Side effects: Restores original VFS contents on CTX after
+BODY executes."
   (declare (indent 1) (debug t))
   (let ((ctx-sym (gensym "ctx"))
         (protected-sym (gensym "protected")))
@@ -494,12 +456,15 @@ Side effects: Restores original VFS contents on CTX after BODY executes."
 (defun macher-agent--process-completed-fsm-buffer (buffer fsm)
   "Process completed FSM in BUFFER context.
 
-Evaluate request completion logic within live BUFFER for finite-state machine FSM,
-invoking `macher-process-request-function' with protected persistent context.
+Evaluate request completion logic within live BUFFER for
+finite-state machine FSM, invoking
+`macher-process-request-function' with protected persistent context.
 
-Return result of request completion process function, or nil if buffer is invalid.
+Return result of request completion process function, or nil if
+buffer is invalid.
 
-Side effects: Switches current buffer to BUFFER and triggers request completion."
+Side effects: Switches current buffer to BUFFER and triggers
+request completion."
   (when (and buffer (buffer-live-p buffer))
     (with-current-buffer buffer
       (when-let* ((agent-ctx (bound-and-true-p macher-agent--persistent-context))
@@ -510,14 +475,20 @@ Side effects: Switches current buffer to BUFFER and triggers request completion.
 (defvar macher-agent--inhibit-patch-hook nil)
 
 (defun macher-agent--trigger-patch-on-complete (fsm &rest _)
-  "rigger patch generation when FSM transitions to DONE state.
+  "Trigger patch generation when FSM transitions to DONE state.
 
-Inspect finite-state machine FSM state upon transition.  If state is DONE, resolve
-target buffer and invoke `macher-agent--process-completed-fsm-buffer'. Ignores errors when
+Inspect finite-state machine FSM state upon transition.  If state
+is DONE, resolve target buffer and invoke
+`macher-agent--process-completed-fsm-buffer'.  Ignores errors when
 session in aborted state.
 
+FSM is the finite-state machine object.
+_RES contains additional optional arguments.
+
 Return nil.
-Side effects: May trigger patch generation and buffer display upon completion."
+
+Side effects: May trigger patch generation and buffer
+display upon completion."
   (ignore-errors
     (unless macher-agent--inhibit-patch-hook
       (let ((macher-agent--inhibit-patch-hook t))
