@@ -18,6 +18,7 @@
 (require 'macher-agent-vfs-client)
 (require 'macher-agent-presets)
 (require 'macher-agent-orchestration)
+(require 'macher-agent-zero-mem)
 
 ;;; Customisation Variables
 
@@ -111,7 +112,10 @@ Side effects: None."
                       (ignore-errors (gptel-fsm-info fsm)))
                      (t nil))))
     (or (plist-get info :macher-agent-context)
-        (plist-get info :macher--context))))
+        (plist-get info :macher--context)
+        (when-let* ((buf (plist-get info :buffer))
+                    ((buffer-live-p buf)))
+          (buffer-local-value 'macher-agent--persistent-context buf)))))
 
 (defun macher-agent--wrap-callback (gptel-cb &optional ptc-exec)
   "Create a simple callback wrapper that processes results without
@@ -256,15 +260,19 @@ ARGS-SPEC is the expected schema specification list.
 
 Return flat keyword plist of argument values.
 Side effects: None."
-  (if (and tool-args (keywordp (car tool-args)))
-      tool-args
+  (cond
+   ((and tool-args (keywordp (car tool-args)))
+    tool-args)
+   ((and tool-args (listp (car tool-args)) (keywordp (caar tool-args)))
+    (car tool-args))
+   (t
     (cl-loop for arg in tool-args
              for spec in args-spec
              for arg-name = (plist-get spec :name)
              for key = (intern (concat ":" (if (symbolp arg-name)
                                                (symbol-name arg-name)
                                              arg-name)))
-             append (list key arg))))
+             append (list key arg)))))
 
 (defun macher-agent--validate-payload (payload args-spec)
   "Validate PAYLOAD against ARGS-SPEC using internal schema validator.
@@ -325,7 +333,7 @@ Side effects: Invokes failure hook and callback on error."
       (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload err)
       (funcall ,wrap-cb (list :status 'error :error (error-message-string err))))))
 
-(defmacro macher-agent--build-success-callback (name-sym payload success-fn output-filter-fn wrap-cb &optional ptc-exec)
+(defmacro macher-agent--build-success-callback (name-sym payload success-fn output-filter-fn wrap-cb &optional is-ptc)
   "Generate success callback for NAME-SYM using PAYLOAD and handlers.
 
 NAME-SYM is the tool symbol name.
@@ -333,33 +341,32 @@ PAYLOAD is the argument plist payload.
 SUCCESS-FN is the optional result formatting function.
 OUTPUT-FILTER-FN is the optional output filtering function.
 WRAP-CB is the callback function wrapper.
-PTC-EXEC is an optional boolean indicating active PTC execution context.
+IS-PTC is an optional boolean indicating active PTC execution context.
 
 Return a lambda callback function accepting response object.
 Side effects: Runs `macher-agent-post-tool-use-hook' on success or
 failure hook on error."
-  `(let ((is-ptc (or ,ptc-exec (bound-and-true-p macher-agent--active-ptc-execution))))
-     (lambda (res-obj)
-       (condition-case cb-err
-           (let*
-               ((s-fn ,success-fn)
-                (f-fn ,output-filter-fn)
-                (raw-payload res-obj)
-                (active-ptc (or is-ptc (bound-and-true-p macher-agent--active-ptc-execution)))
-                (success-data
-                 (if (and s-fn (not active-ptc))
-                     (let ((arity (func-arity s-fn)))
-                       (if (or (eq (cdr arity) 'many)
-                               (and (numberp (cdr arity)) (>= (cdr arity) 2)))
-                           (funcall s-fn raw-payload payload)
-                         (funcall s-fn raw-payload)))
-                   raw-payload))
-                (final-data (if f-fn (funcall f-fn success-data) success-data)))
-             (run-hook-with-args 'macher-agent-post-tool-use-hook ,name-sym ,payload final-data)
-             (funcall ,wrap-cb (list :status 'success :data final-data)))
-         (error
-          (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload cb-err)
-          (funcall ,wrap-cb (list :status 'error :error (error-message-string cb-err))))))))
+  `(lambda (res-obj)
+     (condition-case cb-err
+         (let*
+             ((s-fn ,success-fn)
+              (f-fn ,output-filter-fn)
+              (raw-payload res-obj)
+              (active-ptc (or ,is-ptc (bound-and-true-p macher-agent--active-ptc-execution)))
+              (success-data
+               (if (and s-fn (not active-ptc))
+                   (let ((arity (func-arity s-fn)))
+                     (if (or (eq (cdr arity) 'many)
+                             (and (numberp (cdr arity)) (>= (cdr arity) 2)))
+                         (funcall s-fn raw-payload ,payload)
+                       (funcall s-fn raw-payload)))
+                 raw-payload))
+              (final-data (if f-fn (funcall f-fn success-data) success-data)))
+           (run-hook-with-args 'macher-agent-post-tool-use-hook ,name-sym ,payload final-data)
+           (funcall ,wrap-cb (list :status 'success :data final-data)))
+       (error
+        (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload cb-err)
+        (funcall ,wrap-cb (list :status 'error :error (error-message-string cb-err)))))))
 
 (cl-defmacro macher-agent-make-tool (name-symbol description &key category args command-fn success-fn output-filter-fn)
   "Define NAME-SYMBOL as a tool compatible with gptel using DESCRIPTION.
@@ -380,6 +387,7 @@ Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
          (name (replace-regexp-in-string "-" "_" stripped-name)))
     `(progn
        (defvar ,name-symbol nil)
+       (put ',name-symbol 'command-fn ,command-fn)
        (setq ,name-symbol
              (gptel-make-tool
               :name ,name
@@ -824,6 +832,103 @@ Side effects: None."
     (transient-suffix-put 'gptel-menu 'gptel--infix-system-message :save-history nil)))
 
 ;;; Memory Tools
+
+(defcustom macher-agent-search-backend 'zero-mem
+  "Backend search strategy for conversation history search.
+Options are `glob' (regex search) and `zero-mem' (PageRank vector search)."
+  :type '(choice (const :tag "Regex Glob" glob)
+                 (const :tag "Zero-Mem Fixed-Point PageRank" zero-mem))
+  :group 'macher-agent)
+
+(defun macher-agent-search-glob (query orig-buf &optional ctx-lines)
+  "Search QUERY in ORIG-BUF using regex matching with CTX-LINES surrounding lines."
+  (let ((ctx-lines (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
+        (results nil)
+        (invalid-re nil))
+    (if (not (buffer-live-p orig-buf))
+        "Error: Cannot locate original conversation buffer."
+      (with-current-buffer orig-buf
+        (save-excursion
+          (goto-char (point-min))
+          (condition-case err
+              (let ((continue t))
+                (while (and continue (re-search-forward query nil t))
+                  (let* ((match-beg (match-beginning 0))
+                         (match-end (match-end 0))
+                         (start-pt (save-excursion
+                                     (goto-char match-beg)
+                                     (forward-line (- ctx-lines))
+                                     (line-beginning-position)))
+                         (end-pt (save-excursion
+                                   (goto-char match-beg)
+                                   (forward-line ctx-lines)
+                                   (line-end-position)))
+                         (snippet (buffer-substring-no-properties start-pt end-pt)))
+                    (push (format "--- Match near line %d ---\n%s\n"
+                                  (line-number-at-pos match-beg) snippet)
+                          results)
+                    (when (= match-beg match-end)
+                      (if (eobp)
+                          (setq continue nil)
+                        (forward-char 1))))))
+            (invalid-regexp
+             (setq invalid-re (error-message-string err))))))
+      (cond
+       (invalid-re
+        (format "Error: Invalid regular expression: %s" invalid-re))
+       (results
+        (string-join (nreverse results) "\n"))
+       (t
+        (format "No matches found in history for: %s" query))))))
+
+(defun macher-agent--buffer-to-traces (buffer)
+  "Convert BUFFER content into a list of trace plists for Zero-Mem graph construction."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char (point-min))
+        (let ((traces nil)
+              (line-num 1))
+          (while (not (eobp))
+            (let ((line-text (buffer-substring-no-properties
+                              (line-beginning-position)
+                              (line-end-position))))
+              (unless (string-empty-p (string-trim line-text))
+                (push (list :text line-text
+                            :timestamp (float line-num)
+                            :metadata (list :line line-num))
+                      traces)))
+            (setq line-num (1+ line-num))
+            (forward-line 1))
+          (nreverse traces))))))
+
+(defun macher-agent-search-zero-mem (query orig-buf &optional ctx-lines)
+  "Search QUERY in ORIG-BUF using fixed-point Zero-Mem PageRank vector retrieval."
+  (if (not (buffer-live-p orig-buf))
+      "Error: Cannot locate original conversation buffer."
+    (let* ((traces (macher-agent--buffer-to-traces orig-buf))
+           (top-k (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5)))
+      (if (null traces)
+          (format "No matches found in history for: %s" query)
+        (let* ((graph (macher-agent-zero-mem-build-graph traces))
+               (retrieved (macher-agent-zero-mem-retrieve query graph :top-k top-k :algorithm 'fixed-point))
+               (results nil))
+          (dolist (tr retrieved)
+            (let ((line (or (plist-get (macher-agent-zero-mem-trace-metadata tr) :line)
+                            (macher-agent-zero-mem-trace-id tr)))
+                  (text (macher-agent-zero-mem-trace-text tr)))
+              (push (format "--- Match near line %d ---\n%s\n" line text) results)))
+          (if results
+              (string-join (nreverse results) "\n")
+            (format "No matches found in history for: %s" query)))))))
+
+(defun macher-agent-search-dispatch (query orig-buf &optional ctx-lines)
+  "Dispatch search for QUERY in ORIG-BUF with CTX-LINES context based on `macher-agent-search-backend'."
+  (if (not (buffer-live-p orig-buf))
+      "Error: Cannot locate original conversation buffer."
+    (pcase macher-agent-search-backend
+      ('zero-mem (macher-agent-search-zero-mem query orig-buf ctx-lines))
+      (_ (macher-agent-search-glob query orig-buf ctx-lines)))))
 
 (macher-agent-make-tool
  macher-agent-tool-search-conversation-history

@@ -190,7 +190,7 @@ Returns an association list of (EntityNode . ActivationScore)."
           (maphash
            (lambda (g-ent _tids)
              ;; Safeguard against corrupted nil keys in the graph index
-             (when (and g-ent 
+             (when (and g-ent
                         (or (string-match-p (regexp-quote q-ent) g-ent)
                             (string-match-p (regexp-quote g-ent) q-ent)))
                (push (cons (cons :ent g-ent) 0.8) aligned-activations)))

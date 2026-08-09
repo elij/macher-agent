@@ -9,6 +9,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'seq)
+(require 'project)
 (require 'macher)
 (require 'gptel nil t)
 (require 'xref)
@@ -147,6 +148,9 @@ WS is the workspace cons cell, string, or struct.
 
 Return the project root path string."
   (cond
+   ((and (fboundp 'project-root) (ignore-errors (project-root ws)))
+    (expand-file-name (project-root ws)))
+
    ((and (consp ws) (eq (car ws) 'project)) (expand-file-name (cdr ws)))
    ((and (consp ws) (eq (car ws) 'agent) (stringp (cdr ws))) (expand-file-name (cdr ws)))
    ((stringp ws) (expand-file-name ws))
@@ -635,7 +639,10 @@ BODY-FN is the function containing pipeline logic.
 
 Return the result of BODY-FN.
 Side effects: Creates and cleans up a temporary sandbox directory."
-  (let* ((workspace-root (macher-agent-context-root context))
+  (let* ((ctx-root (ignore-errors (macher-agent-context-root context)))
+         (proj (project-current nil default-directory))
+         (proj-root (when proj (expand-file-name (project-root proj))))
+         (workspace-root (or ctx-root proj-root default-directory))
          (sandbox-dir (make-temp-file "macher-sandbox-" t)))
     (unwind-protect
         (progn
