@@ -9,67 +9,15 @@
 (require 'macher)
 (require 'json)
 (require 'cl-lib)
+(require 'map)
 (require 'transient)
 (require 'subr-x)
+(require 'gptel)
+(require 'macher-agent-core)
+(require 'macher-agent-sandbox)
 (require 'macher-agent-vfs-client)
-
-(declare-function macher-agent-current-context "macher-agent-vfs-client")
-(declare-function macher-agent--resolve-buffer-name "macher-agent-orchestration")
-(declare-function macher-agent--read-context-file "macher-agent-vfs-client")
-(declare-function macher-agent--merge-contexts "macher-agent-vfs-client")
-(declare-function macher-agent--clone-context "macher-agent-vfs-client")
-(declare-function macher-agent--ensure-access "macher-agent-vfs-client")
-(declare-function macher-agent-context-classify-entry "macher-agent-vfs-client")
-
-;;; Response Structures
-
-(cl-defstruct macher-agent-tool-response
-  "Represent a base tool execution response structure.
-
-PAYLOAD is the underlying response object or data payload.
-STATUS is the execution status symbol, such as success or error.
-DATA is additional structured data associated with the result.
-ERROR is an error message string or object if execution failed.
-BUFFER-NAME is the associated buffer name string if applicable.
-
-Return a new `macher-agent-tool-response' struct instance.
-Side effects: None."
-  payload
-  status
-  data
-  error
-  buffer-name)
-
-(cl-defstruct (macher-agent-process-response (:include macher-agent-tool-response))
-  "Represent a process tool execution response structure.
-
-Return a new `macher-agent-process-response' struct instance.
-Side effects: None.")
-
-(cl-defstruct (macher-agent-delegate-response (:include macher-agent-tool-response))
-  "Represent a task delegation response structure.
-
-Return a new `macher-agent-delegate-response' struct instance.
-Side effects: None.")
-
-(cl-defstruct (macher-agent-nohup-response (:include macher-agent-tool-response))
-  "Represent a detached process response structure.
-
-Return a new `macher-agent-nohup-response' struct instance.
-Side effects: None.")
-
-(cl-defstruct (macher-agent-lisp-result-response (:include macher-agent-tool-response))
-  "Represent a Lisp evaluation result response structure.
-
-Return a new `macher-agent-lisp-result-response' struct instance.
-Side effects: None.")
-
-(cl-defstruct (macher-agent-ptc-response (:include macher-agent-tool-response))
-  "Represent a Programmatic Tool Calling response structure.
-
-Return a new `macher-agent-ptc-response' struct instance.
-Side effects: None."
-  primitives)
+(require 'macher-agent-presets)
+(require 'macher-agent-orchestration)
 
 ;;; Customisation Variables
 
@@ -84,7 +32,8 @@ Side effects: None.")
 (defvar macher-agent--active-ptc-execution nil
   "Indicate whether a Programmatic Tool Calling Lisp script is active.
 
-If non-nil, evaluation of a Programmatic Tool Calling Lisp script is in progress.
+If non-nil, evaluation of a Programmatic Tool Calling Lisp script
+is in progress.
 
 Return non-nil when active, nil otherwise.
 Side effects: None.")
@@ -97,35 +46,7 @@ List of custom tool name symbols permitted to access context.
 Return list of allowed tool symbol names.
 Side effects: None.")
 
-(defcustom macher-agent-display-subagent-fn nil
-  "Specify function to display a sub-agent buffer during execution.
-
-BUFFER is the buffer object to display.
-If nil, the buffer executes silently in the background.
-
-Return the display function or nil.
-Side effects: None."
-  :type '(choice (const :tag "Silent Background Execution" nil)
-                 function)
-  :group 'macher-agent)
-
-(defcustom macher-agent-hide-subagent-fn nil
-  "Specify function to hide a sub-agent buffer after execution finishes.
-
-BUFFER is the buffer object to hide.
-If nil, no action is taken when finished.
-
-Return the hide function or nil.
-Side effects: None."
-  :type '(choice (const :tag "Do Nothing" nil)
-                 function)
-  :group 'macher-agent)
-
-(defvar-local macher-agent--pending-instructions-queue nil
-  "Store pending system instruction strings for tool response payloads.
-
-Return list of instruction strings queued for insertion.
-Side effects: None.")
+(put 'macher-agent--pending-instructions-queue 'permanent-local t)
 
 (defvar-local macher-agent--final-result nil
   "Store the synthesised final answer from the sub-agent.
@@ -175,148 +96,50 @@ Side effects: None.")
 
 ;;; Execution Helpers
 
-(defun macher-agent--resolve-context (passed-context)
-  "Resolve the active agent context structure.
+(defun macher-agent--get-active-context ()
+  "Extract the active VFS context strictly from the executing FSM.
 
-PASSED-CONTEXT is an optional context object passed directly, which may be nil.
-
-Return the resolved context structure, or nil if context cannot be resolved.
+Return active context or nil if no FSM is active.
 Side effects: None."
-  (or passed-context
-      (ignore-errors (macher-agent-current-context))
-      (when-let* ((fsm (or (bound-and-true-p macher-agent--active-fsm)
-                           (bound-and-true-p macher--fsm-latest)
-                           (bound-and-true-p gptel--fsm-last)))
-                  (info (macher-agent--extract-fsm-info fsm)))
-        (plist-get info :macher-agent-context))))
+  (when-let* ((fsm (or (bound-and-true-p macher-agent--active-fsm)
+                       (macher-agent--get-fsm-latest)))
+              (info (cond
+                     ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm))
+                      (gptel-fsm-info fsm))
+                     ((listp fsm) fsm)
+                     ((fboundp 'gptel-fsm-info)
+                      (ignore-errors (gptel-fsm-info fsm)))
+                     (t nil))))
+    (or (plist-get info :macher-agent-context)
+        (plist-get info :macher--context))))
 
-(defun macher-agent--format-directives (result-data)
-  "Append pending system instructions to RESULT-DATA if directives exist.
-
-RESULT-DATA is the string or object response from tool execution.
-
-Return formatted string incorporating pending directives.
-Side effects: Clears `macher-agent--pending-instructions-queue' when non-empty."
-  (let ((final-str (if (stringp result-data) result-data (format "%S" result-data))))
-    (when macher-agent--pending-instructions-queue
-      (setq final-str (concat final-str "\n\n=== SYSTEM DIRECTIVE ===\n"
-                              (string-join (nreverse macher-agent--pending-instructions-queue) "\n")))
-      (setq macher-agent--pending-instructions-queue nil))
-    final-str))
-
-(defun macher-agent--wrap-callback (gptel-cb)
-  "Create a callback wrapper that parses results and formats directives.
+(defun macher-agent--wrap-callback (gptel-cb &optional ptc-exec)
+  "Create a simple callback wrapper that processes results without
+string tampering.
 
 GPTEL-CB is the original gptel callback function, which may be nil.
+PTC-EXEC is an optional boolean indicating active PTC execution context.
 
 Return a unary callback function accepting a plist result structure.
 Side effects: None."
-  (lambda (plist-result)
-    (let ((final-str (if (eq (plist-get plist-result :status) 'success)
-                         (plist-get plist-result :data)
-                       (plist-get plist-result :error))))
-      (when (eq (plist-get plist-result :status) 'error)
-        (message "MACHER AGENT ERROR: %S" final-str))
-      (if gptel-cb
-          (funcall gptel-cb (macher-agent--format-directives final-str))
-        (macher-agent--format-directives final-str)))))
-
-(defun macher-agent--show-ui (buf)
-  "Safely trigger display function for buffer BUF.
-
-BUF is the buffer object to display.
-
-Return nil.
-Side effects: Invokes `macher-agent-display-subagent-fn' when non-nil."
-  (when macher-agent-display-subagent-fn
-    (funcall macher-agent-display-subagent-fn buf)))
-
-(defun macher-agent--hide-ui (buf)
-  "Safely trigger hide function for buffer BUF.
-
-BUF is the buffer object to hide.
-
-Return nil.
-Side effects: Invokes `macher-agent-hide-subagent-fn' when non-nil."
-  (when macher-agent-hide-subagent-fn
-    (funcall macher-agent-hide-subagent-fn buf)))
-
-(defun macher-agent--insert-hidden (text)
-  "Insert TEXT hidden visually via display overlay while remaining readable.
-
-TEXT is the string content to insert.
-
-Return nil.
-Side effects: Inserts text and creates an overlay at point."
-  (let* ((start (point))
-         (_ (insert text))
-         (ov (make-overlay start (point))))
-    (overlay-put ov 'display "")
-    (overlay-put ov 'insert-behind-hooks '(ignore))))
-
-(defun macher-agent--normalize-key-string (key)
-  "Normalise KEY to a hyphenated string with underscores replaced.
-
-KEY is a keyword, symbol, or string key.
-
-Return normalised string with underscores converted to hyphens.
-Side effects: None."
-  (let ((key-str (if (keywordp key)
-                     (substring (symbol-name key) 1)
-                   (format "%s" key))))
-    (replace-regexp-in-string "_" "-" key-str)))
-
-(defun macher-agent--extract-prop-hash (obj norm-key)
-  "Extract property matching NORM-KEY from hash-table OBJ.
-
-OBJ is the hash-table object to inspect.
-NORM-KEY is the normalised string key to find.
-
-Return the matching value, or symbol `macher-missing' if not found.
-Side effects: None."
-  (let ((res 'macher-missing))
-    (maphash (lambda (k v)
-               (when (equal (macher-agent--normalize-key-string k) norm-key)
-                 (setq res v)))
-             obj)
-    res))
-
-(defun macher-agent--extract-prop-list (obj norm-key)
-  "Extract property matching NORM-KEY from list, alist, or plist OBJ.
-
-OBJ is the list, alist, or plist structure.
-NORM-KEY is the normalised string key to find.
-
-Return the matching value, or symbol `macher-missing' if not found.
-Side effects: None."
-  (let ((res 'macher-missing)
-        (tail obj))
-    (while (and (eq res 'macher-missing) tail (consp tail))
-      (let ((elem (car tail)))
-        (if (consp elem)
-            (progn
-              (when (equal (macher-agent--normalize-key-string (car elem)) norm-key)
-                (setq res (cdr elem)))
-              (setq tail (cdr tail)))
-          (when (equal (macher-agent--normalize-key-string elem) norm-key)
-            (setq res (cadr tail)))
-          (setq tail (cddr tail)))))
-    res))
+  (let ((is-ptc (or ptc-exec (bound-and-true-p macher-agent--active-ptc-execution))))
+    (lambda (plist-result)
+      (let ((final-str (if (eq (plist-get plist-result :status) 'success)
+                           (plist-get plist-result :data)
+                         (plist-get plist-result :error))))
+        (when (eq (plist-get plist-result :status) 'error)
+          (message "MACHER AGENT ERROR: %S" final-str))
+        (let
+            ((macher-agent--active-ptc-execution
+              (or is-ptc (bound-and-true-p macher-agent--active-ptc-execution))))
+          (if gptel-cb
+              (funcall gptel-cb final-str)
+            final-str))))))
 
 (defun macher-agent--extract-prop (obj key)
-  "Extract KEY from OBJ handling plists, alists, and hash-tables.
-
-OBJ is a hash-table, plist, or alist object.
-KEY is the target key symbol, keyword, or string.
-
-Return matching property value, or nil if not present.
-Side effects: None."
-  (let* ((norm-key (macher-agent--normalize-key-string key))
-         (res (cond
-               ((hash-table-p obj) (macher-agent--extract-prop-hash obj norm-key))
-               ((listp obj) (macher-agent--extract-prop-list obj norm-key))
-               (t 'macher-missing))))
-    (if (eq res 'macher-missing) nil res)))
+  "Extract KEY from OBJ handling plists, alists, and hash-tables."
+  (let ((norm-key (if (stringp key) (intern (concat ":" (replace-regexp-in-string "_" "-" key))) key)))
+    (map-elt obj norm-key 'macher-missing)))
 
 ;;; Schema Validation
 
@@ -369,31 +192,31 @@ NAME is the parameter path string for error messages.
 
 Return nil upon successful validation.
 Side effects: Signals error if missing required properties or invalid types."
+  (unless (or (hash-table-p value) (listp value))
+    (error "Validation error (%s): Expected object structure, got %S" name value))
   (let ((props (plist-get spec :properties))
         (reqs (plist-get spec :required)))
-    (when (and (consp props) (eq (car props) 'quote))
-      (setq props (cadr props)))
-    (when (and (consp reqs) (eq (car reqs) 'quote))
-      (setq reqs (cadr reqs)))
-    (when (vectorp reqs)
-      (setq reqs (append reqs nil)))
+    (when (and (consp props) (eq (car props) 'quote)) (setq props (cadr props)))
+    (when (and (consp reqs) (eq (car reqs) 'quote)) (setq reqs (cadr reqs)))
+    (when (vectorp reqs) (setq reqs (append reqs nil)))
     (when props
       (unless (and (listp props) (evenp (length props)))
-        (error "%s" (format "Schema properties for '%s' must be a flat plist, got %S" name props)))
-      (cl-loop for (k v-spec) on props by #'cddr
-               for prop-name = (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))
-               for child-val = (macher-agent--extract-prop value k)
-               do (if child-val
-                      (macher-agent--validate-schema
-                       v-spec child-val (format "%s.%s" name prop-name))
-                    (when (or (and reqs
-                                   (or (member prop-name reqs)
-                                       (member (intern prop-name) reqs)
-                                       (member (intern (concat ":" prop-name)) reqs)))
-                              (and (not reqs)
-                                   (plist-member v-spec :optional)
-                                   (not (plist-get v-spec :optional))))
-                      (error "%s" (format "Missing required parameter: '%s.%s'" name prop-name))))))))
+        (error "%s" (format
+                     "Schema properties for '%s' must be a flat plist, got %S" name props)))
+      (cl-loop
+       for (k v-spec) on props by #'cddr
+       for prop-name = (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))
+       for child-val = (macher-agent--extract-prop value k)
+       do (if (not (eq child-val 'macher-missing))
+              (macher-agent--validate-schema v-spec child-val (format "%s.%s" name prop-name))
+            (when (or (and reqs
+                           (or (member prop-name reqs)
+                               (member (intern prop-name) reqs)
+                               (member (intern (concat ":" prop-name)) reqs)))
+                      (and (not reqs)
+                           (plist-member v-spec :optional)
+                           (not (plist-get v-spec :optional))))
+              (error "%s" (format "Missing required parameter: '%s.%s'" name prop-name))))))))
 
 (defun macher-agent--validate-schema (spec value &optional path)
   "Recursively validate VALUE against JSON SPEC with optional PATH.
@@ -466,7 +289,8 @@ NAME-SYM is the tool symbol name.
 PAYLOAD is the argument plist payload.
 
 Return error string if blocked or errored, nil if execution is permitted.
-Side effects: Runs hooks in `macher-agent-pre-tool-use-hook' and permission hook."
+Side effects: Runs hooks in `macher-agent-pre-tool-use-hook' and
+permission hook."
   (let ((pre-blocked nil)
         (pre-error nil))
     (condition-case hook-err
@@ -501,7 +325,7 @@ Side effects: Invokes failure hook and callback on error."
       (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload err)
       (funcall ,wrap-cb (list :status 'error :error (error-message-string err))))))
 
-(defmacro macher-agent--build-success-callback (name-sym payload success-fn output-filter-fn wrap-cb)
+(defmacro macher-agent--build-success-callback (name-sym payload success-fn output-filter-fn wrap-cb &optional ptc-exec)
   "Generate success callback for NAME-SYM using PAYLOAD and handlers.
 
 NAME-SYM is the tool symbol name.
@@ -509,29 +333,33 @@ PAYLOAD is the argument plist payload.
 SUCCESS-FN is the optional result formatting function.
 OUTPUT-FILTER-FN is the optional output filtering function.
 WRAP-CB is the callback function wrapper.
+PTC-EXEC is an optional boolean indicating active PTC execution context.
 
 Return a lambda callback function accepting response object.
-Side effects: Runs `macher-agent-post-tool-use-hook' on success or failure hook on error."
-  `(lambda (res-obj)
-     (condition-case cb-err
-         (let* ((s-fn ,success-fn)
+Side effects: Runs `macher-agent-post-tool-use-hook' on success or
+failure hook on error."
+  `(let ((is-ptc (or ,ptc-exec (bound-and-true-p macher-agent--active-ptc-execution))))
+     (lambda (res-obj)
+       (condition-case cb-err
+           (let*
+               ((s-fn ,success-fn)
                 (f-fn ,output-filter-fn)
-                (raw-payload (if (macher-agent-tool-response-p res-obj)
-                                 (macher-agent-tool-response-payload res-obj)
-                               res-obj))
-                (success-data (if s-fn
-                                  (let ((arity (func-arity s-fn)))
-                                    (if (or (eq (cdr arity) 'many)
-                                            (and (numberp (cdr arity)) (>= (cdr arity) 2)))
-                                        (funcall s-fn raw-payload payload)
-                                      (funcall s-fn raw-payload)))
-                                raw-payload))
+                (raw-payload res-obj)
+                (active-ptc (or is-ptc (bound-and-true-p macher-agent--active-ptc-execution)))
+                (success-data
+                 (if (and s-fn (not active-ptc))
+                     (let ((arity (func-arity s-fn)))
+                       (if (or (eq (cdr arity) 'many)
+                               (and (numberp (cdr arity)) (>= (cdr arity) 2)))
+                           (funcall s-fn raw-payload payload)
+                         (funcall s-fn raw-payload)))
+                   raw-payload))
                 (final-data (if f-fn (funcall f-fn success-data) success-data)))
-           (run-hook-with-args 'macher-agent-post-tool-use-hook ,name-sym ,payload final-data)
-           (funcall ,wrap-cb (list :status 'success :data final-data)))
-       (error
-        (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload cb-err)
-        (funcall ,wrap-cb (list :status 'error :error (error-message-string cb-err)))))))
+             (run-hook-with-args 'macher-agent-post-tool-use-hook ,name-sym ,payload final-data)
+             (funcall ,wrap-cb (list :status 'success :data final-data)))
+         (error
+          (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload cb-err)
+          (funcall ,wrap-cb (list :status 'error :error (error-message-string cb-err))))))))
 
 (cl-defmacro macher-agent-make-tool (name-symbol description &key category args command-fn success-fn output-filter-fn)
   "Define NAME-SYMBOL as a tool compatible with gptel using DESCRIPTION.
@@ -547,7 +375,8 @@ OUTPUT-FILTER-FN is the optional filter function for final result data.
 Return expanding form defining and initialising the tool variable.
 Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
   (declare (indent 2))
-  (let* ((stripped-name (replace-regexp-in-string "^macher-agent-\\|-tool$" "" (symbol-name name-symbol)))
+  (let* ((stripped-name
+          (replace-regexp-in-string "^macher-agent-tool-\\|^macher-agent-\\|-tool$" "" (symbol-name name-symbol)))
          (name (replace-regexp-in-string "-" "_" stripped-name)))
     `(progn
        (defvar ,name-symbol nil)
@@ -560,166 +389,79 @@ Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
               :async t
               :function
               (lambda (callback &rest tool-args)
-                (let* ((wrap-cb (macher-agent--wrap-callback callback))
-                       (payload (macher-agent--extract-payload tool-args ,args)))
-                  (macher-agent--with-tool-error-handling ',name-symbol payload wrap-cb
-                                                          (macher-agent--validate-payload payload ,args)
-                                                          (let* ((context (or (ignore-errors (macher-agent-resolve-context))
-                                                                              (bound-and-true-p macher-agent--persistent-context)))
-                                                                 (root (if context (macher-agent-context-root context) default-directory))
-                                                                 (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
-                                                            (if hook-rejection
-                                                                (funcall wrap-cb (list :status 'error :error hook-rejection))
-                                                              (let* ((action (funcall ,command-fn payload context root))
-                                                                     (action-res (if (macher-agent-tool-response-p action)
-                                                                                     action
-                                                                                   (make-macher-agent-lisp-result-response
-                                                                                    :payload action)))
-                                                                     (on-success (macher-agent--build-success-callback
-                                                                                  ',name-symbol payload ,success-fn ,output-filter-fn wrap-cb)))
-                                                                (macher-agent-execute-response action-res context on-success wrap-cb))))))))))))
+                (let*
+                    ((ptc-exec (bound-and-true-p macher-agent--active-ptc-execution))
+                     (wrap-cb (macher-agent--wrap-callback callback ptc-exec))
+                     (payload (macher-agent--extract-payload tool-args ,args)))
+                  (macher-agent--with-tool-error-handling
+                   ',name-symbol payload wrap-cb
+                   (macher-agent--validate-payload payload ,args)
+                   (let*
+                       ((context (macher-agent--get-active-context))
+                        (root
+                         (if context (macher-agent-context-root context) default-directory))
+                        (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
+                     (if hook-rejection
+                         (funcall wrap-cb (list :status 'error :error hook-rejection))
+                       (let*
+                           ((on-success
+                             (macher-agent--build-success-callback
+                              ',name-symbol payload ,success-fn
+                              ,output-filter-fn wrap-cb ptc-exec))
+                            (cmd-fn ,command-fn)
+                            (arity (func-arity cmd-fn)))
+                         (if (or (eq (cdr arity) 'many)
+                                 (and (numberp (cdr arity)) (>= (cdr arity) 4)))
+                             (funcall cmd-fn payload context root on-success)
+                           (let ((action-res (funcall cmd-fn payload context root)))
+                             (if (functionp action-res)
+                                 (funcall action-res on-success)
+                               (funcall on-success action-res)))))))))))))))
 
-;;; Response Execution Methods
+(defun macher-agent-execute-ptc-script
+    (script-string context on-success on-error &optional extra-primitives target-buf)
+  "Execute Programmatic Tool Calling SCRIPT-STRING using CONTEXT.
 
-(cl-defgeneric macher-agent-execute-response (response context on-success on-error)
-  "Execute action encapsulated by RESPONSE structure.
+SCRIPT-STRING is the string containing Lisp code to evaluate.
+CONTEXT is the active VFS context structure.
+ON-SUCCESS is the callback function invoked with success result.
+ON-ERROR is the callback function invoked with error result.
+EXTRA-PRIMITIVES is an optional list of allowed primitive functions.
+TARGET-BUF is an optional target buffer for execution.
 
-RESPONSE is the tool response structure instance.
-CONTEXT is the active agent context structure.
-ON-SUCCESS is the callback called on successful execution.
-ON-ERROR is the callback called on execution failure.
-
-Return result of dispatching to specific method implementation.
-Side effects: Performs actions dictated by RESPONSE structure type.")
-
-(cl-defmethod macher-agent-execute-response (res _context on-success _on-error)
-  "Handle fallback response execution for raw Lisp objects or structs.
-
-RES is the response struct or raw Lisp payload object.
-_CONTEXT is the ignored context object.
-ON-SUCCESS is the callback function for success.
-_ON-ERROR is the ignored error callback function.
-
-Return result of invoking ON-SUCCESS callback.
-Side effects: Invokes ON-SUCCESS callback with response payload or raw value."
-  (if (macher-agent-tool-response-p res)
-      (funcall on-success (macher-agent-tool-response-payload res))
-    (funcall on-success res)))
-
-(cl-defmethod macher-agent-execute-response ((res macher-agent-process-response) context on-success on-error)
-  "Execute process response RES in sandbox using CONTEXT.
-
-RES is the process response struct instance.
-CONTEXT is the active agent context structure.
-ON-SUCCESS is the callback function called on success.
-ON-ERROR is the callback function called on failure.
-
-Return result of sandbox execution invocation.
-Side effects: Spawns process within persistent sandbox environment."
-  (let ((payload (macher-agent-tool-response-payload res)))
-    (if (stringp payload)
-        (macher-agent--run-in-persistent-sandbox
-         context payload
-         (lambda (process-output)
-           (setf (macher-agent-tool-response-payload res) process-output)
-           (funcall on-success res))
-         on-error)
-      (funcall on-error (list :status 'error :error "Process payload must be a string.")))))
-
-(cl-defmethod macher-agent-execute-response ((res macher-agent-delegate-response) _context on-success _on-error)
-  "Delegate task execution in RES in parallel and invoke ON-SUCCESS.
-
-RES is the delegate response struct instance.
-_CONTEXT is the ignored context structure.
-ON-SUCCESS is the callback function called on completion.
-_ON-ERROR is the ignored error callback function.
-
-Return result of parallel execution invocation.
-Side effects: Spawns parallel sub-agent processes."
-  (macher-agent-execute-parallel
-   (macher-agent-tool-response-payload res)
-   (lambda (sub-agent-results)
-     (setf (macher-agent-tool-response-payload res) sub-agent-results)
-     (funcall on-success res))))
-
-(cl-defmethod macher-agent-execute-response ((res macher-agent-nohup-response) _context on-success _on-error)
-  "Run detached process command in RES asynchronously and call ON-SUCCESS.
-
-RES is the nohup response struct instance.
-_CONTEXT is the ignored context structure.
-ON-SUCCESS is the callback function called on launch.
-_ON-ERROR is the ignored error callback function.
-
-Return result of invoking ON-SUCCESS callback.
-Side effects: Launches detached background command asynchronously."
-  (macher-agent--run-async-cmd "detached" (macher-agent-tool-response-payload res) default-directory (lambda (_ _)))
-  (setf (macher-agent-tool-response-payload res) "SUCCESS: Process started.")
-  (funcall on-success res))
-
-(cl-defmethod macher-agent-execute-response ((res macher-agent-lisp-result-response) _context on-success _on-error)
-  "Execute Lisp payload for response RES and invoke ON-SUCCESS.
-
-RES is the Lisp result response struct instance.
-_CONTEXT is the ignored context structure.
-ON-SUCCESS is the callback function called on completion.
-_ON-ERROR is the ignored error callback function.
-
-Return result of evaluating Lisp task.
-Side effects: Evaluates Lisp payload task asynchronously."
-  (macher-agent-execute-lisp-task
-   (macher-agent-tool-response-payload res)
-   (lambda (lisp-result)
-     (setf (macher-agent-tool-response-payload res) lisp-result)
-     (funcall on-success res))))
-
-(cl-defmethod macher-agent-execute-response ((res macher-agent-ptc-response) context on-success on-error)
-  "Execute Programmatic Tool Calling script in RES using CONTEXT.
-
-RES is the PTC response struct instance.
-CONTEXT is the active agent context structure.
-ON-SUCCESS is the callback function called on completion.
-ON-ERROR is the callback function called on error.
-
-Return result of evaluating iterator loop.
-Side effects: Evaluates Lisp AST and dispatches tool calls with feedback."
-  (condition-case general-err
-      (let ((macher-agent--active-ptc-execution t)
-            (script-string (macher-agent-tool-response-payload res))
-            (extra-primitives (macher-agent-ptc-response-primitives res))
-            (target-buf (or (macher-agent-tool-response-buffer-name res) (current-buffer))))
-        (if (not script-string)
-            (funcall on-error (list :status 'error :error "Invalid PTC script payload"))
-          (let ((ast (macroexpand-all (read script-string))))
-            (with-current-buffer target-buf
-              (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)
-                    macher-agent-sandbox--functions (make-hash-table :test 'eq)
-                    macher-agent-sandbox--globals (make-hash-table :test 'eq))
-              (macher-agent-sandbox--init extra-primitives)
-              (let ((iterator (macher-agent-sandbox--eval-iter ast nil)))
-                (if (not iterator)
-                    (funcall on-error (list :status 'error :error "Failed to initialise PTC iterator"))
-                  (letrec
-                      ((ptc-resume-loop
-                        (lambda (last-result)
-                          (with-current-buffer target-buf
-                            (when iterator
-                              (condition-case iter-err
-                                  (let ((yielded-val (iter-next iterator last-result)))
-                                    (macher-agent--ptc-handle-yielded-value
-                                     yielded-val context ptc-resume-loop on-error
-                                     (lambda () (setq iterator nil))))
-                                (iter-end-of-sequence
-                                 (setq iterator nil)
-                                 (when (fboundp 'gptel--update-status)
-                                   (gptel--update-status " PTC: Complete" 'success))
-                                 (funcall on-success (cdr iter-err)))
-                                (error
-                                 (setq iterator nil)
-                                 (funcall on-error (list :status 'error
-                                                         :error (error-message-string iter-err))))))))))
-                    (funcall ptc-resume-loop nil))))))))
-    (error
-     (funcall on-error (list :status 'error :error (error-message-string general-err))))))
+Return nil.
+Side effects: Evaluates Lisp code in a sandboxed environment."
+  (let ((prims (or extra-primitives
+                   '(nreverse sort delete delq nconc plist-put aset puthash remhash error signal message random emacs-version)))
+        (buf (or target-buf (current-buffer))))
+    (let ((macher-agent--active-ptc-execution t))
+      (condition-case err
+          (progn
+            (with-current-buffer buf
+              (setq macher-agent-sandbox--globals (make-hash-table :test 'eq)
+                    macher-agent-sandbox--primitives (make-hash-table :test 'eq)
+                    macher-agent-sandbox--functions (make-hash-table :test 'eq))
+              (macher-agent-sandbox--init prims))
+            (let* ((ast (macroexpand-all (read script-string)))
+                   (iterator (with-current-buffer buf (macher-agent-sandbox--eval-iter ast nil)))
+                   (stop-iter-fn (lambda (reason)
+                                   (funcall on-error (list :status 'error :error reason)))))
+              (letrec
+                  ((ptc-resume-loop
+                    (lambda (input)
+                      (condition-case iter-err
+                          (let ((step (with-current-buffer buf (iter-next iterator input))))
+                            (if (and (listp step) (eq (plist-get step :interrupt) 'tool-call))
+                                (macher-agent--ptc-handle-yielded-value
+                                 step context ptc-resume-loop on-error stop-iter-fn)
+                              (funcall ptc-resume-loop step)))
+                        (iter-end-of-sequence
+                         (funcall on-success (cdr iter-err)))
+                        (error
+                         (funcall on-error (list :status 'error :error (error-message-string iter-err))))))))
+                (funcall ptc-resume-loop nil))))
+        (error
+         (funcall on-error (list :status 'error :error (error-message-string err))))))))
 
 ;;; PTC Integration
 
@@ -741,13 +483,15 @@ Side effects: Updates mode-line status and executes pre-tool-call hooks."
          (block-reason nil))
 
     (when (bound-and-true-p gptel-pre-tool-call-functions)
-      (run-hook-wrapped 'gptel-pre-tool-call-functions
-                        (lambda (f)
-                          (let ((res (ignore-errors
-                                       (funcall f (list :name original-name-str :args args :buffer (buffer-name) :model (bound-and-true-p gptel-model))))))
-                            (when (and res (listp res) (plist-get res :block))
-                              (setq block-reason (plist-get res :block))
-                              t)))))
+      (run-hook-wrapped
+       'gptel-pre-tool-call-functions
+       (lambda (f)
+         (let ((res (ignore-errors
+                      (funcall f (list :name original-name-str :args args
+                                       :buffer (buffer-name) :model (bound-and-true-p gptel-model))))))
+           (when (and res (listp res) (plist-get res :block))
+             (setq block-reason (plist-get res :block))
+             t)))))
 
     (if block-reason
         (error "%s" block-reason)
@@ -799,10 +543,12 @@ Side effects: Inserts formatted result block text into buffer at buffer max."
   (when-let* ((str-res (if (stringp res-data) res-data (prin1-to-string res-data)))
               (call-str (prin1-to-string `(:name ,original-name-str :args ,args))))
     (when (bound-and-true-p gptel-post-tool-call-functions)
-      (run-hook-wrapped 'gptel-post-tool-call-functions
-                        (lambda (f)
-                          (ignore-errors
-                            (funcall f (list :name original-name-str :args args :result str-res :buffer (buffer-name) :model (bound-and-true-p gptel-model)))))))
+      (run-hook-wrapped
+       'gptel-post-tool-call-functions
+       (lambda (f)
+         (ignore-errors
+           (funcall f (list :name original-name-str :args args :result str-res
+                            :buffer (buffer-name) :model (bound-and-true-p gptel-model)))))))
     (when (bound-and-true-p gptel-include-tool-results)
       (save-excursion
         (goto-char (point-max))
@@ -855,14 +601,16 @@ SCHEMA is the argument schema specification list.
 Return coerced plist of arguments.
 Side effects: None."
   (let ((coerced-args nil))
-    (cl-loop for (k v) on args by #'cddr
-             for spec = (cl-find-if (lambda (s)
-                                      (let ((n (plist-get s :name)))
-                                        (string= (replace-regexp-in-string "_" "-" (if (symbolp n) (symbol-name n) n))
-                                                 (substring (symbol-name k) 1))))
-                                    schema)
-             do (progn (push k coerced-args)
-                       (push (if spec (macher-agent--coerce-val v spec) v) coerced-args)))
+    (cl-loop
+     for (k v) on args by #'cddr
+     for spec =
+     (cl-find-if (lambda (s)
+                   (let ((n (plist-get s :name)))
+                     (string= (replace-regexp-in-string "_" "-" (if (symbolp n) (symbol-name n) n))
+                              (substring (symbol-name k) 1))))
+                 schema)
+     do (progn (push k coerced-args)
+               (push (if spec (macher-agent--coerce-val v spec) v) coerced-args)))
     (nreverse coerced-args)))
 
 (defun macher-agent--coerce-positional-args (args schema)
@@ -894,73 +642,42 @@ Side effects: None."
           (macher-agent--coerce-plist-args args schema)
         (macher-agent--coerce-positional-args args schema)))))
 
-(defun macher-agent--format-ptc-subagent-results (sub-agent-results)
-  "Format SUB-AGENT-RESULTS into a list of result plists.
-
-SUB-AGENT-RESULTS is a vector or list of sub-agent response objects.
-
-Return list of formatted result plists.
-Side effects: None."
-  (let ((vec (if (vectorp sub-agent-results) sub-agent-results (vconcat sub-agent-results))))
-    (cl-loop for sub-res across vec
-             collect (list :buffer (cond
-                                    ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-buffer-name sub-res))
-                                    ((listp sub-res) (plist-get sub-res :buffer))
-                                    (t (format "%s" sub-res)))
-                           :status (cond
-                                    ((macher-agent-tool-response-p sub-res) (macher-agent-tool-response-status sub-res))
-                                    ((listp sub-res) (plist-get sub-res :status))
-                                    (t 'success))
-                           :data (cond
-                                  ((macher-agent-tool-response-p sub-res)
-                                   (if (eq (macher-agent-tool-response-status sub-res) 'success)
-                                       (macher-agent-tool-response-data sub-res)
-                                     (macher-agent-tool-response-error sub-res)))
-                                  ((listp sub-res) (plist-get sub-res :data))
-                                  (t sub-res))))))
-
-(defun macher-agent--dispatch-ptc-primitive (tool-lisp-sym args resolved-tool original-name-str ptc-callback on-error stop-iter-fn)
+(defun macher-agent--dispatch-ptc-primitive
+    (tool-lisp-sym args resolved-tool original-name-str ptc-callback on-error stop-iter-fn)
   "Dispatch TOOL-LISP-SYM with ARGS or RESOLVED-TOOL for ORIGINAL-NAME-STR.
 
-TOOL-LISP-SYM is the symbol naming the Lisp primitive function.
-ARGS is the list of arguments for the primitive call.
-RESOLVED-TOOL is the resolved tool object or nil.
-ORIGINAL-NAME-STR is the original tool name string.
-PTC-CALLBACK is the callback function receiving output data.
-ON-ERROR is the error callback function on failure.
-STOP-ITER-FN is the function called to halt iterator loop.
+TOOL-LISP-SYM is the symbol of the tool function.
+ARGS is the list of arguments passed to the tool.
+RESOLVED-TOOL is the resolved gptel tool structure.
+ORIGINAL-NAME-STR is the string name of the original tool.
+PTC-CALLBACK is the callback function upon successful execution.
+ON-ERROR is the callback function invoked upon error.
+STOP-ITER-FN is the function to halt the iterator.
 
-Return result of primitive execution or callback invocation.
-Side effects: Invokes target primitive function or tool callback."
+Return result of dispatching tool execution.
+Side effects: Invokes tool function and callbacks."
   (if (fboundp tool-lisp-sym)
       (let ((lisp-res (apply tool-lisp-sym args)))
-        (funcall ptc-callback
-                 (if (macher-agent-tool-response-p lisp-res)
-                     (macher-agent-tool-response-payload lisp-res)
-                   lisp-res)))
+        (funcall ptc-callback lisp-res))
     (if-let* ((_ (macher-tool-valid-p resolved-tool))
               (tool-fn (gptel-tool-function resolved-tool)))
         (let ((coerced-args (macher-agent--coerce-ptc-args args resolved-tool)))
-          (cl-letf (((symbol-function 'macher-agent-execute-response)
-                     (lambda (action-res _ctx _on-succ _on-err)
-                       (if (macher-agent-delegate-response-p action-res)
-                           (macher-agent-execute-parallel
-                            (macher-agent-tool-response-payload action-res)
-                            (lambda (sub-agent-results)
-                              (funcall ptc-callback (macher-agent--format-ptc-subagent-results sub-agent-results))))
-                         (funcall ptc-callback
-                                  (if (macher-agent-tool-response-p action-res)
-                                      (macher-agent-tool-response-payload action-res)
-                                    action-res))))))
-            (if (gptel-tool-async resolved-tool)
-                (apply tool-fn (lambda (err-res) (funcall ptc-callback err-res)) coerced-args)
-              (let ((sync-result (apply tool-fn coerced-args)))
-                (funcall ptc-callback sync-result)))))
-      (when stop-iter-fn (funcall stop-iter-fn))
+          (if (gptel-tool-async resolved-tool)
+              (let ((called nil))
+                (apply tool-fn
+                       (lambda (res &optional err)
+                         (unless called
+                           (setq called t)
+                           (if err
+                               (funcall stop-iter-fn err)
+                             (funcall ptc-callback res))))
+                       coerced-args))
+            (let ((sync-result (apply tool-fn coerced-args)))
+              (funcall ptc-callback sync-result))))
+      (when stop-iter-fn (funcall stop-iter-fn "Tool not accessible"))
       (funcall on-error
                (list :status 'error
-                     :error (format "ERROR: Tool '%s' is not accessible in this context or is no longer available. Please select another tool or approach."
-                                    original-name-str))))))
+                     :error (format "ERROR: Tool '%s' is not accessible." original-name-str))))))
 
 (defun macher-agent--ptc-handle-yielded-value (yielded-val context ptc-resume-loop on-error stop-iter-fn)
   "Handle YIELDED-VAL returned during PTC execution.
@@ -991,29 +708,6 @@ Side effects: Triggers tool execution and schedules loop resumption."
                             :error (format "Unexpected yield from PTC sandbox: %S" yielded-val)))))
 
 ;;; Sandbox Execution
-
-(defun macher-agent--run-async-cmd (name cmd dir callback)
-  "Execute command CMD asynchronously with explicit lexical capture.
-
-NAME is the process name string.
-CMD is the shell command string to execute.
-DIR is the working directory string.
-CALLBACK is the function called upon process exit with status and output.
-
-Return process object.
-Side effects: Spawns asynchronous process and creates output buffer."
-  (let* ((out-buf (generate-new-buffer (format " *%s*" name)))
-         (default-directory dir))
-    (make-process
-     :name name
-     :buffer out-buf
-     :command (list shell-file-name shell-command-switch cmd)
-     :sentinel (lambda (proc _event)
-                 (when (memq (process-status proc) '(exit signal))
-                   (let ((output (with-current-buffer out-buf (buffer-string)))
-                         (exit-code (process-exit-status proc)))
-                     (kill-buffer out-buf)
-                     (funcall callback exit-code output)))))))
 
 (defun macher-agent--run-in-persistent-sandbox (context command on-success on-error)
   "Execute COMMAND asynchronously within dynamically generated VFS sandbox.
@@ -1056,14 +750,16 @@ Side effects: Creates temporary sandbox directory and spawns process."
        (funcall on-error (list :status 'error :error (error-message-string err)))))))
 
 (defun macher-agent--read-file-vfs-aware (file-path context)
-  "Read FILE-PATH prioritising uncommitted VFS memory over physical disk.
+  "Read FILE-PATH prioritising uncommitted VFS memory over physical
+disk.
 
 FILE-PATH is the file path string to read.
 CONTEXT is the active agent context structure.
 
 Return file content string, or nil if file cannot be read.
 Side effects: None."
-  (let* ((vfs-entry (when context (cl-find file-path (macher-context-contents context) :key #'car :test #'equal)))
+  (let* ((vfs-entry
+          (when context (cl-find file-path (macher-context-contents context) :key #'car :test #'equal)))
          (vfs-content (when vfs-entry (if (consp (cdr vfs-entry)) (cddr vfs-entry) (cdr vfs-entry)))))
     (cond
      (vfs-content vfs-content)
@@ -1072,25 +768,16 @@ Side effects: None."
      (t nil))))
 
 (defun macher-agent-add-pending-instruction (instruction)
-  "Push INSTRUCTION directive to steer model after tool execution completes.
+  "Push INSTRUCTION to the end of the queue for the next network turn.
 
-INSTRUCTION is the directive string to push.
+INSTRUCTION is the directive string to append to the queue.
 
-Return nil.
-Side effects: Pushes directive string onto `macher-agent--pending-instructions-queue'."
-  (push instruction macher-agent--pending-instructions-queue))
+Return new list of pending instructions.
 
-(defun macher-agent--format-error (err)
-  "Standardise error message string ERR for language model consumption.
-
-ERR is the error signal data or object.
-
-Return formatted error message string.
-Side effects: None."
-  (let ((msg (error-message-string err)))
-    (if (string-match-p "^\\(ERROR\\|SECURITY ERROR\\):" msg)
-        msg
-      (format "ERROR: %s" msg))))
+Side effects: Updates `macher-agent--pending-instructions-queue' buffer-locally."
+  (setq-local macher-agent--pending-instructions-queue
+              (append macher-agent--pending-instructions-queue
+                      (list (format "USER OVERRIDE DIRECTIVE:\n%s" instruction)))))
 
 ;;; Media Integration
 
@@ -1108,9 +795,8 @@ FILE is the string path of file or raw base64 data.
 
 Return base64-encoded string representation.
 Side effects: None."
-  (if-let* ((fsm (or (and (boundp 'macher-agent--active-fsm) macher-agent--active-fsm)
-                     (and (boundp 'macher--fsm-latest) (symbol-value 'macher--fsm-latest))
-                     (and (boundp 'gptel--fsm-last) (symbol-value 'gptel--fsm-last))))
+  (if-let* ((fsm (or (bound-and-true-p macher-agent--active-fsm)
+                     (macher-agent--get-fsm-latest)))
             (info (ignore-errors (gptel-fsm-info fsm)))
             (ctx (plist-get info :macher-agent-context))
             (pending (when ctx (macher-agent--get-context-data ctx :pending-media)))
@@ -1136,6 +822,71 @@ Side effects: None."
   (ignore-errors
     (transient-suffix-put 'gptel-menu 'gptel--infix-tools :save-history nil)
     (transient-suffix-put 'gptel-menu 'gptel--infix-system-message :save-history nil)))
+
+;;; Memory Tools
+
+(macher-agent-make-tool
+ macher-agent-tool-search-conversation-history
+ "Search the full, un-truncated conversation history of the current buffer for matching query text or regex."
+ :category "conversation"
+ :args '((:name "query"
+                :type string
+                :description "The search query string or regular expression to search for in conversation history."))
+ :command-fn
+ (lambda (payload _context _root)
+   (let* ((query (or (plist-get payload :query)
+                     (plist-get payload 'query)))
+          (fsm (or (bound-and-true-p macher-agent--active-fsm)
+                   (and (fboundp 'macher-agent--get-fsm-latest)
+                        (macher-agent--get-fsm-latest))))
+          (info (when (and fsm (fboundp 'gptel-fsm-info))
+                  (ignore-errors (gptel-fsm-info fsm))))
+          (target-buf (or (and info (plist-get info :buffer))
+                          (current-buffer)))
+          (results nil))
+     (if (or (not query) (not (stringp query)) (string-empty-p query))
+         "No matches found in conversation history for query: empty"
+       (if (or (not target-buf) (not (buffer-live-p target-buf)))
+           "No matches found in conversation history: Buffer not available."
+         (with-current-buffer target-buf
+           (save-excursion
+             (save-restriction
+               (widen)
+               (goto-char (point-min))
+               (let ((case-fold-search t))
+                 (condition-case nil
+                     (while (re-search-forward query nil t)
+                       (let* ((match-pt (point))
+                              (line-num (line-number-at-pos match-pt))
+                              (start-pt (save-excursion
+                                          (forward-line -2)
+                                          (line-beginning-position)))
+                              (end-pt (save-excursion
+                                        (forward-line 2)
+                                        (line-end-position)))
+                              (snippet (buffer-substring-no-properties start-pt end-pt)))
+                         (push (format "--- Match near line %d ---\n%s" line-num snippet)
+                               results)
+                         (when (= (match-beginning 0) (match-end 0))
+                           (forward-char 1))))
+                   (error
+                    (goto-char (point-min))
+                    (while (search-forward query nil t)
+                      (let* ((match-pt (point))
+                             (line-num (line-number-at-pos match-pt))
+                             (start-pt (save-excursion
+                                         (forward-line -2)
+                                         (line-beginning-position)))
+                             (end-pt (save-excursion
+                                       (forward-line 2)
+                                       (line-end-position)))
+                             (snippet (buffer-substring-no-properties start-pt end-pt)))
+                        (push (format "--- Match near line %d ---\n%s" line-num snippet)
+                              results))))))))
+           (if results
+               (string-join (nreverse results) "\n\n")
+             (format "No matches found in conversation history for query: %s" query))))))))
+
 
 (provide 'macher-agent-gptel-tools)
 ;;; macher-agent-gptel-tools.el ends here

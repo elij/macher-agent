@@ -1,4 +1,4 @@
-;;; macher-agent-sandbox.el --- Sandboxed Lisp evaluator for macher-agent -*- lexical-binding: t; -*-
+;;; macher-agent-sandbox.el --- Sandboxed Lisp evaluator for macher-agent-*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
 ;; Keywords: convenience, gptel, llm, macher
@@ -15,6 +15,7 @@
 (require 'cl-lib)
 (require 'generator)
 (require 'byte-opt)
+(require 'macher-agent-core)
 
 (declare-function cps-internal-yield "generator")
 
@@ -185,8 +186,9 @@ EVAL-ARGS is the list of evaluated argument values.
 
 Return the result of the function call or yield a tool call interrupt.
 Side effects: May yield an interrupt or mutate global sandbox state."
-            (let ((prim (and macher-agent-sandbox--primitives (gethash func macher-agent-sandbox--primitives)))
-                  (closure (and macher-agent-sandbox--functions (gethash func macher-agent-sandbox--functions))))
+            (let
+                ((prim (and macher-agent-sandbox--primitives (gethash func macher-agent-sandbox--primitives)))
+                 (closure (and macher-agent-sandbox--functions (gethash func macher-agent-sandbox--functions))))
 
               (cond
                ((and (fboundp 'macher-agent--ptc-primitive-p)
@@ -212,7 +214,6 @@ EVAL-ARGS is the list of evaluated argument values.
 
 Return the result of invoking FUNC with EVAL-ARGS.
 Side effects: May yield an interrupt or mutate global sandbox state."
-            ;;(message func)
             (cond
              ((and (consp func) (eq (car func) 'closure))
               (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))
@@ -294,14 +295,16 @@ Side effects: May mutate global sandbox state during evaluation."
 (iter-defun macher-agent-sandbox--eval-setq-iter (args env)
             "Evaluate setq form ARGS in ENV.
 
-Assign values to variable symbols pair by pair in ARGS, updating lexical
-binding in ENV if present, or setting global sandbox variable otherwise.
+Assign values to variable symbols pair by pair in ARGS, updating
+lexical binding in ENV if present, or setting global sandbox
+variable otherwise.
 
 ARGS is a list of alternating VAR RHS expressions.
 ENV is the current lexical environment alist.
 
 Return the value assigned to the final variable.
-Side effects: Mutates variable bindings in ENV or `macher-agent-sandbox--globals`."
+Side effects: Mutates variable bindings in ENV
+or `macher-agent-sandbox--globals`."
             (let ((val nil))
               (while args
                 (let* ((var (pop args))
@@ -353,7 +356,8 @@ Side effects: May yield tool call interrupts or mutate global sandbox state."
 
 (defvar-local macher-agent-sandbox--special-forms
   `((quote . ,(iter-lambda (args _env) (car args)))
-    (mapcar . ,(iter-lambda (args env) (iter-yield-from (macher-agent-sandbox--eval-mapcar-iter args env))))
+    (mapcar . ,(iter-lambda (args env)
+                            (iter-yield-from (macher-agent-sandbox--eval-mapcar-iter args env))))
     (mapc . ,(iter-lambda (args env) (iter-yield-from (macher-agent-sandbox--eval-mapc-iter args env))))
     (function . ,(iter-lambda (args env)
                               (let ((fn-target (car args)))
@@ -379,7 +383,8 @@ Side effects: May yield tool call interrupts or mutate global sandbox state."
                                 (matched nil))
                             (while (and args (not matched))
                               (let* ((clause (pop args))
-                                     (cond-val (iter-yield-from (macher-agent-sandbox--eval-iter (car clause) env))))
+                                     (cond-val
+                                      (iter-yield-from (macher-agent-sandbox--eval-iter (car clause) env))))
                                 (when cond-val
                                   (setq matched t)
                                   (if (cdr clause)
@@ -405,11 +410,13 @@ Side effects: May yield tool call interrupts or mutate global sandbox state."
                                 func-name)))
     (funcall . ,(iter-lambda (args env)
                              (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
-                                   (eval-args (iter-yield-from (macher-agent-sandbox--eval-args-iter (cdr args) env))))
+                                   (eval-args
+                                    (iter-yield-from (macher-agent-sandbox--eval-args-iter (cdr args) env))))
                                (iter-yield-from (macher-agent-sandbox--funcall-iter func eval-args)))))
     (apply . ,(iter-lambda (args env)
                            (let* ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
-                                  (eval-args (iter-yield-from (macher-agent-sandbox--eval-args-iter (cdr args) env)))
+                                  (eval-args
+                                   (iter-yield-from (macher-agent-sandbox--eval-args-iter (cdr args) env)))
                                   (final-args (append (butlast eval-args) (car (last eval-args)))))
                              (iter-yield-from (macher-agent-sandbox--funcall-iter func final-args)))))
     (condition-case . ,(iter-lambda (args env)
@@ -431,7 +438,9 @@ Side effects: May yield tool call interrupts or mutate global sandbox state."
                                                (let ((new-env (if var (cons (cons var err) env) env))
                                                      (result nil))
                                                  (dolist (form (cdr matched-handler) result)
-                                                   (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env)))))
+                                                   (setq result
+                                                         (iter-yield-from
+                                                          (macher-agent-sandbox--eval-iter form new-env)))))
                                              (signal (car err) (cdr err)))))))))
     (unwind-protect . ,(iter-lambda (args env)
                                     (unwind-protect

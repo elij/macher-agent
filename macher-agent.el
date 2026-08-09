@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.0.87
+;; Version: 0.8.0.92
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -20,27 +20,20 @@
 (require 'gptel)
 (require 'project)
 
-(require 'macher-agent-api)
-(require 'macher-agent-vfs-client)
-(require 'macher-agent-orchestration)
-(require 'macher-agent-gptel-bridge)
-(require 'macher-agent-gptel-tools)
+(require 'macher-agent-core)
 (require 'macher-agent-sandbox)
+(require 'macher-agent-vfs-client)
+(require 'macher-agent-presets)
+(require 'macher-agent-macher-bridge)
+(require 'macher-agent-gptel-bridge)
+(require 'macher-agent-orchestration)
+(require 'macher-agent-gptel-tools)
+(require 'macher-agent-api)
 
 (defgroup macher-agent nil
   "Agent tools within the macher edit context."
   :group 'gptel
   :prefix "macher-agent-")
-
-(defvar macher-agent-active-subagents nil
-  "Store active sub-agents and their locked directories as an alist.
-
-Each entry is a cell mapping sub-agent buffer instances or identifiers
-to their designated sandbox directory paths.
-
-Return an association list mapping sub-agent buffers to sandbox paths, or nil.
-
-Side effects: Global variable storing active sub-agent mappings.")
 
 (defun macher-agent-inject-thought (instruction)
   "Inject a user directive while the agent is processing a tool.

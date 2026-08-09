@@ -18,6 +18,39 @@ The integration with gptel isolates setting changes to within a workspace. It ad
 
 The default context is orphaned as it is inaccessible within a capture block. All macher tools and patch generation processes are wrapped to inject a macher-agent accessible context, ensuring hydration of the Virtual File System works for disk-based tools. Macher generates diffs for both buffer changes and file changes as 2 different unified diffs. The Virtual File System is persistent until it is cleared, applied, or invalidated (by modifications outside Emacs). When subagents are spawned, they operate on a sibling Virtual File System until they are terminated.
 
+## Memory Recall
+
+### Macher Agent Zero-Mem Benchmarks (100k tokens)
+
+Memory recall beyond the `gptel-max-tokens` event horizon via the `search_conversation` tool
+
+1000 Traces
+
+| Engine          | Time       | GC Cycles | GC Time    |
+|-----------------|------------|-----------|------------|
+| Float PPR       | 0.050142 s | 2         | 0.034173 s |
+| Fixed-Point PPR | 0.028505 s | 1         | 0.016375 s |
+| Glob            | 0.000026 s | 0         | 0          |
+
+5000 Traces
+
+| Engine          | Time       | GC Cycles | GC Time    |
+|-----------------|------------|-----------|------------|
+| Float PPR       | 0.277900 s | 11        | 0.200374 s |
+| Fixed-Point PPR | 0.142280 s | 5         | 0.092353 s |
+| Glob            | 0.000062 s | 0         | 0          |
+
+10000 Traces
+
+| Engine          | Time       | GC Cycles | GC Time    |
+|-----------------|------------|-----------|------------|
+| Float PPR       | 0.589837 s | 20        | 0.429688 s |
+| Fixed-Point PPR | 0.293908 s | 9         | 0.197646 s |
+| Glob            | 0.000115 s | 0         | 0          |
+
+[Zero-Mem](https://arxiv.org/abs/2607.29377)
+[BEAM](https://arxiv.org/pdf/2510.27246)
+
 ## Installation
 
 ### Dependencies

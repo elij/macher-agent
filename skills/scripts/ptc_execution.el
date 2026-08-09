@@ -10,13 +10,11 @@ spawn sub-agents, and handle complex asynchronous workflows in a single step."
      :description "The Emacs Lisp script to execute. Use standard let*, mapcar, dolist, \
 and permitted tool primitives."))
   :command-fn
-  (lambda (payload _context _root)
+  (lambda (payload context _root callback)
     (if-let*
         ((script (plist-get payload :script)))
-        (make-macher-agent-ptc-response
-         :payload script
-         :primitives
-         '(
-           nreverse sort delete delq nconc plist-put aset puthash remhash
-           error signal message random emacs-version))
+        (macher-agent-execute-ptc-script
+         script context
+         (lambda (res) (funcall callback res))
+         (lambda (err) (funcall callback err)))
       (error "No script provided for PTC execution"))))
