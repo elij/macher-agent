@@ -507,6 +507,10 @@ Side effects: None."
   (cond
    ((and (fboundp 'gptel-tool-p) (gptel-tool-p sym))
     (cons 'tool sym))
+   ((and (consp sym) (keywordp (car sym)))
+    (if (or (plist-member sym :function) (plist-member sym :args))
+        (cons 'tool sym)
+      (cons 'preset sym)))
    (t
     (when-let* ((clean-sym (macher-normalise-preset-name sym)))
       (if-let*
