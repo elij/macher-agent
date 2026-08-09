@@ -3,7 +3,8 @@
 (require 'buttercup)
 (require 'macher-agent-macher-bridge)
 (require 'macher-agent)
-(let ((current-dir (file-name-directory (or load-file-name buffer-file-name))))
+(let* ((file-name (or load-file-name buffer-file-name))
+       (current-dir (if file-name (file-name-directory file-name) default-directory)))
   (add-to-list 'load-path (expand-file-name "helpers" current-dir)))
 
 (require 'macher-agent-test-harness)
@@ -15,13 +16,12 @@
   "Orchestration Tools (skills/scripts/*.el)"
   (before-all
    ;; Load all tool scripts to define their variables for testing
-   (dolist (script (directory-files "skills/scripts" t "\\.el$"))
-     (with-temp-buffer
-       (insert-file-contents script)
-       (let ((val nil))
-         (condition-case nil
-             (while t (setq val (eval (read (current-buffer)) t)))
-           (end-of-file val))))))
+   (let* ((file-name (or load-file-name buffer-file-name))
+          (test-dir (if file-name (file-name-directory file-name) default-directory))
+          (root-dir (or (locate-dominating-file test-dir "skills") test-dir))
+          (scripts-dir (expand-file-name "skills/scripts" root-dir)))
+     (dolist (script (directory-files scripts-dir t "\\.el$"))
+       (load script nil t))))
   (it "guarantees list_buffers_in_workspace output perfectly matches context-tree buffer categorisation"
       (let*
           ((ctx
@@ -222,14 +222,152 @@
       (let* ((ws (make-macher-agent-workspace :project-root default-directory))
              (ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
              (write-fn (gptel-tool-function macher-agent-write-buffer-in-workspace-tool))
-             (search-fn (gptel-tool-function macher-agent-search-in-workspace-tool)))
+             (cmd-fn (or (get 'macher-agent-search-in-workspace-tool 'command-fn)
+                         (get 'macher-agent-tool-search-in-workspace 'command-fn))))
         (spy-on 'macher-agent-resolve-context :and-return-value ctx)
         (spy-on 'call-process :and-return-value 0)
         (with-macher-agent-mock-fsm ctx
                                     (funcall write-fn nil "vfs-search-target.txt" "unique-vfs-search-token line")
-                                    (let ((res (funcall search-fn nil "unique-vfs-search-token")))
+                                    (let ((res (funcall cmd-fn '(:pattern "unique-vfs-search-token") ctx default-directory)))
                                       (expect res :to-match "vfs-search-target\\.txt")
-                                      (expect res :to-match "unique-vfs-search-token line"))))))
+                                      (expect res :to-match "unique-vfs-search-token line")))))
+
+  (it "list_available_tools filters tools to only perception, collaboration, event, execution categories and includes workspace tools"
+      (let* ((global-reg (make-hash-table :test 'equal))
+             (tool-perception (gptel-make-tool :name "tool-perc" :description "perception tool" :category "perception"))
+             (tool-collab (gptel-make-tool :name "tool-collab" :description "collaboration tool" :category "collaboration"))
+             (tool-event (gptel-make-tool :name "tool-event" :description "event tool" :category "event"))
+             (tool-exec (gptel-make-tool :name "tool-exec" :description "execution tool" :category "execution"))
+             (tool-other (gptel-make-tool :name "tool-other" :description "conversation tool" :category "conversation"))
+             (tool-none (gptel-make-tool :name "tool-none" :description "uncategorized tool" :category "misc"))
+             (tool-ws (gptel-make-tool :name "tool-workspace" :description "workspace tool" :category "perception"))
+             (ws (make-macher-agent-workspace :project-root default-directory))
+             (ctx (macher-agent--make-vfs-context :workspace ws :contents nil))
+             (list-fn (gptel-tool-function macher-agent-list-available-tools-tool)))
+        (puthash "tool-perc" tool-perception global-reg)
+        (puthash "tool-collab" tool-collab global-reg)
+        (puthash "tool-event" tool-event global-reg)
+        (puthash "tool-exec" tool-exec global-reg)
+        (puthash "tool-other" tool-other global-reg)
+        (puthash "tool-none" tool-none global-reg)
+        (puthash "tool-workspace" tool-ws (macher-agent-workspace-tools-registry ws))
+        (let ((macher-agent-tools-registry global-reg))
+          (let ((res (funcall list-fn nil ctx)))
+            (expect res :to-match "tool-perc")
+            (expect res :to-match "tool-collab")
+            (expect res :to-match "tool-event")
+            (expect res :to-match "tool-exec")
+            (expect res :to-match "tool-workspace")
+            (expect res :not :to-match "tool-other")
+            (expect res :not :to-match "tool-none")))))
+
+  (it "searches conversation history via glob search"
+      (let ((buf (generate-new-buffer "test-conv-glob")))
+        (with-current-buffer buf
+          (insert "Line 1: system start\nLine 2: important keyword found\nLine 3: system end\n"))
+        (let ((res (macher-agent-search-glob "keyword" buf 1)))
+          (expect res :to-match "Match near line 2")
+          (expect res :to-match "important keyword found"))
+        (let ((res-none (macher-agent-search-glob "nonexistent" buf 1)))
+          (expect res-none :to-match "No matches found in history for: nonexistent"))
+        (kill-buffer buf)))
+
+  (it "converts buffer lines into zero-mem trace plists"
+      (let ((buf (generate-new-buffer "test-conv-traces")))
+        (with-current-buffer buf
+          (insert "First trace line\n\nSecond trace line\n"))
+        (let ((traces (macher-agent--buffer-to-traces buf)))
+          (expect (length traces) :to-equal 2)
+          (expect (plist-get (nth 0 traces) :text) :to-equal "First trace line")
+          (expect (plist-get (nth 0 traces) :timestamp) :to-equal 1.0)
+          (expect (plist-get (nth 1 traces) :text) :to-equal "Second trace line")
+          (expect (plist-get (nth 1 traces) :timestamp) :to-equal 3.0))
+        (kill-buffer buf)))
+
+  (it "searches conversation history via zero-mem PageRank search"
+      (let ((buf (generate-new-buffer "test-conv-zeromem")))
+        (with-current-buffer buf
+          (insert "Trace 1: macher-agent initialization\nTrace 2: gptel-bridge configuration\nTrace 3: random text\n"))
+        (let ((res (macher-agent-search-zero-mem "macher-agent" buf 2)))
+          (expect res :to-match "Match near line 1")
+          (expect res :to-match "macher-agent initialization"))
+        (kill-buffer buf)))
+
+  (it "defaults macher-agent-search-backend to zero-mem"
+      (expect (default-value 'macher-agent-search-backend) :to-equal 'zero-mem))
+
+  (it "dispatches search based on macher-agent-search-backend configuration"
+      (let ((buf (generate-new-buffer "test-conv-dispatch"))
+            (macher-agent-search-backend 'glob))
+        (with-current-buffer buf
+          (insert "Header text\nTarget query inside history\nFooter text\n"))
+        (spy-on 'macher-agent-search-glob :and-call-through)
+        (spy-on 'macher-agent-search-zero-mem :and-call-through)
+        
+        ;; Test glob backend
+        (let ((res-glob (macher-agent-search-dispatch "query" buf 2)))
+          (expect 'macher-agent-search-glob :to-have-been-called)
+          (expect res-glob :to-match "Target query inside history"))
+        
+        ;; Test zero-mem backend
+        (setq macher-agent-search-backend 'zero-mem)
+        (let ((res-zm (macher-agent-search-dispatch "query" buf 2)))
+          (expect 'macher-agent-search-zero-mem :to-have-been-called)
+          (expect res-zm :to-match "Target query inside history"))
+        
+        ;; Test dead buffer error handling
+        (kill-buffer buf)
+        (expect (macher-agent-search-dispatch "query" buf 2) :to-match "Error: Cannot locate original conversation buffer.")))
+
+  (it "executes search_conversation_history tool via dispatcher without inline loops or persistent global mutation"
+      (let* ((buf (generate-new-buffer "test-conv-tool"))
+             (ctx (macher--make-context))
+             (mock-fsm (if (fboundp 'gptel-make-fsm)
+                           (gptel-make-fsm :info (list :buffer buf :macher-agent-context ctx))
+                         (list :buffer buf :macher-agent-context ctx)))
+             (macher-agent--active-fsm mock-fsm)
+             (cmd-fn (or (get 'macher-agent-search-conversation-history-tool 'command-fn)
+                         (get 'macher-agent-tool-search-conversation-history 'command-fn)))
+             (macher-agent-search-backend 'glob))
+        (with-current-buffer buf
+          (insert "Line 1: hello\nLine 2: target-match\nLine 3: world\n"))
+        (spy-on 'macher-agent-search-dispatch :and-call-through)
+        (let ((res (funcall cmd-fn '(:query "target-match" :context_lines 1) ctx default-directory)))
+          (expect 'macher-agent-search-dispatch :to-have-been-called)
+          (expect res :to-match "target-match"))
+        (kill-buffer buf)))
+
+  (it "retrieves conversation buffer from context in search_conversation_history tool"
+      (let* ((buf (generate-new-buffer "test-conv-ctx"))
+             (mock-fsm (if (fboundp 'gptel-make-fsm)
+                           (gptel-make-fsm :info (list :buffer buf))
+                         (list :buffer buf)))
+             (ctx (macher-agent--make-vfs-context :workspace (make-macher-agent-workspace :project-root default-directory)
+                                                  :contents nil))
+             (cmd-fn (or (get 'macher-agent-search-conversation-history-tool 'command-fn)
+                         (get 'macher-agent-tool-search-conversation-history 'command-fn)))
+             (macher-agent-search-backend 'glob)
+             (macher-agent--active-fsm nil))
+        (with-current-buffer buf
+          (insert "Line 1: foo\nLine 2: context-buffer-match\nLine 3: bar\n"))
+        (macher-agent--set-context-data ctx :fsm mock-fsm)
+        (let ((res (funcall cmd-fn '(:query "context-buffer-match" :context_lines 1) ctx default-directory)))
+          (expect res :to-match "context-buffer-match"))
+        (kill-buffer buf)))
+
+  (it "handles zero-length matches and invalid-regexp safely in search_glob"
+      (let ((buf (generate-new-buffer "test-conv-edge")))
+        (with-current-buffer buf
+          (insert "Line 1\nLine 2\n"))
+        ;; Test zero-length match (e.g., "^" or ".*") does not infinite loop
+        (let ((res (macher-agent-search-glob "^" buf 1)))
+          (expect res :to-match "Match near line 1"))
+        ;; Test invalid regexp handling
+        (let ((res-err (macher-agent-search-glob "[unclosed" buf 1)))
+          (expect res-err :to-match "Error: Invalid regular expression"))
+        (kill-buffer buf)))
+
+  )
 
  (describe "Agent Skills (macher-agent-skills.el)"
            (before-each
@@ -237,6 +375,7 @@
                    (ctx (macher-agent--make-vfs-context :workspace ws :contents nil)))
               (puthash (expand-file-name "/mock/proj") ctx macher-agent-active-workspaces)
               (spy-on 'macher-agent-resolve-context :and-return-value ctx)))
+           
            (it "parses SKILL.md files correctly extracting frontmatter and markdown body"
                (let* ((parsed (macher-agent-parse-skill-file "tests/fixtures/skills/global/SKILL.md")))
                  (expect (plist-get parsed :name) :to-equal "mock-skill")
@@ -475,7 +614,11 @@
                                         (list :known-presets gptel--known-presets)
                                         '(my-ptc-preset))))
                          (expect (plist-get composed :ptc-primitives) :to-equal '(spawn_subagent delegate_tasks))))
-                     (delete-directory mock-dir t)))))))
+                     (delete-directory mock-dir t)))))
+
+           )
+
+ )
 
 (provide 'macher-agent-skills-test)
 ;;; macher-agent-skills-test.el ends here

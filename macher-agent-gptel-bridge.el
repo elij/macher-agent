@@ -17,6 +17,8 @@
 
 (defvar gptel-system-prompt)
 (defvar macher-agent-active-workspaces)
+(defvar macher-agent-token-multiplier 4
+  "Estimated characters per token used for context truncation.")
 
 (defcustom macher-agent-prompt-transformers
   '(macher-agent-transformer-deduplicate-tools)
@@ -39,52 +41,6 @@ Return maximum allowed duplicate tool calls integer.
 Side effects: None."
   :type 'integer
   :group 'macher-agent)
-
-(defcustom macher-agent-max-context-chars '((nil . 2000000))
-  "Alist mapping model symbols to maximum character length of context history.
-
-The symbol nil acts as default fallback limit.
-Actual length will snap to nearest safe message turn boundary.
-
-Return alist mapping model symbols to integer character limits.
-Side effects: None."
-  :type '(alist :key-type (choice (const :tag "Default fallback" nil) symbol)
-                :value-type integer)
-  :group 'macher-agent)
-
-(defun macher-agent--get-max-context-chars ()
-  "Return maximum context character limit for current model.
-
-Resolve limit based on `gptel-model' symbol, `macher-agent-max-context-chars'
-alist, and `macher-agent-resolve-backend-and-model'.
-
-Return integer character limit or nil.
-Side effects: None."
-  (if (numberp macher-agent-max-context-chars)
-      macher-agent-max-context-chars
-    (when (listp macher-agent-max-context-chars)
-      (let* ((model (bound-and-true-p gptel-model))
-             (model-sym (cond ((symbolp model) model)
-                              ((stringp model) (intern model))
-                              (t nil)))
-             (model-str (cond ((stringp model) model)
-                              ((symbolp model) (symbol-name model))
-                              (t nil)))
-             (resolved-pair
-              (when model (ignore-errors (macher-agent-resolve-backend-and-model model))))
-             (resolved-raw (cdr resolved-pair))
-             (resolved-sym (cond ((symbolp resolved-raw) resolved-raw)
-                                 ((stringp resolved-raw) (intern resolved-raw))
-                                 (t nil)))
-             (resolved-str (cond ((stringp resolved-raw) resolved-raw)
-                                 ((symbolp resolved-raw) (symbol-name resolved-raw))
-                                 (t nil)))
-             (candidates (delete-dups
-                          (delq nil (list model-sym model-str resolved-sym resolved-str))))
-             (cell (or (cl-some (lambda (k) (assoc k macher-agent-max-context-chars))
-                                candidates)
-                       (assoc nil macher-agent-max-context-chars))))
-        (cdr cell)))))
 
 ;;; Programmatic Tool Calling (PTC)
 
@@ -350,9 +306,10 @@ _FSM is the finite-state machine object.
 
 Return nil.
 Side effects: Truncates context history in temporary prompt buffer."
-  (let ((max-chars (macher-agent--get-max-context-chars)))
-    (when (and (numberp max-chars)
-               (> (buffer-size) max-chars))
+  (let* ((token-limit (or (bound-and-true-p gptel-max-tokens) 2048))
+         (max-chars (* token-limit macher-agent-token-multiplier)))
+
+    (when (> (buffer-size) max-chars)
       (save-excursion
         (goto-char (point-min))
         (let ((safe-min (point-min)))
@@ -565,9 +522,11 @@ Side effects: None."
     (payload orig-buf _presets _skills _redirected-skill)
   "Inject dynamic context tools into PAYLOAD if ORIG-BUF buffer
 size exceeds limits."
-  (let ((buf-size (with-current-buffer orig-buf (buffer-size)))
-        (max-chars (with-current-buffer orig-buf (macher-agent--get-max-context-chars))))
-    (when (and (numberp max-chars) (> buf-size max-chars))
+  (let* ((token-limit (with-current-buffer orig-buf
+                        (or (bound-and-true-p gptel-max-tokens) 2048)))
+         (max-chars (* token-limit macher-agent-token-multiplier))
+         (buf-size (with-current-buffer orig-buf (buffer-size))))
+    (when (> buf-size max-chars)
       (let ((mem-tool (ignore-errors
                         (macher-agent-resolve-tool "search_conversation_history" nil nil nil))))
         (when (macher-tool-valid-p mem-tool)

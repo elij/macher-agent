@@ -65,52 +65,52 @@ Returns a list of raw trace plists for the graph engine."
         (id-counter 0))
     (with-current-buffer target-buffer
       (erase-buffer))
-    
+
     ;; Insert file into a temporary buffer to use the fast native C parser
     (let ((data (with-temp-buffer
                   (insert-file-contents filepath)
                   (goto-char (point-min))
                   (json-parse-buffer :object-type 'alist :array-type 'list))))
-      
+
       (catch 'limit-reached
         ;; Iterate through the root array of batch objects
         (dolist (batch data)
           (let ((turns (alist-get 'turns batch)))
-            
+
             ;; Iterate through the conversational turns
             (dolist (turn turns)
               (dolist (message turn)
                 (let ((role (alist-get 'role message))
                       (content (alist-get 'content message)))
-                  
+
                   ;; Isolate the user and assistant roles
-                  (when (and (stringp role) 
+                  (when (and (stringp role)
                              (stringp content)
                              (or (string= role "user") (string= role "assistant")))
-                    
+
                     ;; Split the content block into individual lines
                     (dolist (line (split-string content "\n"))
                       (let ((trimmed-line (string-trim line)))
-                        
+
                         ;; Ignore empty lines to prevent blank nodes in the graph
                         (unless (string-empty-p trimmed-line)
                           (when (>= id-counter limit)
                             (throw 'limit-reached t))
-                          
+
                           (let ((trace (list :text trimmed-line
                                              :timestamp (float id-counter)
                                              :metadata (list :source filepath
                                                              :role role
                                                              :index id-counter))))
-                            
+
                             ;; Insert the line into the buffer for the naive glob
                             (with-current-buffer target-buffer
                               (insert trimmed-line "\n"))
-                            
+
                             ;; Store the trace for the graph engine
                             (push trace traces)
                             (setq id-counter (1+ id-counter))))))))))))))
-    
+
     (nreverse traces)))
 
 ;; 5. The interactive benchmark command
@@ -120,7 +120,7 @@ Returns a list of raw trace plists for the graph engine."
   (let ((sizes '(1000 5000 10000))
         (query param)
         (results-buf (get-buffer-create "*Macher Intensive Benchmarks*")))
-    
+
     (with-current-buffer results-buf
       (erase-buffer)
       (insert "Macher Agent Zero-Mem Intensive Benchmarks\n")
@@ -130,45 +130,45 @@ Returns a list of raw trace plists for the graph engine."
       (let* ((test-buf (generate-new-buffer " *macher-test-heavy*"))
              (traces (macher-agent-zero-mem-load-corpus-from-disk "chat.json" test-buf size))
              (graph (macher-agent-zero-mem-build-graph traces)))
-        
+
         (with-current-buffer results-buf
           (insert (format "Corpus Size: %d Traces\n" size)
                   "--------------------------------------------------\n"))
-        
+
         ;; Measure Float PPR
         (macher-agent-zero-mem-test-isolate-environment)
-        (let* ((float-metrics (macher-agent-zero-mem-test-measure-execution 
+        (let* ((float-metrics (macher-agent-zero-mem-test-measure-execution
                                (lambda () (macher-agent-zero-mem-retrieve query graph :top-k 5 :iterations 15 :algorithm 'float))))
                (ft (plist-get float-metrics :total-time))
                (fgc (plist-get float-metrics :gc-cycles))
                (fgctime (plist-get float-metrics :gc-time)))
           (with-current-buffer results-buf
             (insert (format "Float PPR       | Time: %9.6f s | GC Cycles: %3d | GC Time: %9.6f s\n" ft fgc fgctime))))
-        
+
         ;; Measure Fixed-Point PPR
         (macher-agent-zero-mem-test-isolate-environment)
-        (let* ((fp-metrics (macher-agent-zero-mem-test-measure-execution 
+        (let* ((fp-metrics (macher-agent-zero-mem-test-measure-execution
                             (lambda () (macher-agent-zero-mem-retrieve query graph :top-k 5 :iterations 15 :algorithm 'fixed-point))))
                (fpt (plist-get fp-metrics :total-time))
                (fpgc (plist-get fp-metrics :gc-cycles))
                (fpgctime (plist-get fp-metrics :gc-time)))
           (with-current-buffer results-buf
             (insert (format "Fixed-Point PPR | Time: %9.6f s | GC Cycles: %3d | GC Time: %9.6f s\n" fpt fpgc fpgctime))))
-        
+
         ;; Measure Naive Glob
         (macher-agent-zero-mem-test-isolate-environment)
-        (let* ((glob-metrics (macher-agent-zero-mem-test-measure-execution 
+        (let* ((glob-metrics (macher-agent-zero-mem-test-measure-execution
                               (lambda () (macher-agent-zero-mem-test-naive-glob query test-buf 5))))
                (gt (plist-get glob-metrics :total-time))
                (ggc (plist-get glob-metrics :gc-cycles)))
           (with-current-buffer results-buf
             (insert (format "Naive Glob      | Time: %9.6f s | GC Cycles: %3d\n" gt ggc))))
-        
+
         (with-current-buffer results-buf
           (insert "\n"))
-        
+
         (kill-buffer test-buf)))
-    
+
     (pop-to-buffer results-buf)))
 
 ;; 6. Interactive query inspection

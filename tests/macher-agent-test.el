@@ -450,30 +450,6 @@
 
             (describe
              "Model-Specific Context Character Limits"
-             (it "resolves model-specific character limits from macher-agent-max-context-chars alist"
-                 (let ((macher-agent-max-context-chars '((gpt-4o . 500000) (claude-3-5-sonnet . 1000000) (nil . 2000000)))
-                       (gptel-model 'gpt-4o))
-                   (expect (macher-agent--get-max-context-chars) :to-equal 500000))
-                 (let ((macher-agent-max-context-chars '((gpt-4o . 500000) (claude-3-5-sonnet . 1000000) (nil . 2000000)))
-                       (gptel-model 'claude-3-5-sonnet))
-                   (expect (macher-agent--get-max-context-chars) :to-equal 1000000)))
-
-             (it "falls back to nil key when model symbol is not explicitly mapped"
-                 (let ((macher-agent-max-context-chars '((gpt-4o . 500000) (nil . 2000000)))
-                       (gptel-model 'unknown-model))
-                   (expect (macher-agent--get-max-context-chars) :to-equal 2000000)))
-
-             (it "resolves model via macher-agent-resolve-backend-and-model when alias symbol is used"
-                 (let ((macher-agent-max-context-chars '((gpt-4o . 300000) (nil . 2000000)))
-                       (gptel-model 'custom-gpt4-alias))
-                   (spy-on 'macher-agent-resolve-backend-and-model :and-return-value '(mock-backend . gpt-4o))
-                   (expect (macher-agent--get-max-context-chars) :to-equal 300000)))
-
-             (it "supports backward compatibility if macher-agent-max-context-chars is a number"
-                 (let ((macher-agent-max-context-chars 150000)
-                       (gptel-model 'gpt-4o))
-                   (expect (macher-agent--get-max-context-chars) :to-equal 150000)))
-
              (it "truncates context history using model-specific alist limits"
                  (with-temp-buffer
                    (insert "Early user prompt content\n")
