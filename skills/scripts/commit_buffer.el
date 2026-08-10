@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
  macher-agent-commit-buffer-tool
  "Directly appends an Emacs buffer and synchronise the agent's memory immediately, \

@@ -27,8 +27,7 @@
   :group 'macher-agent-zero-mem)
 
 (defcustom macher-agent-zero-mem-entity-transition-ratio 0.7
-  "Ratio of document transitions allocated to entities vs temporal
-neighbors (E_dd)."
+  "Ratio of document transitions vs temporal neighbors (E_dd)."
   :type 'float
   :group 'macher-agent-zero-mem)
 
@@ -46,7 +45,7 @@ neighbors (E_dd)."
 
 (defun macher-agent-zero-mem-naive-ner (text)
   "Extract entity strings from TEXT using deterministic heuristic rules [28].
-Returns a deduplicated list of lowercase strings representing the entities."
+Return a deduplicated list of lowercase strings representing the entities."
   (let ((case-fold-search nil) ; Case-sensitive matching
         (entities nil))
     (with-temp-buffer
@@ -97,7 +96,7 @@ Returns a deduplicated list of lowercase strings representing the entities."
   "Build the relational trace graph from a list of plist raw traces TRACES-RAW.
 TRACES-RAW should be a list of plists
 example (:text \"text\" :timestamp 1.0 :metadata plist).
-Returns a `macher-agent-zero-mem-graph' struct."
+Return a `macher-agent-zero-mem-graph' struct."
   (let* ((traces (make-hash-table :test 'equal))
          (entity-index (make-hash-table :test 'equal))
          (adj-list (make-hash-table :test 'equal))
@@ -179,8 +178,8 @@ Returns a `macher-agent-zero-mem-graph' struct."
 ;;;; 3. Query Alignment & PageRank Diffusion
 
 (defun macher-agent-zero-mem-align-query (query graph)
-  "Extract and align query entities with the GRAPH's Entity nodes [35].
-Returns an association list of (EntityNode . ActivationScore)."
+  "Extract and align QUERY entities with GRAPH's Entity nodes [35].
+Return an association list of (EntityNode . ActivationScore)."
   (let* ((q-entities (macher-agent-zero-mem-naive-ner query))
          (aligned-activations nil))
     (dolist (q-ent q-entities)
@@ -198,10 +197,9 @@ Returns an association list of (EntityNode . ActivationScore)."
     aligned-activations))
 
 (defun macher-agent-zero-mem-pagerank-float (query graph &optional iterations)
-  "Compute the Stationary Personalised PageRank distribution over the GRAPH [37].
-ITERATIONS defaults to 15. Returns a hash table mapping nodes to their PageRank
-score.
-Argument QUERY criteria."
+  "Compute Stationary Personalised PageRank for QUERY over GRAPH.
+ITERATIONS defaults to 15.  Return a hash table mapping nodes to
+PageRank scores."
   (let* ((iters (or iterations 15))
          (gamma macher-agent-zero-mem-damping-factor)
          (pi-table (make-hash-table :test 'equal))
@@ -295,8 +293,10 @@ fixed-point arithmetic.")
 
 (defun macher-agent-zero-mem--compile-transitions (adj-list node-to-idx count)
   "Compile ADJ-LIST into a vector of transitions using fixed-point weights.
-Argument NODE-TO-IDX node index.
-Argument COUNT total."
+
+ADJ-LIST is the adjacency list hash table.
+NODE-TO-IDX is the node-to-index mapping hash table.
+COUNT is the total node count."
   (let ((transitions (make-vector count nil)))
     (maphash
      (lambda (u-node trans-list)
@@ -311,7 +311,8 @@ Argument COUNT total."
     transitions))
 
 (defun macher-agent-zero-mem--init-reset-vector (query graph nodes node-to-idx count)
-  "Initialise the vectorised reset distribution."
+  "Initialise vectorised reset distribution for QUERY on GRAPH.
+Use NODES, NODE-TO-IDX, and COUNT."
   (let ((reset-array (make-vector count 0))
         (alignments (macher-agent-zero-mem-align-query query graph)))
     (let ((align-sum (cl-loop for (_node . val) in alignments sum val)))
@@ -340,7 +341,8 @@ Argument COUNT total."
     reset-array))
 
 (defun macher-agent-zero-mem--pr-tick (ctx gamma-fp one-minus-gamma-fp)
-  "Vectorised, allocation-free hot loop iteration for PageRank."
+  "Vectorised, allocation-free hot loop iteration for PageRank.
+Use CTX, GAMMA-FP, and ONE-MINUS-GAMMA-FP."
   (let* ((count (macher-agent-zero-mem-pr-ctx-node-count ctx))
          (pi-array (macher-agent-zero-mem-pr-ctx-pi-array ctx))
          (next-array (macher-agent-zero-mem-pr-ctx-next-array ctx))
@@ -370,7 +372,7 @@ Argument COUNT total."
     (setf (macher-agent-zero-mem-pr-ctx-next-array ctx) tmp)))
 
 (defun macher-agent-zero-mem--export-scores (ctx)
-  "Convert the vectorised pi-array back to a float-based hash table."
+  "Convert the vectorised pi-array in CTX back to a float-based hash table."
   (let* ((count (macher-agent-zero-mem-pr-ctx-node-count ctx))
          (pi-array (macher-agent-zero-mem-pr-ctx-pi-array ctx))
          (nodes-array (macher-agent-zero-mem-pr-ctx-nodes-array ctx))
@@ -381,9 +383,9 @@ Argument COUNT total."
     result-table))
 
 (defun macher-agent-zero-mem-pagerank-fixed-point (query graph &optional iterations)
-  "Compute Stationary Personalised PageRank using refactored allocation-free
-vector-driven fixed-point arithmetic. ITERATIONS defaults to 15. Returns a
-hash table mapping nodes to PageRank scores."
+  "Compute Stationary Personalised PageRank for QUERY on GRAPH.
+Use fixed-point arithmetic.  ITERATIONS defaults to 15.  Return a hash table
+mapping nodes to PageRank scores."
   (let* ((iters (or iterations 15))
          (gamma-fp (round (* macher-agent-zero-mem-damping-factor macher-agent-zero-mem-pr-scale)))
          (one-minus-gamma-fp (- macher-agent-zero-mem-pr-scale gamma-fp))
@@ -424,9 +426,10 @@ hash table mapping nodes to PageRank scores."
 ;;;; 4. Dual-View Evidence Retrieval and Fusion
 
 (cl-defun macher-agent-zero-mem-retrieve (query graph &key (top-k 5) (iterations 15) (algorithm 'fixed-point))
-  "Execute the Dual-View Evidence retrieval and closure pipeline [41, 42].
+  "Execute Dual-View Evidence retrieval for QUERY on GRAPH.
+ITERATIONS specifies the number of PageRank diffusion iterations.
 ALGORITHM specifies PageRank implementation: `fixed-point' (default) or `float'.
-Returns the top-K highest-ranked `macher-agent-zero-mem-trace' structs."
+Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
   (let* ((pi-table (if (eq algorithm 'float)
                        (macher-agent-zero-mem-pagerank-float query graph iterations)
                      (macher-agent-zero-mem-pagerank-fixed-point query graph iterations)))

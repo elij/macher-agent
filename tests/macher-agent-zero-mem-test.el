@@ -1,4 +1,4 @@
-;;; macher-agent-zero-mem-test.el --- Benchmark & Unit Tests for Macher Agent Zero-Mem -*- lexical-binding: t -*-
+;;; macher-agent-zero-mem-test.el --- Benchmark & Unit Tests for Macher Agent Zero-Mem -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;

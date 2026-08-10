@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-wait-for-vfs-semaphore
     "Suspends the agent until the specified file or buffer is created or modified in the virtual file system."

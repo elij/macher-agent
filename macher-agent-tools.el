@@ -1,4 +1,4 @@
-;;; macher-agent-gptel-tools.el --- Pure gptel orchestration tools -*- lexical-binding: t; -*-
+;;; macher-agent-tools.el --- Pure gptel orchestration tools -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
@@ -6,16 +6,14 @@
 
 ;;; Code:
 
-(require 'macher)
 (require 'json)
 (require 'cl-lib)
 (require 'map)
 (require 'transient)
 (require 'subr-x)
-(require 'gptel)
 (require 'macher-agent-core)
 (require 'macher-agent-sandbox)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-vfs)
 (require 'macher-agent-presets)
 (require 'macher-agent-orchestration)
 (require 'macher-agent-zero-mem)
@@ -118,8 +116,7 @@ Side effects: None."
           (buffer-local-value 'macher-agent--persistent-context buf)))))
 
 (defun macher-agent--wrap-callback (gptel-cb &optional ptc-exec)
-  "Create a simple callback wrapper that processes results without
-string tampering.
+  "Create a pure callback wrapper that processes results.
 
 GPTEL-CB is the original gptel callback function, which may be nil.
 PTC-EXEC is an optional boolean indicating active PTC execution context.
@@ -141,7 +138,13 @@ Side effects: None."
             final-str))))))
 
 (defun macher-agent--extract-prop (obj key)
-  "Extract KEY from OBJ handling plists, alists, and hash-tables."
+  "Extract KEY property from OBJ structure.
+
+OBJ can be a plist, alist, or hash-table.
+KEY is the property key symbol or string to extract.
+
+Return the property value if found, or symbol `macher-missing' if missing.
+Side effects: None."
   (let ((norm-key (if (stringp key) (intern (concat ":" (replace-regexp-in-string "_" "-" key))) key)))
     (map-elt obj norm-key 'macher-missing)))
 
@@ -382,49 +385,46 @@ OUTPUT-FILTER-FN is the optional filter function for final result data.
 Return expanding form defining and initialising the tool variable.
 Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
   (declare (indent 2))
-  (let* ((stripped-name
-          (replace-regexp-in-string "^macher-agent-tool-\\|^macher-agent-\\|-tool$" "" (symbol-name name-symbol)))
+  (let* ((stripped-name (replace-regexp-in-string "^macher-agent-tool-\\|^macher-agent-\\|-tool$" "" (symbol-name name-symbol)))
          (name (replace-regexp-in-string "-" "_" stripped-name)))
     `(progn
        (defvar ,name-symbol nil)
        (put ',name-symbol 'command-fn ,command-fn)
        (setq ,name-symbol
-             (gptel-make-tool
-              :name ,name
-              :description ,description
-              :category ,(or category "macher-agent")
-              :args ,args
-              :async t
-              :function
+             (macher-agent-bridge-register-tool
+              ,name
+              ,description
+              ,(or category "macher-agent")
+              ,args
               (lambda (callback &rest tool-args)
                 (let*
                     ((ptc-exec (bound-and-true-p macher-agent--active-ptc-execution))
                      (wrap-cb (macher-agent--wrap-callback callback ptc-exec))
                      (payload (macher-agent--extract-payload tool-args ,args)))
                   (macher-agent--with-tool-error-handling
-                   ',name-symbol payload wrap-cb
-                   (macher-agent--validate-payload payload ,args)
-                   (let*
-                       ((context (macher-agent--get-active-context))
-                        (root
-                         (if context (macher-agent-context-root context) default-directory))
-                        (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
-                     (if hook-rejection
-                         (funcall wrap-cb (list :status 'error :error hook-rejection))
-                       (let*
-                           ((on-success
-                             (macher-agent--build-success-callback
-                              ',name-symbol payload ,success-fn
-                              ,output-filter-fn wrap-cb ptc-exec))
-                            (cmd-fn ,command-fn)
-                            (arity (func-arity cmd-fn)))
-                         (if (or (eq (cdr arity) 'many)
-                                 (and (numberp (cdr arity)) (>= (cdr arity) 4)))
-                             (funcall cmd-fn payload context root on-success)
-                           (let ((action-res (funcall cmd-fn payload context root)))
-                             (if (functionp action-res)
-                                 (funcall action-res on-success)
-                               (funcall on-success action-res)))))))))))))))
+                      ',name-symbol payload wrap-cb
+                    (macher-agent--validate-payload payload ,args)
+                    (let*
+                        ((context (macher-agent--get-active-context))
+                         (root
+                          (if context (macher-agent-context-root context) default-directory))
+                         (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
+                      (if hook-rejection
+                          (funcall wrap-cb (list :status 'error :error hook-rejection))
+                        (let*
+                            ((on-success
+                              (macher-agent--build-success-callback
+                               ',name-symbol payload ,success-fn
+                               ,output-filter-fn wrap-cb ptc-exec))
+                             (cmd-fn ,command-fn)
+                             (arity (func-arity cmd-fn)))
+                          (if (or (eq (cdr arity) 'many)
+                                  (and (numberp (cdr arity)) (>= (cdr arity) 4)))
+                              (funcall cmd-fn payload context root on-success)
+                            (let ((action-res (funcall cmd-fn payload context root)))
+                              (if (functionp action-res)
+                                  (funcall action-res on-success)
+                                (funcall on-success action-res)))))))))))))))
 
 (defun macher-agent-execute-ptc-script
     (script-string context on-success on-error &optional extra-primitives target-buf)
@@ -728,12 +728,14 @@ ON-ERROR is the error callback function.
 Return nil.
 Side effects: Creates temporary sandbox directory and spawns process."
   (let* ((workspace-root (if context (macher-agent-context-root context) default-directory))
-         (sandbox-dir (make-temp-file "macher-sandbox-" t)))
+         (sandbox-dir (make-temp-file "macher-sandbox-" t))
+         (contents (when context (macher-agent--get-context-contents context))))
     (condition-case err
         (progn
-          (macher-agent--vfs-verify-clean-merge workspace-root context)
+          (macher-agent--vfs-verify-clean-merge workspace-root contents)
           (macher-agent--vfs-sync-baseline workspace-root sandbox-dir)
-          (macher-agent--vfs-apply-overlay context sandbox-dir)
+          (when contents
+            (macher-agent--vfs-apply-overlay-stateless contents workspace-root sandbox-dir))
 
           (let* ((out-buf (generate-new-buffer " *macher-sandbox-out*"))
                  (default-directory (file-name-as-directory sandbox-dir)))
@@ -758,8 +760,7 @@ Side effects: Creates temporary sandbox directory and spawns process."
        (funcall on-error (list :status 'error :error (error-message-string err)))))))
 
 (defun macher-agent--read-file-vfs-aware (file-path context)
-  "Read FILE-PATH prioritising uncommitted VFS memory over physical
-disk.
+  "Read FILE-PATH prioritising uncommitted VFS memory over physical disk.
 
 FILE-PATH is the file path string to read.
 CONTEXT is the active agent context structure.
@@ -767,7 +768,7 @@ CONTEXT is the active agent context structure.
 Return file content string, or nil if file cannot be read.
 Side effects: None."
   (let* ((vfs-entry
-          (when context (cl-find file-path (macher-context-contents context) :key #'car :test #'equal)))
+          (when context (cl-find file-path (macher-agent--get-context-contents context) :key #'car :test #'equal)))
          (vfs-content (when vfs-entry (if (consp (cdr vfs-entry)) (cddr vfs-entry) (cdr vfs-entry)))))
     (cond
      (vfs-content vfs-content)
@@ -811,7 +812,7 @@ Side effects: None."
             ((cl-some (lambda (item) (string= file (car item))) pending)))
       file
     (if-let* ((ctx (ignore-errors (macher-agent-current-context)))
-              (workspace (macher-context-workspace ctx))
+              (workspace (macher-agent--get-context-workspace ctx))
               (workspace-root (macher-agent--get-workspace-root workspace))
               (actual-name (if (file-name-absolute-p file)
                                (file-relative-name file workspace-root)
@@ -841,7 +842,7 @@ Options are `glob' (regex search) and `zero-mem' (PageRank vector search)."
   :group 'macher-agent)
 
 (defun macher-agent-search-glob (query orig-buf &optional ctx-lines)
-  "Search QUERY in ORIG-BUF using regex matching with CTX-LINES surrounding lines."
+  "Search for QUERY in ORIG-BUF matching CTX-LINES."
   (let ((ctx-lines (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
         (results nil)
         (invalid-re nil))
@@ -882,7 +883,7 @@ Options are `glob' (regex search) and `zero-mem' (PageRank vector search)."
         (format "No matches found in history for: %s" query))))))
 
 (defun macher-agent--buffer-to-traces (buffer)
-  "Convert BUFFER content into a list of trace plists for Zero-Mem graph construction."
+  "Convert BUFFER content into trace plists for Zero-Mem graph construction."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (save-excursion
@@ -903,7 +904,7 @@ Options are `glob' (regex search) and `zero-mem' (PageRank vector search)."
           (nreverse traces))))))
 
 (defun macher-agent-search-zero-mem (query orig-buf &optional ctx-lines)
-  "Search QUERY in ORIG-BUF using fixed-point Zero-Mem PageRank vector retrieval."
+  "Search for QUERY in ORIG-BUF with CTX-LINES using Zero-Mem PageRank retrieval."
   (if (not (buffer-live-p orig-buf))
       "Error: Cannot locate original conversation buffer."
     (let* ((traces (macher-agent--buffer-to-traces orig-buf))
@@ -911,7 +912,9 @@ Options are `glob' (regex search) and `zero-mem' (PageRank vector search)."
       (if (null traces)
           (format "No matches found in history for: %s" query)
         (let* ((graph (macher-agent-zero-mem-build-graph traces))
-               (retrieved (macher-agent-zero-mem-retrieve query graph :top-k top-k :algorithm 'fixed-point))
+               (retrieved
+                (macher-agent-zero-mem-retrieve
+                 query graph :top-k top-k :algorithm 'fixed-point))
                (results nil))
           (dolist (tr retrieved)
             (let ((line (or (plist-get (macher-agent-zero-mem-trace-metadata tr) :line)
@@ -923,75 +926,13 @@ Options are `glob' (regex search) and `zero-mem' (PageRank vector search)."
             (format "No matches found in history for: %s" query)))))))
 
 (defun macher-agent-search-dispatch (query orig-buf &optional ctx-lines)
-  "Dispatch search for QUERY in ORIG-BUF with CTX-LINES context based on `macher-agent-search-backend'."
+  "Dispatch search for QUERY in ORIG-BUF with CTX-LINES context.
+Based on `macher-agent-search-backend'."
   (if (not (buffer-live-p orig-buf))
       "Error: Cannot locate original conversation buffer."
     (pcase macher-agent-search-backend
       ('zero-mem (macher-agent-search-zero-mem query orig-buf ctx-lines))
       (_ (macher-agent-search-glob query orig-buf ctx-lines)))))
 
-(macher-agent-make-tool
- macher-agent-tool-search-conversation-history
- "Search the full, un-truncated conversation history of the current buffer for matching query text or regex."
- :category "conversation"
- :args '((:name "query"
-                :type string
-                :description "The search query string or regular expression to search for in conversation history."))
- :command-fn
- (lambda (payload _context _root)
-   (let* ((query (or (plist-get payload :query)
-                     (plist-get payload 'query)))
-          (fsm (or (bound-and-true-p macher-agent--active-fsm)
-                   (and (fboundp 'macher-agent--get-fsm-latest)
-                        (macher-agent--get-fsm-latest))))
-          (info (when (and fsm (fboundp 'gptel-fsm-info))
-                  (ignore-errors (gptel-fsm-info fsm))))
-          (target-buf (or (and info (plist-get info :buffer))
-                          (current-buffer)))
-          (results nil))
-     (if (or (not query) (not (stringp query)) (string-empty-p query))
-         "No matches found in conversation history for query: empty"
-       (if (or (not target-buf) (not (buffer-live-p target-buf)))
-           "No matches found in conversation history: Buffer not available."
-         (with-current-buffer target-buf
-           (save-excursion
-             (save-restriction
-               (widen)
-               (goto-char (point-min))
-               (let ((case-fold-search t))
-                 (condition-case nil
-                     (while (re-search-forward query nil t)
-                       (let* ((match-pt (point))
-                              (line-num (line-number-at-pos match-pt))
-                              (start-pt (save-excursion
-                                          (forward-line -2)
-                                          (line-beginning-position)))
-                              (end-pt (save-excursion
-                                        (forward-line 2)
-                                        (line-end-position)))
-                              (snippet (buffer-substring-no-properties start-pt end-pt)))
-                         (push (format "--- Match near line %d ---\n%s" line-num snippet)
-                               results)
-                         (when (= (match-beginning 0) (match-end 0))
-                           (forward-char 1))))
-                   (error
-                    (goto-char (point-min))
-                    (while (search-forward query nil t)
-                      (let* ((match-pt (point))
-                             (line-num (line-number-at-pos match-pt))
-                             (start-pt (save-excursion
-                                         (forward-line -2)
-                                         (line-beginning-position)))
-                             (end-pt (save-excursion
-                                       (forward-line 2)
-                                       (line-end-position)))
-                             (snippet (buffer-substring-no-properties start-pt end-pt)))
-                        (push (format "--- Match near line %d ---\n%s" line-num snippet)
-                              results))))))))
-           (if results
-               (string-join (nreverse results) "\n\n")
-             (format "No matches found in conversation history for query: %s" query))))))))
-
-
-(provide 'macher-agent-gptel-tools)
-;;; macher-agent-gptel-tools.el ends here
+(provide 'macher-agent-tools)
+;;; macher-agent-tools.el ends here

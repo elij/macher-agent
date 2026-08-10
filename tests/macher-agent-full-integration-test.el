@@ -1,4 +1,4 @@
-;;; macher-agent-full-integration-test.el --- Full integration tests for macher-agent -*- lexical-binding: t -*-
+;;; macher-agent-full-integration-test.el --- Full integration tests for macher-agent -*- lexical-binding: t; -*-
 
 (require 'buttercup)
 (require 'cl-lib)
@@ -138,7 +138,7 @@
                 (expect vfs-entry :not :to-be nil)
                 (expect (macher-agent-vfs-entry-curr vfs-entry) :to-equal "sandbox inflated content"))
 
-              (macher-agent-sandbox-inflate ctx)
+              (macher-agent-sandbox-inflate sandbox-dir (macher-agent-workspace-vfs-buffers (macher-agent--get-context-workspace ctx)) (macher-agent-context-root ctx) (macher-agent--get-context-contents ctx))
               (let ((sandbox-file (expand-file-name "sandbox_test.txt" sandbox-dir)))
                 (expect (file-exists-p sandbox-file) :to-be t)
                 (when (file-exists-p sandbox-file)

@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (declare-function macher-context-workspace-root "macher-agent-api")
 
 (macher-agent-make-tool

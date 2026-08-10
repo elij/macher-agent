@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-execute-subagents-tool
     "Execute tasks across multiple sub-agents in parallel in a fire-and-forget, \

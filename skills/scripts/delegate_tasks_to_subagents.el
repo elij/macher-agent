@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-delegate-tasks-to-subagents-tool
     "Delegate tasks to multiple sub-agents asynchronously using A2A point-to-point payloads. \

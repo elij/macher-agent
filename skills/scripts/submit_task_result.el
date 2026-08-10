@@ -1,6 +1,7 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-submit-task-result-tool
-    "Submit the final result of your assigned task back to the orchestrator. CRITICAL DIRECTIVE: You MUST use the `submit_task_result` tool to submit your final answer when you are completely finished. Do NOT output your final answer as standard text. IMMEDIATELY STOP after."
+    "Submit your response through this tool. Use it for delivering final task outputs, providing analysis, answering questions, or completing any interaction. This is the only way to communicate your response to the user. After calling this tool, end your execution immediately."
   :category "event"
   :args '((:name "final_answer" :type string :description "The final answer, data, or summary of completed work."))
   :command-fn

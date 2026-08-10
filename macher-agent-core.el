@@ -1,5 +1,11 @@
 ;;; macher-agent-core.el --- Core state for Macher Agent -*- lexical-binding: t; -*-
 
+;;; Commentary:
+
+;; Core state variables and functions for Macher Agent.
+
+;;; Code:
+
 (require 'cl-lib)
 
 ;; Buffer-local agent state
@@ -39,7 +45,8 @@ Return list of pending instruction strings, or nil.
 
 Side effects: Buffer-local variable.")
 
-(defvar-local macher-agent--final-result nil)
+(defvar-local macher-agent--final-result nil
+  "Store the final result string or data returned by agent execution.")
 
 (defvar-local macher-agent--persistent-context nil
   "Store the buffer-local persistent VFS context structure.

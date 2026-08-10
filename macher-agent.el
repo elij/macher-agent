@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.0.94
+;; Version: 0.8.0.96
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -16,18 +16,17 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'macher)
 (require 'gptel)
 (require 'project)
 
 (require 'macher-agent-core)
 (require 'macher-agent-sandbox)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-vfs)
 (require 'macher-agent-presets)
-(require 'macher-agent-macher-bridge)
-(require 'macher-agent-gptel-bridge)
+(require 'macher-agent-macher)
+(require 'macher-agent-gptel)
 (require 'macher-agent-orchestration)
-(require 'macher-agent-gptel-tools)
+(require 'macher-agent-tools)
 (require 'macher-agent-api)
 
 (defgroup macher-agent nil
@@ -49,7 +48,7 @@ Return the result message string displayed in the echo area."
   (macher-agent-add-pending-instruction (format "USER OVERRIDE: %s" instruction))
   (message "Instruction queued! The agent will see this when its current tool finishes."))
 
-(defun macher-agent--master-gptel-setup ()
+(defun macher-agent--main-gptel-setup ()
   "Initialise `macher-agent' configuration in `gptel' buffers.
 
 Perform the complete setup sequence for gptel integration by executing
@@ -64,7 +63,7 @@ Return the result of `macher-agent--wrap-macher-tools'."
   (macher-agent-setup-gptel-buffer)
   (macher-agent--wrap-macher-tools))
 
-(add-hook 'gptel-mode-hook #'macher-agent--master-gptel-setup)
+(add-hook 'gptel-mode-hook #'macher-agent--main-gptel-setup)
 
 (provide 'macher-agent)
 ;;; macher-agent.el ends here

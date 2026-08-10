@@ -1,7 +1,7 @@
-;;; macher-agent-skills-test.el --- Tests for macher-agent-skills -*- lexical-binding: t -*-
+;;; macher-agent-skills-test.el --- Tests for macher-agent-skills -*- lexical-binding: t; -*-
 
 (require 'buttercup)
-(require 'macher-agent-macher-bridge)
+(require 'macher-agent-macher)
 (require 'macher-agent)
 (let* ((file-name (or load-file-name buffer-file-name))
        (current-dir (if file-name (file-name-directory file-name) default-directory)))
@@ -407,7 +407,9 @@
                    (expect (plist-get spec :boot-directive) :to-equal "Initial boot directive text"))
                  (let ((test-buf (generate-new-buffer "test-boot-preset-buf")))
                    (with-current-buffer test-buf
-                     (setq-local gptel--known-presets (copy-tree gptel--known-presets))
+                     (if (boundp 'gptel--known-presets)
+                         (setq gptel--known-presets (copy-tree gptel--known-presets))
+                       (setq-local gptel--known-presets (copy-tree gptel--known-presets)))
                      (macher-agent--apply-preset '(boot-preset))
                      (expect macher-agent--boot-directive :to-equal "Initial boot directive text"))
                    (kill-buffer test-buf))))

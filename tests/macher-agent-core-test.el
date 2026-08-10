@@ -1,11 +1,15 @@
-;;; macher-agent-core-test.el --- Core behaviour tests for macher-agent -*- lexical-binding: t -*-
+;;; macher-agent-core-test.el --- Core behaviour tests for macher-agent -*- lexical-binding: t; -*-
+
+;;; Commentary:
 
 ;; This test suite enforces the specification for macher-agent,
 ;; focusing on VFS optimistic concurrency, lexical state management,
 ;; sandbox isolation, and diff splitting behaviours.
 
+;;; Code:
+
 (require 'buttercup)
-(require 'macher-agent-macher-bridge)
+(require 'macher-agent-macher)
 (require 'cl-lib)
 (require 'macher-agent)
 
@@ -36,7 +40,7 @@
 
                           (let ((threw nil))
                             (condition-case err
-                                (macher-agent-vfs-write workspace file-path "New content")
+                                (macher-agent-vfs-write (macher-agent-workspace-vfs-buffers workspace) (macher-agent-workspace-mtime-tracker workspace) file-path "New content")
                               (error
                                (setq threw t)
                                (expect (cadr err) :to-equal "Your previous edits to test.el were discarded due to external file modifications.  Please re-read and re-apply")))
@@ -49,9 +53,9 @@
                                (file-path "/mock/proj/shared.el"))
                           (puthash (expand-file-name "/mock/proj/") ctx-a macher-agent-active-workspaces)
 
-                          (macher-agent-vfs-write workspace file-path "Agent A changes")
+                          (macher-agent-vfs-write (macher-agent-workspace-vfs-buffers workspace) (macher-agent-workspace-mtime-tracker workspace) file-path "Agent A changes")
 
-                          (let ((read-content (macher-agent-vfs-read workspace file-path)))
+                          (let ((read-content (macher-agent-vfs-read (macher-agent-workspace-vfs-buffers workspace) nil file-path)))
                             (expect read-content :to-equal "Agent A changes")))))
 
           (describe "2. Execution Environments (Sandbox)"
@@ -70,7 +74,7 @@
                                       (when (string-suffix-p "overlay.el" filename)
                                         (setq written-to-sandbox (substring-no-properties start end)))))
 
-                            (macher-agent-sandbox-inflate ctx)
+                            (macher-agent-sandbox-inflate "/tmp/macher-sandbox/" (macher-agent-workspace-vfs-buffers workspace) (macher-agent-context-root ctx) (macher-agent--get-context-contents ctx))
 
                             (expect written-to-sandbox :to-equal "VFS Overlay Content")))))
 
@@ -336,4 +340,7 @@
 
                               (it "confirms redundant macher-agent--show-ui function is removed"
                                   (expect (fboundp 'macher-agent--show-ui) :to-be nil)))))
+
+(provide 'macher-agent-core-test)
+;;; macher-agent-core-test.el ends here
 

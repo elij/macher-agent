@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
  macher-agent-search-in-workspace-tool
  "Search for a regular expression pattern within the strictly bounded workspace."

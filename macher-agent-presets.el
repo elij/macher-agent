@@ -1,16 +1,22 @@
 ;;; macher-agent-presets.el --- Skill facade for directives -*- lexical-binding: t; -*-
 
+;;; Commentary:
+
+;; Skill facade for directives and presets in Macher Agent.
+
+;;; Code:
+
 (require 'cl-lib)
 (require 'subr-x)
 (require 'org)
 (require 'macher-agent-core)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-vfs)
 
 (defcustom macher-agent-skill-directories nil
   "Specify user-defined directories to scan for skill definition files.
 
 This variable holds a list of directory path strings that are scanned for
-SKILL.md files during skill initialisation.q
+SKILL.md files during skill initialisation.
 
 Return a list of directory paths or nil if unset.
 
@@ -612,7 +618,7 @@ Side effects: Updates skill association list and resolves skill tools."
                     :model (when model (intern model)) :boot-directive boot-directive
                     :tools resolved-tools :exclusive exclusive :ptc-primitives ptc-primitives))
         (if workspace
-            (setf (macher-agent-workspace-skills-alist workspace) alist)
+            (macher-agent--set-workspace-skills-alist workspace alist)
           (setq macher-agent-global-skills-alist alist))))))
 
 (defun macher-agent--load-skill-from-path (path &optional context)
@@ -713,7 +719,7 @@ Side effects: Registers skills, configures directives, and sets up menus."
                                 (if (listp macher-agent-skill-directories)
                                     macher-agent-skill-directories
                                   (list macher-agent-skill-directories))
-                                nil)))) ; FORCE FULL MEMORY COPY
+                                nil))))
 
     (cl-loop for d in (delete-dups directories)
              do (when (file-directory-p d)
@@ -729,16 +735,23 @@ Side effects: Registers skills, configures directives, and sets up menus."
     (let* ((workspace (when context (macher-agent--get-context-workspace context)))
            (ws-skills (when workspace (macher-agent-workspace-skills-alist workspace)))
            (global-skills macher-agent-global-skills-alist)
-           (merged-skills (cl-remove-duplicates (append ws-skills global-skills nil) ; FORCE COPY
+           (merged-skills (cl-remove-duplicates (append ws-skills global-skills nil)
                                                 :key #'car
                                                 :test #'eq
                                                 :from-end t)))
 
       (unless (local-variable-p 'gptel-directives)
-        (setq-local gptel-directives (copy-tree (default-value 'gptel-directives))))
+        (if (boundp 'gptel-directives)
+            (setq gptel-directives
+                  (or gptel-directives (copy-tree (default-value 'gptel-directives))))
+          (setq-local gptel-directives (copy-tree (default-value 'gptel-directives)))))
 
       (unless (local-variable-p 'gptel--known-presets)
-        (setq-local gptel--known-presets (copy-tree (default-value 'gptel--known-presets))))
+        (if (boundp 'gptel--known-presets)
+            (setq gptel--known-presets
+                  (or gptel--known-presets (copy-tree (default-value 'gptel--known-presets))))
+          (setq-local
+           gptel--known-presets (copy-tree (default-value 'gptel--known-presets)))))
 
       (cl-loop
        for (sym . meta) in merged-skills
