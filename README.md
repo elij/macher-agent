@@ -8,7 +8,7 @@ A truly native Emacs harness relies on buffers rather than terminal user interfa
 
 ## Approach to subagents
 
-The architecture is optimised to operate large numbers of agents running concurrently within a single Emacs instance. The Virtual File System and the Elisp sandbox with programmatic tool calling allow agents to solve problems before requiring explicit permissions from the user with changes being present as a unified diff.
+The architecture is optimised to operate large numbers of agents running concurrently within a single Emacs instance. The Virtual File System and the Elisp sandbox with programmatic tool calling allow agents to solve problems before requiring explicit permissions from the user with changes being presentws as a unified diff.
 
 ## Integration with/changes to gptel (tooling, presets, UI)
 
@@ -79,6 +79,11 @@ Programmatic tool calling in Elisp allows small scripts that would typically tak
         (delegate-tasks-to-subagents tasks))))
 
 ```
+## Multi agent VFS
+
+Each agent operates a discrete VFS (`macher` context) in the workspace with auto fail-fast merge resolution.
+
+<img alt="VFS" src="https://github.com/user-attachments/assets/123a9010-e39c-4e59-967c-a032a71a52cc" />
 
 ## Installation
 
