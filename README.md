@@ -51,6 +51,35 @@ Memory recall beyond the `gptel-max-tokens` event horizon via the `search_conver
 [Zero-Mem](https://arxiv.org/abs/2607.29377)
 [BEAM](https://arxiv.org/pdf/2510.27246)
 
+## Use of PTC for token efficiency
+
+Programmatic tool calling in Elisp allows small scripts that would typically take many tool calling rounds to execute in a single call. PTC usses a yieding Elisp sandbox for all tool calls.
+
+*NB: script drafted by an LLM from real world usage*
+
+`list-directory-in-workspace`, `spawn-subagent` and  `delegate-tasks-to-subagents` are gptel tools.
+
+<img alt="PTC" src="https://github.com/user-attachments/assets/299b08c8-0d22-46e9-acee-fc2b631c5d30" />
+
+
+```elisp
+(let* ((listing (list-directory-in-workspace "" "" ""))
+       (lines (split-string listing "\n"))
+       (file-lines (cl-loop for line in lines when (string-prefix-p "file: " line) collect (substring line 6)))
+       (agent-count (length file-lines))
+       (agent-names (cl-loop for i from 0 below agent-count collect (format "agent-%d" i)))
+       (tasks (cl-loop for path in file-lines for name in agent-names
+                       collect (list :buffer_name name
+                                     :instructions (format "Read the first paragraph of the file at '%s' and provide a concise one-sentence summary." path)
+                                     :presets (list "macher-agent-worker")))))
+  (if (zerop agent-count)
+      "No files found"
+      (progn
+        (mapcar (lambda (name) (spawn-subagent name (list "macher-agent-worker"))) agent-names)
+        (delegate-tasks-to-subagents tasks))))
+
+```
+
 ## Installation
 
 ### Dependencies

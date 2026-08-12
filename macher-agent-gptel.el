@@ -605,21 +605,21 @@ to the base prompt for this single request frame."
 
 (defun macher-agent-pipe--extract-redirect (state orig-buf _presets _skills redirected-skill)
   "Route redirected skill text in STATE and natively merge its tools."
-  (if redirected-skill
-      (let* ((known (with-current-buffer orig-buf (bound-and-true-p gptel--known-presets)))
-             (redirect-state (macher-agent-compose-payload (list :known-presets known)
-                                                           (list redirected-skill)))
-             (redirect-text (plist-get redirect-state :system))
-             (redirect-tools (plist-get redirect-state :tools)))
+  (when redirected-skill
+    (let* ((known (with-current-buffer orig-buf (bound-and-true-p gptel--known-presets)))
+           (redirect-state (macher-agent-compose-payload (list :known-presets known)
+                                                         (list redirected-skill)))
+           (redirect-text (plist-get redirect-state :system))
+           (redirect-tools (plist-get redirect-state :tools)))
 
-        (when redirect-text
-          (setf (macher-agent-transmission-state-redirect-prompt state) redirect-text))
+      (when redirect-text
+        (setf (macher-agent-transmission-state-redirect-prompt state) redirect-text))
 
-        (when redirect-tools
-          (setf (macher-agent-transmission-state-tools state)
-                (macher-agent-normalize-tools
-                 (append (macher-agent-transmission-state-tools state) redirect-tools)))))
-    state))
+      (when redirect-tools
+        (setf (macher-agent-transmission-state-tools state)
+              (macher-agent-normalize-tools
+               (append (macher-agent-transmission-state-tools state) redirect-tools))))))
+  state)
 
 (defun macher-agent--transformer-apply-state
     (orig-buf buffer-presets transmission-skills redirected-skill prompt-start fsm)
