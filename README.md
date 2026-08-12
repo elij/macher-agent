@@ -12,7 +12,7 @@ The architecture is optimised to operate large numbers of agents running concurr
 
 ## Integration with/changes to gptel (tooling, presets, UI)
 
-The integration with gptel isolates setting changes to within a workspace. It adds an advice to the encoding of base64 to inject non-file backed media, such as the media used in computer use interactions. It also implements finite-state machine tracking for workspace-local tool access.
+The integration with gptel isolates setting changes to within a workspace. It adds an advice to the encoding of base64 to inject non-file backed media, such as the media used in computer use interactions. It also implements finite-state machine tracking for workspace-local tool access. gptel tools are accessible within the PTC Elisp sandbox.
 
 ## Integration with/changes to macher (context/VFS/patch generation)
 
