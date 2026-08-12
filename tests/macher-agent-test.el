@@ -2,10 +2,10 @@
 
 (require 'subr-x)
 (require 'buttercup)
-(require 'macher-agent-macher-bridge)
+(require 'macher-agent-macher)
 (require 'macher-agent)
-(require 'macher-agent-vfs-client)
-(require 'macher-agent-gptel-tools)
+(require 'macher-agent-vfs)
+(require 'macher-agent-gptel)
 (require 'macher-agent-orchestration)
 (let ((current-dir (file-name-directory (or load-file-name buffer-file-name))))
   (add-to-list 'load-path (expand-file-name "helpers" current-dir)))
@@ -534,7 +534,7 @@
                                (spy-on 'macher-agent--read-content-from-disk-direct :and-return-value "fresh disk state")
                                (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value "stale buffer state")
 
-                               (let ((mutated (macher-agent--sync-context-entry entry workspace)))
+                               (let ((mutated (macher-agent--sync-context-entry entry (macher-agent-workspace-mtime-tracker workspace))))
                                  (expect mutated :to-be t)
                                  (expect (macher-agent-vfs-entry-orig entry) :to-equal "fresh disk state")
                                  (expect (macher-agent-vfs-entry-curr entry) :to-equal "fresh disk state")
@@ -570,7 +570,7 @@
                                            `(t 1 1 1 ,new-mtime ,new-mtime ,new-mtime 100 "mode" t 1 1))))
                                (spy-on 'macher-agent--read-content-from-disk-direct :and-return-value "mock disk state")
                                (spy-on 'macher-agent--read-content-from-disk-or-buffer :and-return-value "mock disk state")
-                               (let ((mutated (macher-agent--sync-context-entry entry workspace)))
+                               (let ((mutated (macher-agent--sync-context-entry entry (macher-agent-workspace-mtime-tracker workspace))))
                                  (expect attrs-called :to-be t)
                                  (expect mutated :to-be t)
                                  (expect (macher-agent-vfs-entry-orig entry) :to-equal "mock disk state")))))
@@ -597,7 +597,7 @@
                                                    `(t 1 1 1 ,new-mtime ,new-mtime ,new-mtime 100 "mode" t 1 1)
                                                  nil)))
                                      (spy-on 'macher-agent--read-content-from-disk-direct :and-return-value "new disk content")
-                                     (let ((mutated (macher-agent--sync-context-entry entry workspace)))
+                                     (let ((mutated (macher-agent--sync-context-entry entry (macher-agent-workspace-mtime-tracker workspace))))
                                        (expect mutated :to-be t)
                                        (expect (macher-agent-vfs-entry-orig entry) :to-equal "new disk content")
                                        (expect (macher-agent-vfs-entry-curr entry) :to-equal "new disk content")))
@@ -625,7 +625,7 @@
                                                    `(t 1 1 1 ,same-mtime ,same-mtime ,same-mtime 100 "mode" t 1 1)
                                                  nil)))
                                      (spy-on 'macher-agent--read-content-from-disk-direct :and-return-value "disk content")
-                                     (let ((mutated (macher-agent--sync-context-entry entry workspace)))
+                                     (let ((mutated (macher-agent--sync-context-entry entry (macher-agent-workspace-mtime-tracker workspace))))
                                        (expect mutated :to-be t)
                                        (expect (macher-agent-vfs-entry-orig entry) :to-equal "desynced live buffer content")
                                        (expect (macher-agent-vfs-entry-curr entry) :to-equal "desynced live buffer content")))
@@ -654,7 +654,7 @@
                                                    `(t 1 1 1 ,new-mtime ,new-mtime ,new-mtime 100 "mode" t 1 1)
                                                  nil)))
                                      (spy-on 'macher-agent--read-content-from-disk-direct :and-return-value "new disk content")
-                                     (let ((mutated (macher-agent--sync-context-entry entry workspace)))
+                                     (let ((mutated (macher-agent--sync-context-entry entry (macher-agent-workspace-mtime-tracker workspace))))
                                        (expect mutated :to-be nil)
                                        (expect (macher-agent-vfs-entry-orig entry) :to-equal "original state")
                                        (expect (macher-agent-vfs-entry-curr entry) :to-equal "original state")))
@@ -927,7 +927,7 @@
                                       (lambda (start _end filename &rest _)
                                         (push (list start filename) write-region-called-with)))
 
-                              (macher-agent--vfs-apply-overlay mock-ctx sandbox-dir)
+                              (macher-agent--vfs-apply-overlay-stateless (macher-context-contents mock-ctx) workspace-root sandbox-dir)
 
                               ;; The orchestrator MUST execute a file write...
                               (expect 'write-region :to-have-been-called)
@@ -943,7 +943,7 @@
 
                               (spy-on 'write-region)
 
-                              (macher-agent--vfs-apply-overlay mock-ctx "/tmp/sandbox-12345/")
+                              (macher-agent--vfs-apply-overlay-stateless (macher-context-contents mock-ctx) "/my/project/" "/tmp/sandbox-12345/")
 
                               ;; Ensure no ghost files are created in the sandbox
                               (expect 'write-region :not :to-have-been-called))))
@@ -954,10 +954,10 @@
                             (let ((call-order nil))
                               (spy-on 'macher-agent--vfs-verify-clean-merge :and-call-fake (lambda (&rest _) (push 'merge call-order)))
                               (spy-on 'macher-agent--vfs-sync-baseline :and-call-fake (lambda (&rest _) (push 'sync call-order)))
-                              (spy-on 'macher-agent--vfs-apply-overlay :and-call-fake (lambda (&rest _) (push 'overlay call-order)))
+                              (spy-on 'macher-agent--vfs-apply-overlay-stateless :and-call-fake (lambda (&rest _) (push 'overlay call-order)))
 
                               ;; Execute a dummy tool
-                              (let ((mock-context (macher--make-context :workspace nil :contents nil)))
+                              (let ((mock-context (macher--make-context :workspace nil :contents (list 'dummy))))
                                 (spy-on 'macher-agent-context-root :and-return-value "/my/project/")
                                 (spy-on 'make-temp-file :and-return-value "/tmp/sandbox-12345/")
                                 (spy-on 'delete-directory)
@@ -969,7 +969,7 @@
                               ;; 1. Assert they were all called
                               (expect 'macher-agent--vfs-verify-clean-merge :to-have-been-called)
                               (expect 'macher-agent--vfs-sync-baseline :to-have-been-called)
-                              (expect 'macher-agent--vfs-apply-overlay :to-have-been-called)
+                              (expect 'macher-agent--vfs-apply-overlay-stateless :to-have-been-called)
 
                               ;; 2. Assert exact execution order
                               (expect (reverse call-order) :to-equal '(merge sync overlay))))
@@ -1053,10 +1053,10 @@
                                                ;; Mutate child context
                                                (macher-agent--update-context-file macher-agent--persistent-context "doc.txt" "v2")
                                                ;; Parent remains unchanged before completion
-                                               (expect (macher-agent-vfs-read parent-ctx "doc.txt") :to-equal "v1")
+                                               (expect (macher-agent-vfs-read (macher-agent-workspace-vfs-buffers (macher-agent--get-context-workspace parent-ctx)) (macher-context-contents parent-ctx) "doc.txt") :to-equal "v1")
                                                ;; Clearing child context resets child without affecting parent
                                                (macher-agent-clear-context)
-                                               (expect (macher-agent-vfs-read macher-agent--persistent-context "doc.txt") :to-equal "v1")
+                                               (expect (macher-agent-vfs-read (macher-agent-workspace-vfs-buffers (macher-agent--get-context-workspace macher-agent--persistent-context)) (macher-context-contents macher-agent--persistent-context) "doc.txt") :to-equal "v1")
                                                ;; Update child context again
                                                (macher-agent--update-context-file macher-agent--persistent-context "doc.txt" "v3"))
                                              
@@ -1069,7 +1069,7 @@
                                                             :metadata (list :buffer_name "child-agent")))
                                                 (lambda (_res)
                                                   ;; Verify parent context now reflects child modifications
-                                                  (expect (macher-agent-vfs-read parent-ctx "doc.txt") :to-equal "v3"))))
+                                                  (expect (macher-agent-vfs-read (macher-agent-workspace-vfs-buffers (macher-agent--get-context-workspace parent-ctx)) (macher-context-contents parent-ctx) "doc.txt") :to-equal "v3"))))
                                              (let ((a2a-cb (with-current-buffer sub-buf macher-agent--a2a-callback)))
                                                (when a2a-cb
                                                  (funcall a2a-cb (list :task-id "task-child" :data "Done"))))
@@ -1280,47 +1280,47 @@
                      (describe "Refactored Unified Transmission Reducer Pipeline"
                                (it "inits core subagent directive when buffer is a subagent"
                                    (let* ((orig-buf (generate-new-buffer "test-subagent-buf"))
-                                          (payload nil))
+                                          (state (make-macher-agent-transmission-state :target-buffer orig-buf)))
                                      (with-current-buffer orig-buf
                                        (setq-local macher-agent--is-subagent t))
-                                     (setq payload (macher-agent-pipe--init-core-directives payload orig-buf nil nil nil))
-                                     (expect (length (plist-get payload :directives)) :to-equal 1)
-                                     (expect (car (plist-get payload :directives)) :to-match "CRITICAL DIRECTIVE:")
+                                     (setq state (macher-agent-pipe--init-core-directives state orig-buf nil nil nil))
+                                     (expect (length (macher-agent-transmission-state-directives state)) :to-equal 1)
+                                     (expect (car (macher-agent-transmission-state-directives state)) :to-match "CRITICAL DIRECTIVE:")
                                      (kill-buffer orig-buf)))
 
                                (it "appends boot directive on initial request when no gptel response property exists"
                                    (let* ((orig-buf (generate-new-buffer "test-initial-request-boot-buf"))
-                                          (payload nil))
+                                          (state (make-macher-agent-transmission-state :target-buffer orig-buf)))
                                      (with-current-buffer orig-buf
                                        (setq-local macher-agent--boot-directive "Execute boot setup now."))
-                                     (setq payload (macher-agent-pipe--append-boot-directive payload orig-buf nil nil nil))
-                                     (expect (length (plist-get payload :directives)) :to-equal 1)
-                                     (expect (car (plist-get payload :directives)) :to-equal "Execute boot setup now.")
+                                     (setq state (macher-agent-pipe--append-boot-directive state orig-buf nil nil nil))
+                                     (expect (length (macher-agent-transmission-state-directives state)) :to-equal 1)
+                                     (expect (car (macher-agent-transmission-state-directives state)) :to-equal "Execute boot setup now.")
                                      (kill-buffer orig-buf)))
 
                                (it "does not append boot directive on subsequent request when gptel response property exists"
                                    (let* ((orig-buf (generate-new-buffer "test-subsequent-request-boot-buf"))
-                                          (payload nil))
+                                          (state (make-macher-agent-transmission-state :target-buffer orig-buf)))
                                      (with-current-buffer orig-buf
                                        (setq-local macher-agent--boot-directive "Execute boot setup now.")
                                        (insert "Previous assistant response")
                                        (put-text-property (point-min) (point-max) 'gptel 'response))
-                                     (setq payload (macher-agent-pipe--append-boot-directive payload orig-buf nil nil nil))
-                                     (expect (plist-get payload :directives) :to-be nil)
+                                     (setq state (macher-agent-pipe--append-boot-directive state orig-buf nil nil nil))
+                                     (expect (macher-agent-transmission-state-directives state) :to-be nil)
                                      (kill-buffer orig-buf)))
 
                                (it "drains thought queue and compiles directives into system prompt"
                                    (let* ((orig-buf (generate-new-buffer "test-thought-queue-buf"))
-                                          (payload (list :system "Base System Prompt")))
+                                          (state (make-macher-agent-transmission-state :base-prompt "Base System Prompt"
+                                                                                       :target-buffer orig-buf)))
                                      (with-current-buffer orig-buf
                                        (macher-agent-add-pending-instruction "Thought 1"))
-                                     (setq payload (macher-agent-pipe--drain-thought-queue payload orig-buf nil nil nil))
-                                     (expect (length (plist-get payload :directives)) :to-equal 1)
+                                     (setq state (macher-agent-pipe--drain-thought-queue state orig-buf nil nil nil))
+                                     (expect (length (macher-agent-transmission-state-directives state)) :to-equal 1)
                                      (with-current-buffer orig-buf
-                                       (expect macher-agent--pending-instructions-queue :to-be nil))
-                                     (setq payload (macher-agent-pipe--compile-directives payload orig-buf nil nil nil))
-                                     (expect (plist-get payload :system) :to-match "Base System Prompt\n\nUSER OVERRIDE DIRECTIVE:\nThought 1")
-                                     (expect (plist-get payload :directives) :to-be nil)
+                                       (expect macher-agent--pending-instructions-queue :not :to-be nil))
+                                     (setq state (macher-agent-pipe--compile-directives state orig-buf nil nil nil))
+                                     (expect (macher-agent-transmission-state-compiled-prompt state) :to-match "Base System Prompt\n\nUSER OVERRIDE DIRECTIVE:\nThought 1")
                                      (kill-buffer orig-buf))))
 
                      (describe "Tool Schema Validation and Lifecycle Hooks"
@@ -1768,3 +1768,4 @@
 
 
 (provide 'macher-agent-test)
+;;; macher-agent-test.el ends here

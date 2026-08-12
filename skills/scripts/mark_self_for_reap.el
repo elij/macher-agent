@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
  macher-agent-mark-self-for-reap
  "Marks the current subagent buffer for termination. Call this exactly once when you \

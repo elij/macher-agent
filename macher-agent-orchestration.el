@@ -10,13 +10,11 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'generator)
-(require 'gptel)
-(require 'macher)
 (require 'macher-agent-core)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-vfs)
 (require 'macher-agent-presets)
-(require 'macher-agent-macher-bridge)
-(require 'macher-agent-gptel-bridge)
+(require 'macher-agent-macher)
+(require 'macher-agent-gptel)
 
 (defvar macher-agent-active-subagents nil
   "Store active sub-agents and their locked directories as an alist.
@@ -85,7 +83,7 @@ FINAL-CALLBACK upon completion."
                       initial-state))))))
 
 (defun macher-agent-a2a-pipe--resolve-target (state)
-  "Pipeline step 1: Resolve existing buffer or spawn a new one."
+  "Pipeline step 1: Resolve existing buffer or spawn a new one in STATE."
   (let* ((msg (plist-get state :a2a-msg))
          (meta (plist-get msg :metadata))
          (buf-name (plist-get meta :buffer_name))
@@ -148,7 +146,7 @@ FINAL-CALLBACK upon completion."
                          :task-id (plist-get msg :task-id)))))))
 
 (defun macher-agent-a2a-pipe--route-instructions (state)
-  "Pipeline step 2: Route instructions to the buffer or intercept for wakeup."
+  "Pipeline step 2: Route instructions in STATE to buffer or intercept."
   (if (plist-get state :error-payload)
       state
     (let* ((child-buf (plist-get state :child-buf))
@@ -181,7 +179,7 @@ FINAL-CALLBACK upon completion."
          (final-callback (plist-get shared :final-callback))
          (original-payloads (plist-get shared :original-payloads))
          (err-payload (plist-get state :error-payload))
-         (wake-cb (plist-get state :wake-cb))) ; <- Extract wake-cb from state
+         (wake-cb (plist-get state :wake-cb)))
 
     (if err-payload
         (progn
@@ -232,9 +230,9 @@ FINAL-CALLBACK upon completion."
     state))
 
 (defun macher-agent--push-context-to-parent (child-ctx parent-buf)
-  "Merge CHILD-CTX into PARENT-BUF within the strict scope
-of the parent.  This guarantees mutation hooks and skill
-initialisations update the parent's registry."
+  "Merge CHILD-CTX into PARENT-BUF within the strict scope of the parent.
+This guarantees mutation hooks and skill initialisations update the
+parent's registry."
   (when (and child-ctx (buffer-live-p parent-buf))
     (with-current-buffer parent-buf
       (let ((parent-ctx (or (bound-and-true-p macher-agent--persistent-context)
@@ -245,56 +243,57 @@ initialisations update the parent's registry."
               (setq macher-agent--persistent-context merged-ctx))))))))
 
 (defun macher-agent-a2a-pipe--transmit (state)
-  "Pipeline step 5: Transmit the FSM or wake the suspended agent."
+  "Pipeline step 5: Transmit the FSM or wake suspended agent using STATE."
   (unless (plist-get state :error-payload)
-    (let ((wake-cb (plist-get state :wake-cb))
-          (wake-msg (plist-get state :wake-msg))
-          (child-buf (plist-get state :child-buf))
-          (msg (plist-get state :a2a-msg)))
-      (if wake-cb
-          (funcall wake-cb wake-msg)
-        (when (and child-buf (buffer-live-p child-buf))
-          (with-current-buffer child-buf
-            (let* ((task-id (or (plist-get msg :task-id)
-                                (bound-and-true-p macher-agent--current-task-id)))
-                   (a2a-cb (or (plist-get state :a2a-cb)
-                               (bound-and-true-p macher-agent--a2a-callback)))
-                   (target-name (buffer-name child-buf))
-                   (callbacks
-                    (list :success-cb
-                          (lambda (res)
-                            (when (functionp a2a-cb)
-                              (funcall a2a-cb (list :status 'success
-                                                    :data res
-                                                    :task-id task-id
-                                                    :buffer-name target-name))))
-                          :on-success
-                          (lambda (res)
-                            (when (functionp a2a-cb)
-                              (funcall a2a-cb (list :status 'success
-                                                    :data res
-                                                    :task-id task-id
-                                                    :buffer-name target-name))))
-                          :error-cb
-                          (lambda (err)
-                            (when (functionp a2a-cb)
-                              (funcall a2a-cb (list :status 'error
-                                                    :error err
-                                                    :task-id task-id
-                                                    :buffer-name target-name))))
-                          :on-error
-                          (lambda (err)
-                            (when (functionp a2a-cb)
-                              (funcall a2a-cb (list :status 'error
-                                                    :error err
-                                                    :task-id task-id
-                                                    :buffer-name target-name)))))))
-              (if (fboundp 'macher-agent-gptel-transmit)
-                  (let ((ctx (when (fboundp 'make-macher-agent-task-context)
-                               (make-macher-agent-task-context :target-buffer (current-buffer)))))
-                    (if ctx (macher-agent-gptel-transmit ctx callbacks) (gptel-send)))
-                (gptel-send)))))))
-    state))
+    (if-let* ((wake-cb (plist-get state :wake-cb)))
+        (funcall wake-cb (plist-get state :wake-msg))
+      (when-let* ((child-buf (plist-get state :child-buf))
+                  ((buffer-live-p child-buf)))
+        (with-current-buffer child-buf
+          (let* ((msg (plist-get state :a2a-msg))
+                 (task-id (or (plist-get msg :task-id)
+                              (bound-and-true-p macher-agent--current-task-id)))
+                 (a2a-cb (or (plist-get state :a2a-cb)
+                             (bound-and-true-p macher-agent--a2a-callback)))
+                 (target-name (buffer-name child-buf))
+                 (macher-agent--active-fsm nil)
+                 (callbacks
+                  (list :success-cb
+                        (lambda (res)
+                          (when (functionp a2a-cb)
+                            (funcall a2a-cb (list :status 'success
+                                                  :data res
+                                                  :task-id task-id
+                                                  :buffer-name target-name))))
+                        :on-success
+                        (lambda (res)
+                          (when (functionp a2a-cb)
+                            (funcall a2a-cb (list :status 'success
+                                                  :data res
+                                                  :task-id task-id
+                                                  :buffer-name target-name))))
+                        :error-cb
+                        (lambda (err)
+                          (when (functionp a2a-cb)
+                            (funcall a2a-cb (list :status 'error
+                                                  :error err
+                                                  :task-id task-id
+                                                  :buffer-name target-name))))
+                        :on-error
+                        (lambda (err)
+                          (when (functionp a2a-cb)
+                            (funcall a2a-cb (list :status 'error
+                                                  :error err
+                                                  :task-id task-id
+                                                  :buffer-name target-name)))))))
+            
+            (if (fboundp 'macher-agent-gptel-transmit)
+                (if-let* (((fboundp 'make-macher-agent-task-context))
+                          (ctx (make-macher-agent-task-context :target-buffer (current-buffer))))
+                    (macher-agent-gptel-transmit ctx callbacks)
+                  (gptel-send))
+              (macher-agent-bridge-transmit)))))))
+  state)
 
 (cl-defstruct macher-agent-task-context
   "Represent a task execution context structure.
@@ -368,7 +367,7 @@ Side effects: Aborts pending gptel operations and kills BUF."
                     (macher-agent-ready-to-reap-p))))
     (with-current-buffer buf
       (set-buffer-modified-p nil)
-      (gptel-abort buf)
+      (macher-agent-bridge-abort buf)
       (let ((kill-buffer-query-functions nil)
             (kill-buffer-hook nil))
         (kill-buffer buf)))))
@@ -398,12 +397,16 @@ Return the updated system prompt value.
 
 Side effects: None."
   (if (stringp sys-spec)
-      (let ((cur (if (listp current-sys)
-                     (string-join current-sys "\n---\n")
-                   (or current-sys ""))))
-        (concat cur
-                (if (string-empty-p cur) "" "\n---\n")
-                (format "### Skill: %s\n%s\n" sym sys-spec)))
+      (let* ((cur (if (listp current-sys)
+                      (string-join current-sys "\n---\n")
+                    (or current-sys "")))
+             (trimmed-spec (string-trim sys-spec)))
+        (if (and (not (string-empty-p trimmed-spec))
+                 (string-match-p (regexp-quote trimmed-spec) cur))
+            cur
+          (concat cur
+                  (if (string-empty-p cur) "" "\n---\n")
+                  (format "### Skill: %s\n%s\n" sym sys-spec))))
     (gptel--modify-value current-sys sys-spec)))
 
 (defun macher-agent--resolve-single-tool-object (tool)
@@ -791,7 +794,8 @@ BUF is the target buffer, defaulting to current buffer.
 
 Return nil.
 
-Side effects: Sets buffer-local presets, gptel settings, and boot-directive."
+Side effects: Sets buffer-local presets, gptel settings, and
+boot-directive."
   (interactive "sSkill: ")
   (let ((target-buf (cond ((bufferp buf) buf)
                           ((stringp buf) (get-buffer buf))
@@ -806,8 +810,10 @@ Side effects: Sets buffer-local presets, gptel settings, and boot-directive."
 
 (defun macher-agent--push-parent
     (parent-buf &optional parent-cb a2a-cb task-id suppress-patch)
-  "Push a parent context frame onto `macher-agent--parent-stack'
-and update local vars.
+  "Push a parent context.
+
+Push PARENT frame onto `macher-agent--parent-stack' and
+update local vars.
 
 PARENT-BUF is the target parent buffer object.
 PARENT-CB is the optional completion callback function.
@@ -906,7 +912,7 @@ Side effects: None."
          t)))
 
 (defun macher-agent--extract-first-preset-symbol (resolved-presets)
-  "Extract the normalised first preset symbol from RESOLVED-PRESETS.
+  "Extract normalised preset symbol from RESOLVED-PRESETS.
 
 RESOLVED-PRESETS is a string, symbol, list, or vector of presets.
 
@@ -931,10 +937,10 @@ Side effects: None."
     macher-agent-subagent-pipe--resolve-context
     macher-agent-subagent-pipe--init-buffer
     macher-agent-subagent-pipe--register)
-  "Chained reducer pipeline to construct and initialize a subagent buffer.")
+  "Store chained reducer pipeline to construct and initialize a subagent buffer.")
 
 (defun macher-agent-subagent-pipe--normalize-args (state)
-  "Pipeline step 1: Normalize overloaded arguments."
+  "Pipeline step 1: Normalize overloaded arguments in STATE."
   (let ((presets (plist-get state :presets))
         (parent (plist-get state :parent-buf))
         (dir (plist-get state :dir))
@@ -981,7 +987,9 @@ Side effects: None."
                :context ctx)))
 
 (defun macher-agent-subagent-pipe--resolve-context (state)
-  "Pipeline step 2: Resolve context, clone it, and determine target directory."
+  "Pipeline step 2.
+
+Resolve context, clone it, and determine target directory in STATE."
   (let* ((parent (plist-get state :parent-buf))
          (dir (plist-get state :dir))
          (ctx (plist-get state :context))
@@ -1002,7 +1010,7 @@ Side effects: None."
                :target-dir target-dir)))
 
 (defun macher-agent-subagent-pipe--init-buffer (state)
-  "Pipeline step 3: Create and initialize the subagent buffer."
+  "Pipeline step 3: Create and initialize subagent buffer in STATE."
   (let* ((name (plist-get state :name))
          (target-dir (plist-get state :target-dir))
          (parent (plist-get state :parent-buf))
@@ -1034,8 +1042,12 @@ Side effects: None."
          macher-agent--suppress-patch (buffer-local-value 'macher-agent--suppress-patch parent))
         (setq-local
          macher-agent--boot-directive (buffer-local-value 'macher-agent--boot-directive parent))
-        (setq-local gptel--known-presets (buffer-local-value 'gptel--known-presets parent))
-        (setq-local gptel-directives (buffer-local-value 'gptel-directives parent)))
+        (if (boundp 'gptel--known-presets)
+            (setq gptel--known-presets (buffer-local-value 'gptel--known-presets parent))
+          (setq-local gptel--known-presets (buffer-local-value 'gptel--known-presets parent)))
+        (if (boundp 'gptel-directives)
+            (setq gptel-directives (buffer-local-value 'gptel-directives parent))
+          (setq-local gptel-directives (buffer-local-value 'gptel-directives parent))))
 
       (when-let* ((c-ctx cloned-ctx))
         (setq-local macher-agent--persistent-context c-ctx))
@@ -1055,7 +1067,7 @@ Side effects: None."
     (plist-put state :target-buf buf)))
 
 (defun macher-agent-subagent-pipe--register (state)
-  "Pipeline step 4: Register the subagent in tracking lists."
+  "Pipeline step 4: Register subagent in tracking lists using STATE."
   (let* ((name (plist-get state :name))
          (target-dir (plist-get state :target-dir))
          (cloned-ctx (plist-get state :cloned-ctx)))
@@ -1121,7 +1133,7 @@ Side effects: Modifies the target live buffer contents."
 (defun macher-agent-apply-virtual-buffers (&optional context)
   "Apply pending VFS virtual edits to live Emacs buffers.
 
-CONTEXT is the optional VFS context structure. If omitted, resolves
+CONTEXT is the optional VFS context structure.  If omitted, resolves
 the active context.
 
 Return nil.

@@ -1,10 +1,10 @@
-;;; macher-agent-resilience-test.el --- Resilience tests for macher-agent -*- lexical-binding: t -*-
+;;; macher-agent-resilience-test.el --- Resilience tests for macher-agent -*- lexical-binding: t; -*-
 
 (require 'buttercup)
 (require 'cl-lib)
 (require 'macher-agent)
-(require 'macher-agent-gptel-bridge)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-gptel)
+(require 'macher-agent-vfs)
 (require 'macher-agent-orchestration)
 
 (describe
@@ -44,7 +44,7 @@
                       (macher-agent--schedule-buffer-reap buf))))
         (push timer active-timers)
         (kill-buffer buf)
-        (expect (lambda () (funcall (timer--function timer))) :not :to-throw))))
+        (expect (funcall (timer--function timer)) :not :to-throw))))
 
  (describe
   "2. LLM Payload Edge Cases: The Nil-Response Guardrail"
@@ -97,8 +97,12 @@
               (setq-default gptel-directives (cons (cons directive-key directive-msg) old-directives))
               (setq-default gptel--known-presets (cons (cons directive-key (list :system directive-msg)) old-presets))
               (with-current-buffer parent-buf
-                (setq-local gptel-directives (default-value 'gptel-directives))
-                (setq-local gptel--known-presets (default-value 'gptel--known-presets))
+                (if (boundp 'gptel-directives)
+                    (setq gptel-directives (default-value 'gptel-directives))
+                  (setq-local gptel-directives (default-value 'gptel-directives)))
+                (if (boundp 'gptel--known-presets)
+                    (setq gptel--known-presets (default-value 'gptel--known-presets))
+                  (setq-local gptel--known-presets (default-value 'gptel--known-presets)))
                 (setq sub-buf (macher-agent-add-subagent "test-resilience-subagent-directive" (list directive-key))))
               (with-current-buffer sub-buf
                 (expect gptel-system-prompt :to-equal directive-msg)))
@@ -136,7 +140,7 @@
                (workspace (make-macher-agent-workspace :project-root temp-dir))
                (ctx (macher--make-context :workspace workspace :contents nil)))
           (puthash (expand-file-name temp-dir) ctx macher-agent-active-workspaces)
-          (macher-agent-vfs-write workspace file-path updated-text)
+          (macher-agent--update-context-file ctx file-path updated-text)
           (expect (macher-agent--get-context-dirty-p ctx) :to-be t)
           (write-region updated-text nil file-path nil 'silent)
           (macher-agent--auto-sync-context ctx)
@@ -149,3 +153,4 @@
         (delete-directory temp-dir t)))))
 
 (provide 'macher-agent-resilience-test)
+;;; macher-agent-resilience-test.el ends here

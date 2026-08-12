@@ -4,6 +4,7 @@ EMACS ?= emacs
 
 # Find source files while ignoring hidden files, tests, package descriptors, and generated autoloads
 EL_FILES := $(shell find . -maxdepth 2 -name "*.el" \
+	! -path "./bench/*" \
 	! -name "*test.el" \
 	! -name ".*" \
 	! -name "*-pkg.el" \
@@ -41,28 +42,31 @@ define CHECKDOC_ELISP
   (require 'checkdoc) \
   (let ((errors 0)) \
     (dolist (file command-line-args-left) \
-      (let ((diag-buf (get-buffer-create checkdoc-diagnostic-buffer))) \
-        (with-current-buffer diag-buf (erase-buffer))) \
-      (with-current-buffer (find-file-noselect file) \
-        (let ((checkdoc-autofix-flag nil)) \
-          (checkdoc-current-buffer t) \
-          (when-let* ((b (get-buffer checkdoc-diagnostic-buffer))) \
-            (with-current-buffer b \
-              (goto-char (point-min)) \
-              (let ((file-errors nil)) \
-                (while (not (eobp)) \
-                  (let ((line (string-trim (buffer-substring-no-properties (line-beginning-position) (line-end-position))))) \
-                    (when (and (not (string-empty-p line)) \
-                               (not (string-prefix-p "*** " line))) \
-                      (push line file-errors))) \
-                  (forward-line 1)) \
-                (when file-errors \
-                  (setq errors (1+ errors)) \
-                  (message "\n--- checkdoc issues in %s ---" file) \
-                  (dolist (err (nreverse file-errors)) \
-                    (message "  %s" err))))))))) \
+      (let* ((diag-name "*checkdoc-output*") \
+             (diag-buf (get-buffer-create diag-name))) \
+        (with-current-buffer diag-buf \
+          (let ((inhibit-read-only t)) \
+            (erase-buffer))) \
+        (with-current-buffer (find-file-noselect file) \
+          (let ((checkdoc-autofix-flag nil) \
+                (checkdoc-diagnostic-buffer diag-name)) \
+            (checkdoc-current-buffer t))) \
+        (with-current-buffer diag-buf \
+          (goto-char (point-min)) \
+          (let ((has-issues nil)) \
+            (while (not (eobp)) \
+              (let ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position)))) \
+                (when (and (not (string-match-p "^\\s-*$$" line)) \
+                           (not (string-match-p "^\\*\\*\\*" line))) \
+                  (unless has-issues \
+                    (setq has-issues t) \
+                    (setq errors (1+ errors)) \
+                    (princ (format "\n--- checkdoc issues in %s ---\n" file))) \
+                  (princ (format "  %s\n" (string-trim line))))) \
+              (forward-line 1)))))) \
     (when (> errors 0) \
-      (error "checkdoc failed with issues across %d file(s)" errors))))
+      (message "checkdoc failed with issues across %d file(s)" errors) \
+      (kill-emacs 1))))
 endef
 export CHECKDOC_ELISP
 
@@ -72,14 +76,16 @@ define PACKAGE_LINT_ELISP
   (require 'package-lint) \
   (let ((errors 0)) \
     (dolist (file command-line-args-left) \
-      (let ((lint-errors (package-lint-file file))) \
-        (when lint-errors \
-          (message "package-lint issues in %s:" file) \
-          (dolist (err lint-errors) \
-            (message "  Line %d: %s" (car err) (nth 2 err))) \
-          (setq errors (+ errors (length lint-errors)))))) \
+      (with-current-buffer (find-file-noselect file) \
+        (let ((lint-errors (package-lint-buffer))) \
+          (when lint-errors \
+            (message "\n--- package-lint issues in %s ---" file) \
+            (dolist (err lint-errors) \
+              (message "  Line %d: %s" (car err) (nth 3 err))) \
+            (setq errors (+ errors (length lint-errors))))))) \
     (when (> errors 0) \
-      (error "package-lint failed"))))
+      (message "package-lint failed with %d issue(s)" errors) \
+      (kill-emacs 1))))
 endef
 export PACKAGE_LINT_ELISP
 

@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
  macher-agent-multi-edit-buffer-in-workspace-tool
  "Apply 1-to-many replacements to one scoped buffer in your workspace sequentially. All edits use exact text \

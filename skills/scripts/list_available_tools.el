@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (require 'subr-x)
 
 (macher-agent-make-tool

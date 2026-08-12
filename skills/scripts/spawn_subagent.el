@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-spawn-subagent-tool
     "Spawn a new sub-agent buffer to handle delegated work."

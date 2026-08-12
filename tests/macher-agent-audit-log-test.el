@@ -1,4 +1,4 @@
-;;; macher-agent-audit-log-test.el --- Tests for macher-agent audit logging -*- lexical-binding: t -*-
+;;; macher-agent-audit-log-test.el --- Tests for macher-agent audit logging -*- lexical-binding: t; -*-
 
 (require 'buttercup)
 (require 'json)

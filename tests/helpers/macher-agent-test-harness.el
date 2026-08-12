@@ -1,13 +1,12 @@
-;;; macher-agent-test-harness.el --- Shared testing utilities for Macher Agent -*- lexical-binding: t -*-
+;;; macher-agent-test-harness.el --- Shared testing utilities for Macher Agent -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
 (require 'gptel)
 (require 'macher-agent-core)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-vfs)
 (require 'macher-agent-skills)
-(require 'macher-agent-gptel-bridge)
+(require 'macher-agent-gptel)
 (require 'macher-agent-orchestration)
-(require 'macher-agent-gptel-tools)
 (require 'macher-agent-api)
 
 (defmacro with-macher-agent-mock-fsm (ctx &rest body)
@@ -110,3 +109,4 @@ CALL-COUNTER is a symbol bound in the calling environment that increments on dis
          ,@body))))
 
 (provide 'macher-agent-test-harness)
+;;; macher-agent-test-harness.el ends here

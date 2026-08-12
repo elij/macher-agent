@@ -1,10 +1,10 @@
-;;; macher-agent-integration-test.el --- Tests for macher-agent-skills -*- lexical-binding: t -*-
+;;; macher-agent-integration-test.el --- Tests for macher-agent-skills -*- lexical-binding: t; -*-
 
 (require 'buttercup)
-(require 'macher-agent-macher-bridge)
+(require 'macher-agent-macher)
 (require 'macher-agent)
 (require 'macher-agent-orchestration)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-vfs)
 (let ((current-dir (file-name-directory (or load-file-name buffer-file-name))))
   (add-to-list 'load-path (expand-file-name "helpers" current-dir)))
 

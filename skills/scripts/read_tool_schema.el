@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-read-tool-schema-tool
     "Get the exact parameter schema for a specific tool. Use this to understand what a tool does before adding it to a preset."

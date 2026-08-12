@@ -12,12 +12,12 @@
 (require 'org-macro)
 (require 'macher-agent-core)
 (require 'macher-agent-sandbox)
-(require 'macher-agent-vfs-client)
+(require 'macher-agent-vfs)
 (require 'macher-agent-presets)
-(require 'macher-agent-macher-bridge)
-(require 'macher-agent-gptel-bridge)
+(require 'macher-agent-macher)
+(require 'macher-agent-gptel)
 (require 'macher-agent-orchestration)
-(require 'macher-agent-gptel-tools)
+(require 'macher-agent-tools)
 
 (defmacro macher-agent-with-project-root (&rest body)
   "Execute BODY with default directory bound to the project root.
@@ -90,7 +90,7 @@ Side effects: Mutates the active agent context and displays a message."
   (let* ((buf-name (if (bufferp buffer) (buffer-name buffer) buffer))
          (ctx (ignore-errors (macher-agent-resolve-context))))
     (if (not ctx)
-        (error "ERROR: No active Macher Agent context found.")
+        (error "ERROR: No active Macher Agent context found")
       (macher-agent-scope-add-file buf-name ctx)
       (message "SUCCESS: Added '%s' to the agent's authorised scope." buf-name))))
 
@@ -247,25 +247,72 @@ Return the result of evaluating EXPRESSION.
 
 Side effects: Evaluates sandboxed Lisp expression."
   (declare (ftype (function (t list) t)))
-  (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)
-        macher-agent-sandbox--functions (make-hash-table :test 'eq)
-        macher-agent-sandbox--globals (make-hash-table :test 'eq))
-  (macher-agent-sandbox--init extra-operations)
-  (let ((context (ignore-errors (macher-agent-resolve-context)))
-        (iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
-        (yield-val nil)
-        (next-yield nil))
-    (condition-case err
-        (while t
-          (setq next-yield (iter-next iterator yield-val))
-          (when (consp next-yield)
-            (let ((target (or (plist-get next-yield :target)
-                              (plist-get next-yield :name)
-                              (car next-yield)))
-                  (args (plist-get next-yield :args)))
-              (macher-agent-log-tool-intent context "ptc" target args)))
-          (setq yield-val next-yield))
-      (iter-end-of-sequence (cdr err)))))
+  (let ((macher-agent-sandbox--primitives (make-hash-table :test 'eq))
+        (macher-agent-sandbox--functions (make-hash-table :test 'eq))
+        (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
+    (macher-agent-sandbox--init extra-operations)
+    (let ((context (ignore-errors (macher-agent-resolve-context)))
+          (iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
+          (yield-val nil)
+          (next-yield nil))
+      (condition-case err
+          (while t
+            (setq next-yield (iter-next iterator yield-val))
+            (when (consp next-yield)
+              (let ((target (or (plist-get next-yield :target)
+                                (plist-get next-yield :name)
+                                (car next-yield)))
+                    (args (plist-get next-yield :args)))
+                (macher-agent-log-tool-intent context "ptc" target args)))
+            (setq yield-val next-yield))
+        (iter-end-of-sequence (cdr err))))))
+
+(defun macher-agent-apply-patch ()
+  "Apply the active patch from `diff-mode' context back to physical files.
+
+Return nil.
+Side effects: Invokes external process (`git` or `patch`) to apply patch."
+  (interactive)
+  (unless (derived-mode-p 'diff-mode) (user-error "Not in a patch/diff buffer"))
+  (let* ((patch-content (buffer-substring-no-properties (point-min) (point-max)))
+         (ctx (ignore-errors (macher-agent-resolve-context)))
+         (ws (or (when ctx (macher-agent--get-context-workspace ctx))
+                 (macher-agent--get-active-workspace)))
+         (root (if ws
+                   (macher-agent-workspace-project-root ws)
+                 (or (locate-dominating-file default-directory ".git") default-directory)))
+         (default-directory (file-name-as-directory (expand-file-name root)))
+         (use-git (locate-dominating-file default-directory ".git"))
+         (cmd (if use-git "git" "patch"))
+         (args (if use-git '("apply" "-p1" "-") '("-p1"))))
+    (with-temp-buffer
+      (insert patch-content)
+      (let
+          ((exit-code
+            (apply #'call-process-region
+                   (point-min) (point-max) cmd nil "*macher-patch-out*" nil args)))
+        (if (= exit-code 0)
+            (progn
+              (message "SUCCESS: Patch applied safely via %s from %s" cmd default-directory)
+              (when (get-buffer "*macher-patch-out*")
+                (kill-buffer "*macher-patch-out*")))
+          (pop-to-buffer "*macher-patch-out*")
+          (message "ERROR: Failed to apply patch safely."))))))
+
+(defun macher-agent-insert-patch ()
+  "Insert the proposed patch content into the current buffer.
+
+Return nil.
+Side effects: Inserts diff string into the current buffer."
+  (interactive)
+  (if-let* ((patch-buf (macher-agent-trigger-patch))
+            (is-live (buffer-live-p patch-buf))
+            (content
+             (with-current-buffer
+                 patch-buf (buffer-substring-no-properties (point-min) (point-max))))
+            ((not (string-empty-p content))))
+      (insert "\nHere is your proposed patch:\n```diff\n" content "\n```\n")
+    (message "No patch available for current workspace.")))
 
 (provide 'macher-agent-api)
 ;;; macher-agent-api.el ends here

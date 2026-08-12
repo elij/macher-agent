@@ -1,6 +1,9 @@
-;;; macher-agent-zero-mem-interactive.el --- Manual Tests for Macher Agent Zero-Mem -*- lexical-binding: t -*-
+;;; macher-agent-zero-mem-interactive.el --- Manual Tests for Macher Agent Zero-Mem -*- lexical-binding: t; -*-
 
 ;;; Commentary:
+;;
+;; Interactive and manual benchmarks and query inspection routines
+;; for the macher-agent-zero-mem PageRank and graph retrieval engine.
 ;;
 
 ;;; Code:
@@ -44,7 +47,7 @@
 
 ;; 3. Naive regular expression tool
 (defun macher-agent-zero-mem-test-naive-glob (query target-buffer ctx-lines)
-  "Extract matching lines from TARGET-BUFFER with context."
+  "Extract lines matching QUERY from TARGET-BUFFER with CTX-LINES context."
   (let ((results nil))
     (with-current-buffer target-buffer
       (save-excursion
@@ -115,7 +118,7 @@ Returns a list of raw trace plists for the graph engine."
 
 ;; 5. The interactive benchmark command
 (defun macher-agent-zero-mem-intensive-benchmark (param)
-  "Run intensive memory and execution benchmarks interactively across varying corpus sizes."
+  "Run intensive memory and execution benchmarks using PARAM interactively across corpus sizes."
   (interactive "sQuery: ")
   (let ((sizes '(1000 5000 10000))
         (query param)
@@ -221,5 +224,5 @@ Returns a list of raw trace plists for the graph engine."
     (kill-buffer test-buf)
     (pop-to-buffer results-buf)))
 
-(provide 'macher-agent-zero-mem-manual)
-;;; macher-agent-zero-mem-manual.el ends here
+(provide 'macher-agent-zero-mem-interactive)
+;;; macher-agent-zero-mem-interactive.el ends here

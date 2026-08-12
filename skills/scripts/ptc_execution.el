@@ -1,3 +1,4 @@
+;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-ptc-execution-tool
     "Execute an Emacs Lisp orchestration script. Use this to orchestrate multiple tools, \
