@@ -18,11 +18,11 @@ The integration with gptel isolates setting changes to within a workspace. It ad
 
 The default context is orphaned as it is inaccessible within a capture block. All macher tools and patch generation processes are wrapped to inject a macher-agent accessible context, ensuring hydration of the Virtual File System works for disk-based tools. Macher generates diffs for both buffer changes and file changes as 2 different unified diffs. The Virtual File System is persistent until it is cleared, applied, or invalidated (by modifications outside Emacs). When subagents are spawned, they operate on a sibling Virtual File System until they are terminated.
 
-## Memory Recall
+## Examples
 
 ### Macher Agent Zero-Mem Benchmarks (100k tokens)
 
-Memory recall beyond the `gptel-max-tokens` event horizon via the `search_conversation` tool
+Memory recall beyond the `gptel-max-tokens` event horizon via the `search_conversation_history` tool
 
 1000 Traces
 
@@ -49,9 +49,10 @@ Memory recall beyond the `gptel-max-tokens` event horizon via the `search_conver
 | Glob            | 0.000115 s | 0         | 0          |
 
 [Zero-Mem](https://arxiv.org/abs/2607.29377)
+
 [BEAM](https://arxiv.org/pdf/2510.27246)
 
-## Use of PTC for token efficiency
+### Use of PTC for token efficiency
 
 Programmatic tool calling in Elisp allows small scripts that would typically take many tool calling rounds to execute in a single call. PTC usses a yieding Elisp sandbox for all tool calls.
 
@@ -63,27 +64,47 @@ Programmatic tool calling in Elisp allows small scripts that would typically tak
 
 
 ```elisp
-(let* ((listing (list-directory-in-workspace "" "" ""))
-       (lines (split-string listing "\n"))
-       (file-lines (cl-loop for line in lines when (string-prefix-p "file: " line) collect (substring line 6)))
-       (agent-count (length file-lines))
-       (agent-names (cl-loop for i from 0 below agent-count collect (format "agent-%d" i)))
-       (tasks (cl-loop for path in file-lines for name in agent-names
-                       collect (list :buffer_name name
-                                     :instructions (format "Read the first paragraph of the file at '%s' and provide a concise one-sentence summary." path)
-                                     :presets (list "macher-agent-worker")))))
+(let*
+    ((listing (list-directory-in-workspace "" "" ""))
+     (lines (split-string listing "\n"))
+     (file-lines
+      (cl-loop
+       for line in lines when (string-prefix-p "file: " line) collect (substring line 6)))
+     (agent-count (length file-lines))
+     (agent-names (cl-loop for i from 0 below agent-count collect (format "agent-%d" i)))
+     (tasks
+      (cl-loop
+       for path in file-lines for name in agent-names
+       collect (list :buffer_name name
+                     :instructions (format "Read the first paragraph of the file at '%s' and provide a concise one-sentence summary." path)
+                     :presets (list "macher-agent-worker")))))
   (if (zerop agent-count)
       "No files found"
-      (progn
-        (mapcar (lambda (name) (spawn-subagent name (list "macher-agent-worker"))) agent-names)
-        (delegate-tasks-to-subagents tasks))))
+    (progn
+      (mapcar (lambda (name) (spawn-subagent name (list "macher-agent-worker"))) agent-names)
+      (delegate-tasks-to-subagents tasks))))
 
 ```
-## Multi agent VFS
+### Multi agent VFS
 
 Each agent operates a discrete VFS (`macher` context) in the workspace with auto fail-fast merge resolution.
 
 <img alt="VFS" src="https://github.com/user-attachments/assets/123a9010-e39c-4e59-967c-a032a71a52cc" />
+
+### A2A communication
+
+In `macher-agent` the princple coordinatation approach are callbacks which allows the recreation of most topologies.
+
+Agent to agent communication tools
+
+|Tool                         |Description |A2A type                      |VFS sync|
+|-----------------------------|------------|------------------------------|--------|
+|`delegate_tasks_to_subagents`|Execute     |`SEND_MESSAGE`                |Merge   |
+|`submit_task_result`         |Respond.    |`ARTIFACT_UPDATE`             |Merge.  |
+|`spawn_subagent`             |Instantiate.|Lifecycle / Initialisation    |Merge.  |
+|Internal                     |Locks..     |`ACQUIRE_LOCK`, `RELEASE_LOCK`|P2P.    |
+|`wait_for_vfs_semaphore`     |Block.      |`ACQUIRE_LOCK`<br>            |P2P.    |
+|`send_message`               |Message.    |`SEND_MESSAGE`                |Merge.  |
 
 ## Installation
 
