@@ -402,29 +402,29 @@ Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
                      (wrap-cb (macher-agent--wrap-callback callback ptc-exec))
                      (payload (macher-agent--extract-payload tool-args ,args)))
                   (macher-agent--with-tool-error-handling
-                      ',name-symbol payload wrap-cb
-                    (macher-agent--validate-payload payload ,args)
-                    (let*
-                        ((context (macher-agent--get-active-context))
-                         (root
-                          (if context (macher-agent-context-root context) default-directory))
-                         (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
-                      (if hook-rejection
-                          (funcall wrap-cb (list :status 'error :error hook-rejection))
-                        (let*
-                            ((on-success
-                              (macher-agent--build-success-callback
-                               ',name-symbol payload ,success-fn
-                               ,output-filter-fn wrap-cb ptc-exec))
-                             (cmd-fn ,command-fn)
-                             (arity (func-arity cmd-fn)))
-                          (if (or (eq (cdr arity) 'many)
-                                  (and (numberp (cdr arity)) (>= (cdr arity) 4)))
-                              (funcall cmd-fn payload context root on-success)
-                            (let ((action-res (funcall cmd-fn payload context root)))
-                              (if (functionp action-res)
-                                  (funcall action-res on-success)
-                                (funcall on-success action-res)))))))))))))))
+                   ',name-symbol payload wrap-cb
+                   (macher-agent--validate-payload payload ,args)
+                   (let*
+                       ((context (macher-agent--get-active-context))
+                        (root
+                         (if context (macher-agent-context-root context) default-directory))
+                        (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
+                     (if hook-rejection
+                         (funcall wrap-cb (list :status 'error :error hook-rejection))
+                       (let*
+                           ((on-success
+                             (macher-agent--build-success-callback
+                              ',name-symbol payload ,success-fn
+                              ,output-filter-fn wrap-cb ptc-exec))
+                            (cmd-fn ,command-fn)
+                            (arity (func-arity cmd-fn)))
+                         (if (or (eq (cdr arity) 'many)
+                                 (and (numberp (cdr arity)) (>= (cdr arity) 4)))
+                             (funcall cmd-fn payload context root on-success)
+                           (let ((action-res (funcall cmd-fn payload context root)))
+                             (if (functionp action-res)
+                                 (funcall action-res on-success)
+                               (funcall on-success action-res)))))))))))))))
 
 (defun macher-agent-execute-ptc-script
     (script-string context on-success on-error &optional extra-primitives target-buf)

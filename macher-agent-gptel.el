@@ -54,6 +54,20 @@ Side effects: None."
   :type 'integer
   :group 'macher-agent)
 
+(defcustom macher-agent-max-context-chars '((nil . 2000000))
+  "Alist mapping gptel model symbols to their maximum allowed context characters."
+  :type '(alist :key-type symbol :value-type integer)
+  :group 'macher-agent)
+
+(defun macher-agent--get-max-context-chars (&optional buf)
+  "Resolve max context characters based on the model in the current buffer."
+  (let* ((target-buf (or buf (current-buffer)))
+         (model (buffer-local-value 'gptel-model target-buf))
+         (model-sym (if (stringp model) (intern model) model)))
+    (or (alist-get model-sym macher-agent-max-context-chars)
+        (alist-get nil macher-agent-max-context-chars)
+        2000000)))
+
 ;;; Programmatic Tool Calling (PTC)
 
 (defun macher-agent--build-tool-arg-type-spec (arg lisp-name lisp-arg-name)
@@ -332,65 +346,57 @@ _FSM is the finite-state machine object.
 
 Return nil.
 Side effects: Truncates context history in temporary prompt buffer."
-  (let* ((token-limit (or (bound-and-true-p gptel-max-tokens) 2048))
-         (max-chars (* token-limit macher-agent-token-multiplier)))
-
+  (let ((max-chars (macher-agent--get-max-context-chars)))
     (when (> (buffer-size) max-chars)
       (save-excursion
         (goto-char (point-min))
-        (let ((safe-min (point-min)))
-          (when (looking-at "^---\n")
-            (when (re-search-forward "^---\n" nil t 2)
-              (setq safe-min (point))))
-          (let* ((target-pt (max safe-min (- (point-max) max-chars)))
-                 (safe-pt safe-min)
-                 (match nil)
-                 (found nil))
+        (let* ((safe-min (if (and (looking-at "^---\n")
+                                  (re-search-forward "^---\n" nil t 2))
+                             (point)
+                           (point-min)))
+               (target-pt (max safe-min (- (point-max) max-chars)))
+               (safe-pt safe-min)
+               (found nil)
+               (match nil)
+               (safe-boundary-p
+                (lambda (m)
+                  (let* ((end-pt (prop-match-end m))
+                         (next-pt (save-excursion
+                                    (goto-char end-pt)
+                                    (if-let* ((next-m (text-property-search-forward 'gptel 'response t)))
+                                        (prop-match-beginning next-m)
+                                      (point-max)))))
+                    (not (save-excursion
+                           (goto-char end-pt)
+                           (re-search-forward "^[ \t]*\\(```\\|#\\+begin_src \\)tool" next-pt t)))))))
+
+          (goto-char target-pt)
+          (while (and (not found)
+                      (setq match (text-property-search-backward 'gptel 'response t))
+                      (>= (prop-match-beginning match) safe-min))
+            (when (funcall safe-boundary-p match)
+              (setq safe-pt (prop-match-end match) found t)))
+
+          (unless found
             (goto-char target-pt)
             (while (and (not found)
-                        (setq match (text-property-search-backward 'gptel 'response t))
-                        (>= (prop-match-beginning match) safe-min))
-              (let* ((end-pt (prop-match-end match))
-                     (next-match (save-excursion
-                                   (goto-char end-pt)
-                                   (text-property-search-forward 'gptel 'response t)))
-                     (next-pt (if next-match (prop-match-beginning next-match) (point-max)))
-                     (has-tool
-                      (save-excursion
-                        (goto-char end-pt)
-                        (re-search-forward "^[ \t]*\\(```\\|#\\+begin_src \\)tool" next-pt t))))
-                (unless has-tool
-                  (setq safe-pt end-pt)
-                  (setq found t))))
-            (unless found
-              (goto-char target-pt)
-              (while (and (not found)
-                          (setq match (text-property-search-forward 'gptel 'response t)))
-                (let*
-                    ((end-pt (prop-match-end match))
-                     (next-match (save-excursion
-                                   (goto-char end-pt)
-                                   (text-property-search-forward 'gptel 'response t)))
-                     (next-pt (if next-match (prop-match-beginning next-match) (point-max)))
-                     (has-tool
-                      (save-excursion
-                        (goto-char end-pt)
-                        (re-search-forward "^[ \t]*\\(```\\|#\\+begin_src \\)tool" next-pt t))))
-                  (unless has-tool
-                    (setq safe-pt end-pt)
-                    (setq found t)))))
-            (when (> safe-pt safe-min)
-              (let ((lines-deleted (count-lines safe-min safe-pt)))
-                (delete-region safe-min safe-pt)
-                (goto-char safe-min)
-                (insert (format "\n[... SYSTEM ALERT: macher-agent truncated %d lines of early \
+                        (setq match (text-property-search-forward 'gptel 'response t)))
+              (when (funcall safe-boundary-p match)
+                (setq safe-pt (prop-match-end match) found t))))
+
+          (when-let* (((> safe-pt safe-min))
+                      (lines-deleted (count-lines safe-min safe-pt)))
+            (delete-region safe-min safe-pt)
+            (goto-char safe-min)
+            (insert (format "\n[... SYSTEM ALERT: macher-agent truncated %d lines of early \
 history to conserve tokens. If you need this context, use the `search_conversation_history` tool \
 ...]\n\n" lines-deleted))
-                (when (looking-at "^[ \t\n\r]+")
-                  (replace-match ""))))))))
-    (when-let* ((fn async-fn)
-                ((functionp fn)))
-      (funcall fn))))
+            (when (looking-at "^[ \t\n\r]+")
+              (replace-match "")))))))
+
+  (when-let* ((fn async-fn)
+              ((functionp fn)))
+    (funcall fn)))
 
 (defun macher-agent--transformer-sync-context (fsm orig-buf)
   "Synchronise workspace context for FSM in ORIG-BUF buffer.
@@ -503,7 +509,7 @@ Side effects: None."
     (setf (macher-agent-transmission-state-temperature state) (bound-and-true-p gptel-temperature))
     (setf (macher-agent-transmission-state-max-tokens state) (bound-and-true-p gptel-max-tokens))
     (setf (macher-agent-transmission-state-tools state) gptel-tools)
-    (setf (macher-agent-transmission-state-ptc-primitives state) 
+    (setf (macher-agent-transmission-state-ptc-primitives state)
           (or (bound-and-true-p macher-agent-ptc-primitives)
               (bound-and-true-p macher-agent--active-ptc-primitives)))
     (setf (macher-agent-transmission-state-known-presets state) (bound-and-true-p gptel--known-presets)))
@@ -585,7 +591,7 @@ Retained across turns until task completion."
   state)
 
 (defun macher-agent-pipe--compile-directives (state _orig-buf _presets _skills _redirect)
-  "Compile all collected directives in STATE and append them cleanly 
+  "Compile all collected directives in STATE and append them cleanly
 to the base prompt for this single request frame."
   (let ((dirs (nreverse (macher-agent-transmission-state-directives state)))
         (sys (macher-agent-transmission-state-base-prompt state)))
@@ -664,7 +670,7 @@ Return nil.
 Side effects: Synchronises context, updates buffer local state,
 and transforms prompt."
   (let* ((temp-buf (current-buffer))
-         (active-fsm (or fsm 
+         (active-fsm (or fsm
                          (bound-and-true-p gptel--fsm)
                          (bound-and-true-p macher-agent--active-fsm)
                          (bound-and-true-p gptel--fsm-last)))
@@ -672,7 +678,7 @@ and transforms prompt."
                            ((fboundp 'gptel-fsm-info)))
                  (ignore-errors (gptel-fsm-info fsm-obj))))
          (orig-buf (or (and info (plist-get info :buffer)) temp-buf)))
-    
+
     (when (buffer-live-p orig-buf)
       (macher-agent--transformer-sync-context active-fsm orig-buf)
       (let* ((prompt-start
@@ -683,9 +689,9 @@ and transforms prompt."
              (extraction (macher-agent--extract-inline-skills prompt-start orig-buf))
              (inline-skills (car extraction))
              (inline-preset-used (cdr extraction)))
-        
+
         (macher-agent--transformer-sync-ui-presets orig-buf)
-        
+
         (let* ((buffer-presets
                 (with-current-buffer orig-buf (bound-and-true-p macher-agent-presets)))
                (known
@@ -696,10 +702,10 @@ and transforms prompt."
                (redirected-skill
                 (macher-agent--transformer-detect-redirect
                  inline-preset-used prompt-start inline-skills))
-               
+
                (state (macher-agent--compile-transmission-payload
                        orig-buf buffer-presets transmission-skills redirected-skill)))
-          
+
           (macher-agent--apply-payload-locally
            (list :model (macher-agent-transmission-state-model state)
                  :backend (with-current-buffer orig-buf (bound-and-true-p gptel-backend))
@@ -707,13 +713,13 @@ and transforms prompt."
                  :max-tokens (macher-agent-transmission-state-max-tokens state)
                  :tools (macher-agent-transmission-state-tools state)
                  :ptc-primitives (macher-agent-transmission-state-ptc-primitives state)))
-          
+
           (when-let* ((compiled (macher-agent-transmission-state-compiled-prompt state)))
             (setq-local gptel-system-prompt compiled))
-          
+
           (when active-fsm
             (macher-agent--update-fsm-info-from-transmission-state active-fsm state))
-          
+
           (when-let* ((redirect-text (macher-agent-transmission-state-redirect-prompt state)))
             (delete-region prompt-start (point-max))
             (insert redirect-text)
@@ -722,7 +728,7 @@ and transforms prompt."
                 (with-no-warnings (setf (gptel-fsm-prompt active-fsm) redirect-text)))
               (setf (gptel-fsm-info active-fsm)
                     (plist-put (gptel-fsm-info active-fsm) :prompt redirect-text)))))))
-    
+
     (when-let* ((fn async-fn)
                 ((functionp fn)))
       (funcall fn))))

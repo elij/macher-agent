@@ -286,7 +286,7 @@ parent's registry."
                                                   :error err
                                                   :task-id task-id
                                                   :buffer-name target-name)))))))
-            
+
             (if (fboundp 'macher-agent-gptel-transmit)
                 (if-let* (((fboundp 'make-macher-agent-task-context))
                           (ctx (make-macher-agent-task-context :target-buffer (current-buffer))))

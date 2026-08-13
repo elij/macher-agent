@@ -494,7 +494,7 @@ request completion."
           ((agent-ctx (bound-and-true-p macher-agent--persistent-context))
            (process-fn (bound-and-true-p macher-process-request-function)))
         (macher-agent--with-protected-context-contents agent-ctx
-          (funcall process-fn 'complete agent-ctx fsm))))))
+                                                       (funcall process-fn 'complete agent-ctx fsm))))))
 
 (defun macher-agent--context-p (ctx)
   "Determine whether CTX is a valid `macher-context' struct.
@@ -1332,4 +1332,3 @@ display upon completion."
 
 (provide 'macher-agent-macher)
 ;;; macher-agent-macher.el ends here
-

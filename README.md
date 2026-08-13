@@ -52,6 +52,25 @@ Memory recall beyond the `gptel-max-tokens` event horizon via the `search_conver
 
 [BEAM](https://arxiv.org/pdf/2510.27246)
 
+
+``` reasoning
+The user is asking "what have we discussed about London?".
+I notice the system alert mentions that the agent truncated 46 lines of early history.
+
+tool (search_conversation_history :query "London" :conte ...)
+(:name "search_conversation_history" :args (:query "London" :context_lines 10))
+
+--- Match near line 15 ---
+While London as a whole is a massive metropolis, the **City of London** (the historic financial district at its core) is actually a separate, tiny ceremonial city. Spanning just over one square mile, it has its own mayor, distinct governing body, and is the smallest city in the UK.
+
+--- Match near line 13 ---
+Here are 5 random and fascinating facts about London:
+
+--- Match near line 10 ---
+Another line about London that isn't useful
+```
+
+
 ### Use of PTC for token efficiency
 
 Programmatic tool calling in Elisp allows small scripts that would typically take many tool calling rounds to execute in a single call. PTC usses a yieding Elisp sandbox for all tool calls.

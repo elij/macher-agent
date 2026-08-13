@@ -28,4 +28,13 @@
                            (macher-agent--get-context-data context :buffer))
                          (when (and (listp context) (bufferp (plist-get context :buffer)))
                            (plist-get context :buffer)))))
-      (macher-agent-search-dispatch query orig-buf context-lines))))
+      
+      (if (not (buffer-live-p orig-buf))
+          "Error: Original buffer not found."
+        (let* ((max-chars (macher-agent--get-max-context-chars orig-buf))
+               (event-horizon-pt (with-current-buffer orig-buf
+                                   (max (point-min) (- (point-max) max-chars)))))
+          (with-current-buffer orig-buf
+            (save-restriction
+              (narrow-to-region (point-min) event-horizon-pt)
+              (macher-agent-search-dispatch query (current-buffer) context-lines))))))))

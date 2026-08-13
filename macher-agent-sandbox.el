@@ -122,59 +122,59 @@ Including a number of hardcoded defaults."
          (macher-agent-sandbox--eval-sync (cadr args) env)))
 
 (iter-defun macher-agent-sandbox--eval-args-iter (args env)
-  "Evaluate a list of ARGS in ENV using the generator evaluator."
-  (let ((evaled nil))
-    (dolist (arg args (nreverse evaled))
-      (push (iter-yield-from (macher-agent-sandbox--eval-iter arg env)) evaled))))
+            "Evaluate a list of ARGS in ENV using the generator evaluator."
+            (let ((evaled nil))
+              (dolist (arg args (nreverse evaled))
+                (push (iter-yield-from (macher-agent-sandbox--eval-iter arg env)) evaled))))
 
 (iter-defun macher-agent-sandbox--apply-closure-iter (closure arguments)
-  "Execute CLOSURE with ARGUMENTS as a generator."
-  (let ((new-env (cadddr closure))
-        (params (cadr closure))
-        (result nil))
-    (while params
-      (let ((param (pop params)))
-        (cond
-         ((eq param '&rest)
-          (push (cons (pop params) arguments) new-env)
-          (setq arguments nil))
-         ((eq param '&optional)
-          nil)
-         (t
-          (push (cons param (pop arguments)) new-env)))))
-    (dolist (form (caddr closure) result)
-      (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
+            "Execute CLOSURE with ARGUMENTS as a generator."
+            (let ((new-env (cadddr closure))
+                  (params (cadr closure))
+                  (result nil))
+              (while params
+                (let ((param (pop params)))
+                  (cond
+                   ((eq param '&rest)
+                    (push (cons (pop params) arguments) new-env)
+                    (setq arguments nil))
+                   ((eq param '&optional)
+                    nil)
+                   (t
+                    (push (cons param (pop arguments)) new-env)))))
+              (dolist (form (caddr closure) result)
+                (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
 
 (iter-defun macher-agent-sandbox--funcall-symbol-iter (func eval-args)
-  "Execute function symbol FUNC with EVAL-ARGS in the sandbox."
-  (let ((prim (and
-               macher-agent-sandbox--primitives
-               (gethash func macher-agent-sandbox--primitives)))
-        (closure (and
-                  macher-agent-sandbox--functions
-                  (gethash func macher-agent-sandbox--functions))))
-    (cond
-     ((and (fboundp 'macher-agent--ptc-primitive-p)
-           (macher-agent--ptc-primitive-p func))
-      (iter-yield (list :interrupt 'tool-call
-                        :name func
-                        :args (macher-agent-sandbox--normalize-args-to-plist eval-args))))
-     (prim (apply prim eval-args))
-     (closure (iter-yield-from (macher-agent-sandbox--apply-closure-iter closure eval-args)))
-     (t (error "Void or forbidden function: %s" func)))))
+            "Execute function symbol FUNC with EVAL-ARGS in the sandbox."
+            (let ((prim (and
+                         macher-agent-sandbox--primitives
+                         (gethash func macher-agent-sandbox--primitives)))
+                  (closure (and
+                            macher-agent-sandbox--functions
+                            (gethash func macher-agent-sandbox--functions))))
+              (cond
+               ((and (fboundp 'macher-agent--ptc-primitive-p)
+                     (macher-agent--ptc-primitive-p func))
+                (iter-yield (list :interrupt 'tool-call
+                                  :name func
+                                  :args (macher-agent-sandbox--normalize-args-to-plist eval-args))))
+               (prim (apply prim eval-args))
+               (closure (iter-yield-from (macher-agent-sandbox--apply-closure-iter closure eval-args)))
+               (t (error "Void or forbidden function: %s" func)))))
 
 (iter-defun macher-agent-sandbox--funcall-iter (func eval-args)
-  "Execute function FUNC with EVAL-ARGS in the sandbox."
-  (cond
-   ((and (consp func) (eq (car func) 'closure))
-    (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))
-   ((and (consp func) (eq (car func) 'lambda))
-    (iter-yield-from
-     (macher-agent-sandbox--apply-closure-iter
-      (list 'closure (cadr func) (cddr func) nil) eval-args)))
-   ((symbolp func)
-    (iter-yield-from (macher-agent-sandbox--funcall-symbol-iter func eval-args)))
-   (t (error "Invalid function target: %s" func))))
+            "Execute function FUNC with EVAL-ARGS in the sandbox."
+            (cond
+             ((and (consp func) (eq (car func) 'closure))
+              (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))
+             ((and (consp func) (eq (car func) 'lambda))
+              (iter-yield-from
+               (macher-agent-sandbox--apply-closure-iter
+                (list 'closure (cadr func) (cddr func) nil) eval-args)))
+             ((symbolp func)
+              (iter-yield-from (macher-agent-sandbox--funcall-symbol-iter func eval-args)))
+             (t (error "Invalid function target: %s" func))))
 
 (defun macher-agent-sandbox--normalize-args-to-plist (args)
   "Normalise ARGS into a standard plist for tool calls."
@@ -205,74 +205,74 @@ Including a number of hardcoded defaults."
    (t args)))
 
 (iter-defun macher-agent-sandbox--eval-single-binding-iter (binding eval-env)
-  "Evaluate a single BINDING specification in EVAL-ENV."
-  (let ((var (if (consp binding) (car binding) binding))
-        (val (when (consp binding)
-               (iter-yield-from (macher-agent-sandbox--eval-iter (cadr binding) eval-env)))))
-    (cons var val)))
+            "Evaluate a single BINDING specification in EVAL-ENV."
+            (let ((var (if (consp binding) (car binding) binding))
+                  (val (when (consp binding)
+                         (iter-yield-from (macher-agent-sandbox--eval-iter (cadr binding) eval-env)))))
+              (cons var val)))
 
 (iter-defun macher-agent-sandbox--bind-iter (bindings env is-star)
-  "Process BINDINGS to extend lexical environment ENV.
+            "Process BINDINGS to extend lexical environment ENV.
 
 If IS-STAR is non-nil, evaluate each binding in the updated environment."
-  (let ((new-env env))
-    (dolist (binding bindings new-env)
-      (let*
-          ((eval-env (if is-star new-env env))
-           (pair
-            (iter-yield-from
-             (macher-agent-sandbox--eval-single-binding-iter binding eval-env))))
-        (setq new-env (cons pair new-env))))))
+            (let ((new-env env))
+              (dolist (binding bindings new-env)
+                (let*
+                    ((eval-env (if is-star new-env env))
+                     (pair
+                      (iter-yield-from
+                       (macher-agent-sandbox--eval-single-binding-iter binding eval-env))))
+                  (setq new-env (cons pair new-env))))))
 
 (iter-defun macher-agent-sandbox--eval-and-or-iter (args env is-or)
-  "Evaluate boolean logic forms ARGS in ENV.
+            "Evaluate boolean logic forms ARGS in ENV.
 
 If IS-OR is non-nil, evaluate as `or', otherwise evaluate as `and'."
-  (let ((result (not is-or)))
-    (while (and args (if is-or (not result) result))
-      (setq result (iter-yield-from (macher-agent-sandbox--eval-iter (pop args) env))))
-    result))
+            (let ((result (not is-or)))
+              (while (and args (if is-or (not result) result))
+                (setq result (iter-yield-from (macher-agent-sandbox--eval-iter (pop args) env))))
+              result))
 
 (iter-defun macher-agent-sandbox--eval-let-iter (args env is-star)
-  "Evaluate let or let* form ARGS in ENV.
+            "Evaluate let or let* form ARGS in ENV.
 
 If IS-STAR is non-nil, evaluate as `let*', otherwise evaluate as `let'."
-  (let ((new-env (iter-yield-from (macher-agent-sandbox--bind-iter (car args) env is-star)))
-        (result nil))
-    (dolist (form (cdr args) result)
-      (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
+            (let ((new-env (iter-yield-from (macher-agent-sandbox--bind-iter (car args) env is-star)))
+                  (result nil))
+              (dolist (form (cdr args) result)
+                (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
 
 (iter-defun macher-agent-sandbox--eval-setq-iter (args env)
-  "Evaluate setq form ARGS in ENV."
-  (let ((val nil))
-    (while args
-      (let* ((var (pop args))
-             (rhs (pop args))
-             (evaled (iter-yield-from (macher-agent-sandbox--eval-iter rhs env)))
-             (binding (assoc var env)))
-        (setq val evaled)
-        (if binding
-            (setcdr binding val)
-          (puthash var val macher-agent-sandbox--globals))))
-    val))
+            "Evaluate setq form ARGS in ENV."
+            (let ((val nil))
+              (while args
+                (let* ((var (pop args))
+                       (rhs (pop args))
+                       (evaled (iter-yield-from (macher-agent-sandbox--eval-iter rhs env)))
+                       (binding (assoc var env)))
+                  (setq val evaled)
+                  (if binding
+                      (setcdr binding val)
+                    (puthash var val macher-agent-sandbox--globals))))
+              val))
 
 (iter-defun macher-agent-sandbox--eval-mapcar-iter (args env)
-  "Evaluate mapcar form ARGS in ENV."
-  (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
-        (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env)))
-        (result nil))
-    (unless (listp seq) (error "Execution error (mapcar): Wrong type argument: listp, %s" seq))
-    (dolist (item seq (nreverse result))
-      (push (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))) result))))
+            "Evaluate mapcar form ARGS in ENV."
+            (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
+                  (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env)))
+                  (result nil))
+              (unless (listp seq) (error "Execution error (mapcar): Wrong type argument: listp, %s" seq))
+              (dolist (item seq (nreverse result))
+                (push (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))) result))))
 
 (iter-defun macher-agent-sandbox--eval-mapc-iter (args env)
-  "Evaluate mapc form ARGS in ENV."
-  (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
-        (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env))))
-    (unless (listp seq)
-      (error "Execution error (mapc): Wrong type argument: listp, %s" seq))
-    (dolist (item seq seq)
-      (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))))))
+            "Evaluate mapc form ARGS in ENV."
+            (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
+                  (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env))))
+              (unless (listp seq)
+                (error "Execution error (mapc): Wrong type argument: listp, %s" seq))
+              (dolist (item seq seq)
+                (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))))))
 
 (defvar macher-agent-sandbox--special-forms nil
   "Store mapping of special form symbols to handler functions.")
@@ -419,46 +419,46 @@ If IS-STAR is non-nil, evaluate as `let*', otherwise evaluate as `let'."
         val)))))
 
 (iter-defun macher-agent-sandbox--eval-compound-iter (expression environment)
-  "Evaluate compound form EXPRESSION in ENVIRONMENT."
-  (let* ((operator (car expression))
-         (arguments (cdr expression))
-         (special-handler (and (symbolp operator)
-                               (cdr (assoc operator macher-agent-sandbox--special-forms))))
-         (macro-def (and (symbolp operator)
-                         (gethash operator macher-agent-sandbox--functions))))
-    (cond
-     ((and (symbolp operator)
-           (fboundp 'macher-agent--ptc-primitive-p)
-           (macher-agent--ptc-primitive-p operator))
-      (let
-          ((evaled-args (iter-yield-from
-                         (macher-agent-sandbox--eval-args-iter arguments environment))))
-        (iter-yield
-         (list :interrupt 'tool-call
-               :name operator
-               :args (macher-agent-sandbox--normalize-args-to-plist evaled-args)))))
-     (special-handler
-      (iter-yield-from (funcall special-handler arguments environment)))
-     ((and (consp macro-def) (eq (car macro-def) 'macro))
-      (let* ((macro-fn (cdr macro-def))
-             (expanded-form (iter-yield-from
-                             (macher-agent-sandbox--funcall-iter macro-fn arguments))))
-        (iter-yield-from (macher-agent-sandbox--eval-iter expanded-form environment))))
-     (t
-      (let ((evaled-args (iter-yield-from
-                          (macher-agent-sandbox--eval-args-iter arguments environment))))
-        (iter-yield-from (macher-agent-sandbox--funcall-iter operator evaled-args)))))))
+            "Evaluate compound form EXPRESSION in ENVIRONMENT."
+            (let* ((operator (car expression))
+                   (arguments (cdr expression))
+                   (special-handler (and (symbolp operator)
+                                         (cdr (assoc operator macher-agent-sandbox--special-forms))))
+                   (macro-def (and (symbolp operator)
+                                   (gethash operator macher-agent-sandbox--functions))))
+              (cond
+               ((and (symbolp operator)
+                     (fboundp 'macher-agent--ptc-primitive-p)
+                     (macher-agent--ptc-primitive-p operator))
+                (let
+                    ((evaled-args (iter-yield-from
+                                   (macher-agent-sandbox--eval-args-iter arguments environment))))
+                  (iter-yield
+                   (list :interrupt 'tool-call
+                         :name operator
+                         :args (macher-agent-sandbox--normalize-args-to-plist evaled-args)))))
+               (special-handler
+                (iter-yield-from (funcall special-handler arguments environment)))
+               ((and (consp macro-def) (eq (car macro-def) 'macro))
+                (let* ((macro-fn (cdr macro-def))
+                       (expanded-form (iter-yield-from
+                                       (macher-agent-sandbox--funcall-iter macro-fn arguments))))
+                  (iter-yield-from (macher-agent-sandbox--eval-iter expanded-form environment))))
+               (t
+                (let ((evaled-args (iter-yield-from
+                                    (macher-agent-sandbox--eval-args-iter arguments environment))))
+                  (iter-yield-from (macher-agent-sandbox--funcall-iter operator evaled-args)))))))
 
 (iter-defun macher-agent-sandbox--eval-iter (expression environment)
-  "Evaluate EXPRESSION in ENVIRONMENT yielding on PTC tool calls."
-  (macher-agent-sandbox--init)
-  (cond
-   ((or (numberp expression) (stringp expression) (memq expression '(t nil)))
-    expression)
-   ((symbolp expression)
-    (macher-agent-sandbox--eval-symbol expression environment))
-   ((consp expression)
-    (iter-yield-from (macher-agent-sandbox--eval-compound-iter expression environment)))))
+            "Evaluate EXPRESSION in ENVIRONMENT yielding on PTC tool calls."
+            (macher-agent-sandbox--init)
+            (cond
+             ((or (numberp expression) (stringp expression) (memq expression '(t nil)))
+              expression)
+             ((symbolp expression)
+              (macher-agent-sandbox--eval-symbol expression environment))
+             ((consp expression)
+              (iter-yield-from (macher-agent-sandbox--eval-compound-iter expression environment)))))
 
 (provide 'macher-agent-sandbox)
 ;;; macher-agent-sandbox.el ends here
