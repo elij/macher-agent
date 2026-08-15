@@ -8,10 +8,15 @@
 
 ;;; Code:
 
+(require 'subr-x)
 (require 'buttercup)
 (require 'macher-agent-macher)
 (require 'cl-lib)
 (require 'macher-agent)
+
+(defvar gptel--fsm)
+(defvar macher-agent--active-fsm)
+(defvar gptel--fsm-last)
 
 ;; Dummy gptel structures for mocking
 (cl-defstruct mock-gptel-fsm info state)
@@ -276,7 +281,7 @@
                           (with-temp-buffer
                             (macher-agent-setup-gptel-buffer)
                             (expect gptel-prompt-transform-functions
-                                    :to-equal '(macher-agent-sync-prompt-transformer t t1 t2)))))
+                                    :to-equal '(macher-agent--transform-inject-context macher-agent-sync-prompt-transformer t t1 t2)))))
 
                     (it "triggers pending media injection on FSM updates"
                         (let* ((ctx (macher--make-context :workspace nil :contents nil))
@@ -340,6 +345,269 @@
 
                               (it "confirms redundant macher-agent--show-ui function is removed"
                                   (expect (fboundp 'macher-agent--show-ui) :to-be nil)))))
+
+(describe "9. Context Resolution and Prompt Injection"
+          (describe "macher-agent--resolve-context"
+                    (it "resolves context from FSM info plist"
+                        (let* ((mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :macher-agent-context mock-ctx))))
+                          (expect (macher-agent--resolve-context fsm) :to-be mock-ctx)))
+
+                    (it "returns nil when FSM info plist does not contain context"
+                        (let ((fsm (gptel-make-fsm :info (list :buffer "dummy"))))
+                          (expect (macher-agent--resolve-context fsm) :to-be nil)))
+
+                    (it "resolves context from buffer-local persistent context"
+                        (let ((buf (get-buffer-create "test-resolve-ctx-buf"))
+                              (mock-ctx (macher--make-context :contents nil)))
+                          (unwind-protect
+                              (with-current-buffer buf
+                                (setq-local macher-agent--persistent-context mock-ctx)
+                                (expect (macher-agent--resolve-context buf) :to-be mock-ctx))
+                            (kill-buffer buf))))
+
+                    (it "returns nil when buffer has no persistent context"
+                        (let ((buf (get-buffer-create "test-resolve-no-ctx-buf")))
+                          (unwind-protect
+                              (with-current-buffer buf
+                                (setq-local macher-agent--persistent-context nil)
+                                (expect (macher-agent--resolve-context buf) :to-be nil))
+                            (kill-buffer buf))))
+
+                    (it "returns nil for non-FSM, non-buffer input values"
+                        (expect (macher-agent--resolve-context nil) :to-be nil)
+                        (expect (macher-agent--resolve-context "not-a-buffer") :to-be nil)
+                        (expect (macher-agent--resolve-context 'some-symbol) :to-be nil)
+                        (expect (macher-agent--resolve-context 12345) :to-be nil)
+                        (expect (macher-agent--resolve-context '(:key "val")) :to-be nil)))
+
+          (describe "macher-agent--get-active-context"
+                    (it "returns active context using gptel--fsm via macher-agent--resolve-context"
+                        (let* ((mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :macher-agent-context mock-ctx))))
+                          (dlet ((gptel--fsm fsm)
+                                 (macher-agent--active-fsm nil)
+                                 (gptel--fsm-last nil))
+                            (expect (macher-agent--get-active-context) :to-be mock-ctx))))
+
+                    (it "returns active context using macher-agent--active-fsm when gptel--fsm is nil"
+                        (let* ((mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :macher-agent-context mock-ctx))))
+                          (dlet ((gptel--fsm nil)
+                                 (macher-agent--active-fsm fsm)
+                                 (gptel--fsm-last nil))
+                            (expect (macher-agent--get-active-context) :to-be mock-ctx))))
+
+                    (it "returns active context using gptel--fsm-last fallback"
+                        (let* ((mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :macher-agent-context mock-ctx))))
+                          (dlet ((gptel--fsm nil)
+                                 (macher-agent--active-fsm nil)
+                                 (gptel--fsm-last fsm))
+                            (expect (macher-agent--get-active-context) :to-be mock-ctx))))
+
+                    (it "returns nil when all FSM variables are unbound or nil"
+                        (dlet ((gptel--fsm nil)
+                               (macher-agent--active-fsm nil)
+                               (gptel--fsm-last nil))
+                          (expect (macher-agent--get-active-context) :to-be nil))))
+
+          (describe "macher-agent--transform-inject-context"
+                    (it "injects context from live originating buffer into FSM info"
+                        (let* ((origin-buf (get-buffer-create "test-origin-buf"))
+                               (mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :buffer origin-buf :model "test-model")))
+                               (called nil))
+                          (unwind-protect
+                              (progn
+                                (with-current-buffer origin-buf
+                                  (setq-local macher-agent--persistent-context mock-ctx))
+                                (macher-agent--transform-inject-context
+                                 (lambda () (setq called t))
+                                 fsm)
+                                (expect called :to-be t)
+                                (expect (plist-get (gptel-fsm-info fsm) :macher-agent-context) :to-be mock-ctx)
+                                (expect (plist-get (gptel-fsm-info fsm) :model) :to-equal "test-model"))
+                            (kill-buffer origin-buf))))
+
+                    (it "does not inject context if originating buffer context is nil"
+                        (let* ((origin-buf (get-buffer-create "test-origin-buf-no-ctx"))
+                               (fsm (gptel-make-fsm :info (list :buffer origin-buf :model "test-model")))
+                               (called nil))
+                          (unwind-protect
+                              (progn
+                                (with-current-buffer origin-buf
+                                  (setq-local macher-agent--persistent-context nil))
+                                (macher-agent--transform-inject-context
+                                 (lambda () (setq called t))
+                                 fsm)
+                                (expect called :to-be t)
+                                (expect (plist-get (gptel-fsm-info fsm) :macher-agent-context) :to-be nil))
+                            (kill-buffer origin-buf))))
+
+                    (it "does not inject context if originating buffer is dead"
+                        (let* ((origin-buf (get-buffer-create "test-origin-buf-dead"))
+                               (mock-ctx (macher--make-context :contents nil))
+                               (fsm nil)
+                               (called nil))
+                          (with-current-buffer origin-buf
+                            (setq-local macher-agent--persistent-context mock-ctx))
+                          (setq fsm (gptel-make-fsm :info (list :buffer origin-buf)))
+                          (kill-buffer origin-buf)
+                          (macher-agent--transform-inject-context
+                           (lambda () (setq called t))
+                           fsm)
+                          (expect called :to-be t)
+                          (expect (plist-get (gptel-fsm-info fsm) :macher-agent-context) :to-be nil)))
+
+                    (it "executes callback when fsm is nil"
+                        (let ((called nil))
+                          (macher-agent--transform-inject-context
+                           (lambda () (setq called t))
+                           nil)
+                          (expect called :to-be t)))
+
+                    (it "executes callback when fsm has no buffer in info"
+                        (let* ((fsm (gptel-make-fsm :info (list :model "test-model")))
+                               (called nil))
+                          (macher-agent--transform-inject-context
+                           (lambda () (setq called t))
+                           fsm)
+                          (expect called :to-be t)
+                          (expect (plist-get (gptel-fsm-info fsm) :macher-agent-context) :to-be nil)))
+
+                    (it "updates existing context in FSM info"
+                        (let* ((origin-buf (get-buffer-create "test-origin-buf-update"))
+                               (old-ctx (macher--make-context :contents nil))
+                               (new-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :buffer origin-buf :macher-agent-context old-ctx :model "test-model")))
+                               (called nil))
+                          (unwind-protect
+                              (progn
+                                (with-current-buffer origin-buf
+                                  (setq-local macher-agent--persistent-context new-ctx))
+                                (macher-agent--transform-inject-context
+                                 (lambda () (setq called t))
+                                 fsm)
+                                (expect called :to-be t)
+                                (expect (plist-get (gptel-fsm-info fsm) :macher-agent-context) :to-be new-ctx)
+                                (expect (plist-get (gptel-fsm-info fsm) :model) :to-equal "test-model"))
+                            (kill-buffer origin-buf))))
+
+                    (it "handles nil async-fn gracefully"
+                        (let* ((origin-buf (get-buffer-create "test-origin-buf-nil-fn"))
+                               (mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :buffer origin-buf :model "test-model"))))
+                          (unwind-protect
+                              (progn
+                                (with-current-buffer origin-buf
+                                  (setq-local macher-agent--persistent-context mock-ctx))
+                                (macher-agent--transform-inject-context nil fsm)
+                                (expect (plist-get (gptel-fsm-info fsm) :macher-agent-context) :to-be mock-ctx))
+                            (kill-buffer origin-buf)))))
+
+          (describe "macher-agent--transformer-sync-context"
+                    (it "synchronizes context and initializes skills with buffer presets"
+                        (let* ((orig-buf (get-buffer-create "test-ert-sync-ctx-orig"))
+                               (mock-ctx (macher--make-context :contents nil))
+                               (synced-ctx nil)
+                               (init-skills-ctx nil))
+                          (unwind-protect
+                              (progn
+                                (cl-letf (((symbol-function 'macher-agent--auto-sync-context)
+                                           (lambda (ctx) (setq synced-ctx ctx)))
+                                          ((symbol-function 'macher-agent-initialize-skills)
+                                           (lambda (ctx) (setq init-skills-ctx ctx))))
+                                  (with-current-buffer orig-buf
+                                    (setq-local gptel-directives '((custom-preset . "Custom directive text")))
+                                    (setq-local gptel-system-prompt "Custom directive text")
+                                    (setq-local macher-agent-presets nil))
+                                  (let ((res (macher-agent--transformer-sync-context mock-ctx orig-buf)))
+                                    (expect res :to-be mock-ctx)
+                                    (expect synced-ctx :to-be mock-ctx)
+                                    (expect init-skills-ctx :to-be mock-ctx)
+                                    (with-current-buffer orig-buf
+                                      (expect macher-agent-presets :to-equal '(custom-preset))))))
+                            (kill-buffer orig-buf))))
+
+                    (it "returns nil when context is nil"
+                        (let ((orig-buf (get-buffer-create "test-ert-sync-ctx-nil")))
+                          (unwind-protect
+                              (progn
+                                (with-current-buffer orig-buf
+                                  (setq-local gptel-directives nil)
+                                  (setq-local macher-agent-presets nil))
+                                (let ((res (macher-agent--transformer-sync-context nil orig-buf)))
+                                  (expect res :to-be nil)))
+                            (kill-buffer orig-buf)))))
+
+          (describe "macher-agent-sync-prompt-transformer"
+                    (it "resolves context and syncs"
+                        (let* ((orig-buf (get-buffer-create "test-ert-sync-prompt-orig"))
+                               (temp-buf (get-buffer-create "test-ert-sync-prompt-temp"))
+                               (mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :buffer orig-buf :macher-agent-context mock-ctx)))
+                               (passed-ctx nil)
+                               (passed-buf nil))
+                          (unwind-protect
+                              (progn
+                                (cl-letf (((symbol-function 'macher-agent--transformer-sync-context)
+                                           (lambda (ctx buf)
+                                             (setq passed-ctx ctx)
+                                             (setq passed-buf buf)
+                                             ctx)))
+                                  (with-current-buffer temp-buf
+                                    (macher-agent-sync-prompt-transformer nil fsm))
+                                  (expect passed-ctx :to-be mock-ctx)
+                                  (expect passed-buf :to-be orig-buf)))
+                            (kill-buffer orig-buf)
+                            (kill-buffer temp-buf)))))
+
+          (describe "macher-agent completion and patch triggering"
+                    (it "verifies macher-agent--get-buffer-persistent-context is deleted"
+                        (expect (fboundp 'macher-agent--get-buffer-persistent-context) :to-be nil))
+
+                    (it "processes completed FSM buffer with injected context"
+                        (let* ((target-buf (get-buffer-create "test-ert-completed-fsm-buf"))
+                               (mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :buffer target-buf)))
+                               (called-action nil)
+                               (called-ctx nil)
+                               (called-fsm nil))
+                          (unwind-protect
+                              (with-current-buffer target-buf
+                                (setq-local macher-agent--pending-instructions-queue '("pending-1"))
+                                (let ((macher-process-request-function
+                                       (lambda (action ctx f)
+                                         (setq called-action action
+                                               called-ctx ctx
+                                               called-fsm f))))
+                                  (macher-agent--process-completed-fsm-buffer mock-ctx target-buf fsm)
+                                  (expect called-action :to-be 'complete)
+                                  (expect called-ctx :to-be mock-ctx)
+                                  (expect called-fsm :to-be fsm)
+                                  (expect macher-agent--pending-instructions-queue :to-be nil))))
+                            (kill-buffer target-buf)))
+
+                    (it "resolves context and forwards on trigger patch on complete"
+                        (let* ((target-buf (get-buffer-create "test-ert-trigger-patch-buf"))
+                               (mock-ctx (macher--make-context :contents nil))
+                               (fsm (gptel-make-fsm :info (list :buffer target-buf :macher-agent-context mock-ctx)
+                                                    :state 'DONE))
+                               (forwarded-ctx nil)
+                               (forwarded-buf nil)
+                               (forwarded-fsm nil))
+                          (unwind-protect
+                              (cl-letf (((symbol-function 'macher-agent--process-completed-fsm-buffer)
+                                         (lambda (ctx buf f)
+                                           (setq forwarded-ctx ctx
+                                                 forwarded-buf buf
+                                                 forwarded-fsm f))))
+                                (macher-agent--trigger-patch-on-complete fsm)
+                                (expect forwarded-ctx :to-be mock-ctx)
+                                (expect forwarded-buf :to-be target-buf)
+                                (expect forwarded-fsm :to-be fsm))
+                            (kill-buffer target-buf))))))
 
 (provide 'macher-agent-core-test)
 ;;; macher-agent-core-test.el ends here

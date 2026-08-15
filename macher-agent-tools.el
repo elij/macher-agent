@@ -96,24 +96,12 @@ Side effects: None.")
 ;;; Execution Helpers
 
 (defun macher-agent--get-active-context ()
-  "Extract the active VFS context strictly from the executing FSM.
-
-Return active context or nil if no FSM is active.
-Side effects: None."
-  (when-let* ((fsm (or (bound-and-true-p macher-agent--active-fsm)
-                       (macher-agent--get-fsm-latest)))
-              (info (cond
-                     ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm))
-                      (gptel-fsm-info fsm))
-                     ((listp fsm) fsm)
-                     ((fboundp 'gptel-fsm-info)
-                      (ignore-errors (gptel-fsm-info fsm)))
-                     (t nil))))
-    (or (plist-get info :macher-agent-context)
-        (plist-get info :macher--context)
-        (when-let* ((buf (plist-get info :buffer))
-                    ((buffer-live-p buf)))
-          (buffer-local-value 'macher-agent--persistent-context buf)))))
+  "Extract the active VFS context from the currently executing or latest FSM.
+Returns the `macher-context` object or nil if unavailable."
+  (when-let* ((active-fsm (or (bound-and-true-p gptel--fsm)
+                              (bound-and-true-p macher-agent--active-fsm)
+                              (bound-and-true-p gptel--fsm-last))))
+    (macher-agent--resolve-context active-fsm)))
 
 (defun macher-agent--wrap-callback (gptel-cb &optional ptc-exec)
   "Create a pure callback wrapper that processes results.

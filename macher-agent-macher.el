@@ -363,23 +363,6 @@ Side effects: None."
       (bound-and-true-p gptel--fsm)
       (bound-and-true-p gptel--fsm-last)))
 
-(defun macher-agent--get-buffer-persistent-context (&optional buf)
-  "Get the buffer-local persistent context for BUF.
-
-Retrieve `macher-agent--persistent-context' from buffer BUF,
-defaulting BUF to the target buffer associated with `gptel--fsm'
-or current buffer.
-
-Return the context structure, or nil if unset or buffer is dead.
-
-Side effects: None."
-  (let ((target (or buf
-                    (and (boundp 'gptel--fsm) gptel--fsm
-                         (plist-get (gptel-fsm-info gptel--fsm) :buffer))
-                    (current-buffer))))
-    (when (buffer-live-p target)
-      (buffer-local-value 'macher-agent--persistent-context target))))
-
 (defun macher-agent--inject-context-into-fsm-info (agent-ctx &optional fsm)
   "Inject AGENT-CTX into FSM info property list.
 
@@ -420,7 +403,8 @@ Side effects: Mutates function slot of TOOL and updates
                      (target-buf (or (when (and fsm (fboundp 'gptel-fsm-info))
                                        (ignore-errors (plist-get (gptel-fsm-info fsm) :buffer)))
                                      (current-buffer)))
-                     (agent-ctx (macher-agent--get-buffer-persistent-context target-buf)))
+                     (agent-ctx (or (macher-agent--resolve-context fsm)
+                                    (macher-agent--resolve-context target-buf))))
                 (if agent-ctx
                     (progn
                       (when (and orphaned-context (macher-context-p orphaned-context))
@@ -475,7 +459,7 @@ BODY executes."
          (when (and ,ctx-sym ,protected-sym)
            (macher-agent--set-context-contents ,ctx-sym ,protected-sym))))))
 
-(defun macher-agent--process-completed-fsm-buffer (buffer fsm)
+(defun macher-agent--process-completed-fsm-buffer (context buffer fsm)
   "Process completed FSM in BUFFER context.
 
 Evaluate request completion logic within live BUFFER for
@@ -491,10 +475,9 @@ request completion."
     (with-current-buffer buffer
       (setq-local macher-agent--pending-instructions-queue nil)
       (when-let*
-          ((agent-ctx (bound-and-true-p macher-agent--persistent-context))
-           (process-fn (bound-and-true-p macher-process-request-function)))
-        (macher-agent--with-protected-context-contents agent-ctx
-                                                       (funcall process-fn 'complete agent-ctx fsm))))))
+          ((process-fn (bound-and-true-p macher-process-request-function)))
+        (macher-agent--with-protected-context-contents context
+                                                       (funcall process-fn 'complete context fsm))))))
 
 (defun macher-agent--context-p (ctx)
   "Determine whether CTX is a valid `macher-context' struct.
@@ -585,7 +568,7 @@ Side effects: May initialise workspace state for current directory."
   (save-excursion
     (when-let* ((current-root (macher-agent-root default-directory)))
       (macher-agent--init-workspace-state current-root)
-      (bound-and-true-p macher-agent--persistent-context))))
+      (macher-agent--resolve-context (current-buffer)))))
 
 (defun macher-agent--register-active-workspace-root (root context)
   "Register CONTEXT for ROOT in `macher-agent-active-workspaces` hash-table.
@@ -670,7 +653,7 @@ Side effects: May populate `:expanded-root' in STATE."
       state
     (let* ((st (macher-agent--get-expanded-root state))
            (active-root-expanded (plist-get st :expanded-root))
-           (pers-ctx (bound-and-true-p macher-agent--persistent-context)))
+           (pers-ctx (macher-agent--resolve-context (current-buffer))))
       (if pers-ctx
           (let ((pers-matches (macher-agent--match-persistent-context pers-ctx active-root-expanded)))
             (if (or pers-matches (bound-and-true-p macher-agent--is-subagent))
@@ -707,7 +690,7 @@ populate `:expanded-root' in STATE."
           (let ((final-ctx
                  (if (not (bound-and-true-p macher-agent--is-subagent))
                      (progn
-                       (let ((pers-ctx (bound-and-true-p macher-agent--persistent-context)))
+                       (let ((pers-ctx (macher-agent--resolve-context (current-buffer))))
                          (when (not (eq pers-ctx canonical-ctx))
                            (setq-local macher-agent--persistent-context canonical-ctx)))
                        canonical-ctx)
@@ -947,7 +930,7 @@ Return the resolved `macher-context` struct, or nil."
       ws-or-ctx
     (let* ((target-root (macher-agent-workspace-project-root ws-or-ctx))
            (expanded-root (and target-root (expand-file-name target-root)))
-           (pers-ctx (bound-and-true-p macher-agent--persistent-context)))
+           (pers-ctx (macher-agent--resolve-context (current-buffer))))
       (or (macher-agent--match-persistent-context pers-ctx expanded-root)
           (macher-agent--find-active-workspace-in-ancestors expanded-root)
           (ignore-errors (macher-agent-resolve-context))))))
@@ -1324,9 +1307,10 @@ display upon completion."
       (let ((macher-agent--inhibit-patch-hook t))
         (when (eq (gptel-fsm-state fsm) 'DONE)
           (let* ((info (gptel-fsm-info fsm))
-                 (buffer (plist-get info :buffer)))
+                 (buffer (plist-get info :buffer))
+                 (context (macher-agent--resolve-context fsm)))
             (with-current-buffer buffer
-              (macher-agent--process-completed-fsm-buffer buffer fsm))))))))
+              (macher-agent--process-completed-fsm-buffer context buffer fsm))))))))
 
 (advice-add 'gptel--fsm-transition :after #'macher-agent--trigger-patch-on-complete)
 

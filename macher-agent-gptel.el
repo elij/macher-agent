@@ -398,41 +398,28 @@ history to conserve tokens. If you need this context, use the `search_conversati
               ((functionp fn)))
     (funcall fn)))
 
-(defun macher-agent--transformer-sync-context (fsm orig-buf)
-  "Synchronise workspace context for FSM in ORIG-BUF buffer.
-
-Resolve context object for finite-state machine FSM in original buffer
-ORIG-BUF, update FSM info plist, auto-synchronise context and initialise
-skills.
+(defun macher-agent--transformer-sync-context (context orig-buf)
+  "Synchronise workspace context in ORIG-BUF buffer using CONTEXT.
 
 Return context object or nil.
-Side effects: Updates FSM info plist and buffer local state."
+Side effects: Updates buffer local state."
   (with-current-buffer orig-buf
-    (let* ((ctx (ignore-errors (macher-agent-resolve-context fsm)))
-           (pers-ctx (bound-and-true-p macher-agent--persistent-context))
-           (target-ctx (or pers-ctx ctx)))
+    (when context
+      (when (fboundp 'macher-agent--auto-sync-context)
+        (macher-agent--auto-sync-context context))
+      (when (fboundp 'macher-agent-initialize-skills)
+        (macher-agent-initialize-skills context)))
 
-      (when (and ctx fsm (fboundp 'gptel-fsm-info))
-        (let ((info (gptel-fsm-info fsm)))
-          (unless (plist-get info :macher-agent-context)
-            (setf (gptel-fsm-info fsm) (plist-put info :macher-agent-context ctx)))))
+    (when-let* ((active-sys (or (bound-and-true-p macher-agent-base-system-prompt)
+                                (bound-and-true-p gptel-system-prompt)))
+                (directives (bound-and-true-p gptel-directives))
+                (ui-fallback-sym (cl-loop for (s . sys) in directives
+                                          when (equal sys active-sys) return s)))
+      (let ((existing (bound-and-true-p macher-agent-presets)))
+        (when-let* (((not (memq ui-fallback-sym existing))))
+          (setq-local macher-agent-presets (list ui-fallback-sym)))))
 
-      (when target-ctx
-        (when (fboundp 'macher-agent--auto-sync-context)
-          (macher-agent--auto-sync-context target-ctx))
-        (when (fboundp 'macher-agent-initialize-skills)
-          (macher-agent-initialize-skills target-ctx)))
-
-      (when-let* ((active-sys (or (bound-and-true-p macher-agent-base-system-prompt)
-                                  (bound-and-true-p gptel-system-prompt)))
-                  (directives (bound-and-true-p gptel-directives))
-                  (ui-fallback-sym (cl-loop for (s . sys) in directives
-                                            when (equal sys active-sys) return s)))
-        (let ((existing (bound-and-true-p macher-agent-presets)))
-          (when-let* (((not (memq ui-fallback-sym existing))))
-            (setq-local macher-agent-presets (list ui-fallback-sym)))))
-
-      ctx)))
+    context))
 
 (defun macher-agent--transformer-sync-ui-presets (orig-buf)
   "Synchronise UI fallback presets with buffer local presets in ORIG-BUF.
@@ -659,12 +646,12 @@ Side effects: Modifies current buffer region and FSM info."
         (setf (gptel-fsm-info fsm)
               (plist-put (gptel-fsm-info fsm) :prompt redirect-text))))))
 
-(defun macher-agent-sync-prompt-transformer (async-fn &optional fsm)
+(defun macher-agent-sync-prompt-transformer (async-fn fsm)
   "Synchronise the VFS and normalise the active tools list.
 Compose skill profiles securely.
 
 ASYNC-FN is a function to call asynchronously upon completion.
-FSM is the optional finite-state machine object.
+FSM is the finite-state machine object.
 
 Return nil.
 Side effects: Synchronises context, updates buffer local state,
@@ -677,10 +664,11 @@ and transforms prompt."
          (info (when-let* ((fsm-obj active-fsm)
                            ((fboundp 'gptel-fsm-info)))
                  (ignore-errors (gptel-fsm-info fsm-obj))))
-         (orig-buf (or (and info (plist-get info :buffer)) temp-buf)))
+         (orig-buf (or (and info (plist-get info :buffer)) temp-buf))
+         (context (macher-agent--resolve-context active-fsm)))
 
     (when (buffer-live-p orig-buf)
-      (macher-agent--transformer-sync-context active-fsm orig-buf)
+      (macher-agent--transformer-sync-context context orig-buf)
       (let* ((prompt-start
               (save-excursion
                 (goto-char (or (previous-single-property-change (point-max) 'gptel)
@@ -1038,6 +1026,8 @@ Side effects: Sets buffer-local variables and adds buffer-local hooks."
         (setq-local macher-agent--is-restored-session nil))
       (add-hook 'gptel-prompt-transform-functions
                 #'macher-agent-sync-prompt-transformer nil t)
+      (add-hook 'gptel-prompt-transform-functions
+                #'macher-agent--transform-inject-context nil t)
 
       (dolist (transformer macher-agent-prompt-transformers)
         (add-hook 'gptel-prompt-transform-functions transformer t t))
