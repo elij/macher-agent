@@ -8,6 +8,9 @@
 
 (require 'cl-lib)
 
+(declare-function gptel-fsm-p "gptel" (fsm))
+(declare-function gptel-fsm-info "gptel" (fsm))
+
 ;; Buffer-local agent state
 (defvar-local macher-agent-parent-buffer nil
   "Store name of parent chat buffer from which current chat branched.
@@ -186,6 +189,32 @@ Side effects: Opens or focuses user interface window, invoking
   (let ((target-buf (or buf (current-buffer))))
     (when macher-agent-display-subagent-fn
       (funcall macher-agent-display-subagent-fn target-buf))))
+
+(defun macher-agent--resolve-context (env-source)
+  "Resolve the agent context from an FSM or buffer ENV-SOURCE."
+  (cond
+   ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p env-source))
+    (plist-get (gptel-fsm-info env-source) :macher-agent-context))
+   ((bufferp env-source)
+    (buffer-local-value 'macher-agent--persistent-context env-source))
+   (t nil)))
+
+(defun macher-agent--transform-inject-context (async-fn fsm)
+  "Inject the originating buffer context into the FSM info list.
+This function executes in the detached *gptel-prompt* buffer. It retrieves
+the context from the originating buffer stored in the FSM."
+  (when (and fsm (fboundp 'gptel-fsm-info))
+    (let* ((info (gptel-fsm-info fsm))
+           (origin-buf (plist-get info :buffer)))
+      (when (buffer-live-p origin-buf)
+        (let ((agent-ctx (buffer-local-value 'macher-agent--persistent-context origin-buf)))
+          (when agent-ctx
+            (let ((cell (plist-member info :macher-agent-context)))
+              (if cell
+                  (setcar (cdr cell) agent-ctx)
+                (nconc info (list :macher-agent-context agent-ctx)))))))))
+  (when (functionp async-fn)
+    (funcall async-fn)))
 
 
 

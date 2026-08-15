@@ -12,6 +12,10 @@
 
 (require 'macher-agent-test-harness)
 
+(defvar gptel--fsm)
+(defvar macher-agent--active-fsm)
+(defvar gptel--fsm-last)
+
 (describe "Macher-Agent BDD Test Suite"
 
           (before-each
@@ -28,10 +32,10 @@
            (describe
             "macher-agent--get-active-context"
             (it "returns nil when no FSM is active without accessing disk"
-                (let ((macher-agent--active-fsm nil)
-                      (macher--fsm-latest nil)
-                      (gptel--fsm-last nil)
-                      (macher-agent--persistent-context nil))
+                (dlet ((gptel--fsm nil)
+                       (macher-agent--active-fsm nil)
+                       (gptel--fsm-last nil)
+                       (macher-agent--persistent-context nil))
                   (spy-on 'macher-agent-resolve-context :and-return-value nil)
                   (expect (macher-agent--get-active-context) :to-be nil)
                   (expect 'macher-agent-resolve-context :not :to-have-been-called)))
@@ -39,7 +43,27 @@
             (it "successfully mocks an active FSM context using with-macher-agent-mock-fsm"
                 (let ((mock-ctx (macher--make-context :contents nil)))
                   (with-macher-agent-mock-fsm mock-ctx
-                                              (expect (macher-agent--get-active-context) :to-be mock-ctx)))))
+                                              (expect (macher-agent--get-active-context) :to-be mock-ctx))))
+
+            (it "resolves context via macher-agent--resolve-context when gptel--fsm is bound"
+                (let* ((mock-ctx (macher--make-context :contents nil))
+                       (fsm (if (fboundp 'gptel-make-fsm)
+                                (gptel-make-fsm :info (list :macher-agent-context mock-ctx))
+                              (list :macher-agent-context mock-ctx))))
+                  (dlet ((gptel--fsm fsm)
+                         (macher-agent--active-fsm nil)
+                         (gptel--fsm-last nil))
+                    (expect (macher-agent--get-active-context) :to-be mock-ctx))))
+
+            (it "resolves context via macher-agent--resolve-context when gptel--fsm-last is bound"
+                (let* ((mock-ctx (macher--make-context :contents nil))
+                       (fsm (if (fboundp 'gptel-make-fsm)
+                                (gptel-make-fsm :info (list :macher-agent-context mock-ctx))
+                              (list :macher-agent-context mock-ctx))))
+                  (dlet ((gptel--fsm nil)
+                         (macher-agent--active-fsm nil)
+                         (gptel--fsm-last fsm))
+                    (expect (macher-agent--get-active-context) :to-be mock-ctx)))))
 
            (it
             "ensures buffer persistent-context remains aligned with canonical active workspace instance"
@@ -88,7 +112,6 @@
                 (setq-local macher-agent--persistent-context ctx2))
               (unwind-protect
                   (let ((default-directory proj2-dir))
-                    ;; When we call macher-agent-resolve-context, it should resolve to ctx2 because proj2-dir is active
                     (expect (macher-agent-resolve-context) :to-be ctx2))
                 (kill-buffer buf1)
                 (kill-buffer buf2))))
@@ -1762,8 +1785,43 @@
                                        (funcall (gptel-tool-function mock-tool)
                                                 (lambda (res) (setq ptc-res res))
                                                 "hello"))
-                                     (expect ptc-res :to-equal '((status . "success") (value . "hello")))))))))
+                                     (expect ptc-res :to-equal '((status . "success") (value . "hello"))))))
 
+                     (describe "macher-agent completion and patch triggering"
+                               (it "processes completed FSM buffer with directly injected context"
+                                   (let* ((buf (generate-new-buffer "*test-completed-fsm*"))
+                                          (mock-ctx (macher--make-context :contents nil))
+                                          (fsm (gptel-make-fsm :info (list :buffer buf)))
+                                          (called-ctx nil)
+                                          (called-action nil)
+                                          (called-fsm nil))
+                                     (unwind-protect
+                                         (with-current-buffer buf
+                                           (setq-local macher-agent--pending-instructions-queue '("queue-item"))
+                                           (let ((macher-process-request-function
+                                                  (lambda (action ctx f)
+                                                    (setq called-action action
+                                                          called-ctx ctx
+                                                          called-fsm f))))
+                                             (macher-agent--process-completed-fsm-buffer mock-ctx buf fsm)
+                                             (expect called-action :to-equal 'complete)
+                                             (expect called-ctx :to-be mock-ctx)
+                                             (expect called-fsm :to-be fsm)
+                                             (expect macher-agent--pending-instructions-queue :to-be nil)))
+                                       (kill-buffer buf))))
+
+                               (it "triggers patch on complete by resolving context from FSM"
+                                   (let* ((buf (generate-new-buffer "*test-trigger-patch*"))
+                                          (mock-ctx (macher--make-context :contents nil))
+                                          (fsm (gptel-make-fsm :info (list :buffer buf :macher-agent-context mock-ctx)
+                                                               :state 'DONE)))
+                                     (unwind-protect
+                                         (progn
+                                           (spy-on 'macher-agent--process-completed-fsm-buffer)
+                                           (macher-agent--trigger-patch-on-complete fsm)
+                                           (expect 'macher-agent--process-completed-fsm-buffer
+                                                   :to-have-been-called-with mock-ctx buf fsm))
+                                       (kill-buffer buf))))))))
 
 
 

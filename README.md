@@ -16,13 +16,13 @@ The integration with gptel isolates setting changes to within a workspace. It ad
 
 ## Integration with/changes to macher (context/VFS/patch generation)
 
-The default context is orphaned as it is inaccessible within a capture block. All macher tools and patch generation processes are wrapped to inject a macher-agent accessible context, ensuring hydration of the Virtual File System works for disk-based tools. Macher generates diffs for both buffer changes and file changes as 2 different unified diffs. The Virtual File System is persistent until it is cleared, applied, or invalidated (by modifications outside Emacs). When subagents are spawned, they operate on a sibling Virtual File System until they are terminated.
+The default context is orphaned as it is inaccessible within a capture block. All macher tools and patch generation processes are wrapped to inject a macher-agent accessible context, ensuring hydration of the Virtual File System works for disk-based tools. Macher generates diffs for both buffer changes and file changes as 2 different unified diffs. The Virtual File System is persistent until it is cleared, applied, or invalidated (by modifications outside Emacs). When subagents are spawned, they operate on a sibling Virtual File System until they are terminated. `search_in_workspace` is shadowed with a version that uses the file system as the approach to constraints in macher is *after* the full search has taken place and allows for xref to out pace GC and crash the Emacs GC  on larger workspaces.
 
 ## Examples
 
 ### Macher Agent Zero-Mem Benchmarks (100k tokens)
 
-Memory recall beyond the `gptel-max-tokens` event horizon via the `search_conversation_history` tool
+Memory recall beyond the `macher-agent-max-context-chars` event horizon via the `search_conversation_history` tool
 
 1000 Traces
 
