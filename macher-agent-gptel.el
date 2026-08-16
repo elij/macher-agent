@@ -14,6 +14,11 @@
 (require 'macher-agent-vfs)
 (require 'macher-agent-presets)
 
+(defvar gptel--ptc-primitives nil)
+(defvar gptel--boot-directive nil)
+(defvar gptel--context-dir nil)
+(defvar gptel--has-tools nil)
+
 (defvar gptel-system-prompt)
 (defvar macher-agent-active-workspaces)
 (defvar macher-agent-token-multiplier 4
@@ -852,8 +857,6 @@ Side effects: May inject media into FSM payload prior to state transition."
         (macher-agent--perform-pending-media-injection fsm))
       (apply orig-fun fsm args))))
 
-(advice-add 'gptel--fsm-transition :around #'macher-agent--inject-media-fsm-advice)
-
 ;;; Response Protection and Callback Management
 
 (defvar macher-agent--captured-buffer-tools nil
@@ -877,9 +880,6 @@ Return result of calling ORIG-FUN.
 Side effects: None."
   (when (or response (plist-get info :tool-use))
     (funcall orig-fun (or response "") info raw)))
-
-(advice-add 'gptel--insert-response :around #'macher-agent--protect-nil-responses)
-(advice-add 'gptel-curl--stream-insert-response :around #'macher-agent--protect-nil-responses)
 
 ;;; State Restoration and Workspace Registration
 
@@ -946,8 +946,6 @@ Side effects: May set `macher-agent--is-restored-session' and update workspaces.
         (macher-agent--register-context-workspace-paths ctx current-root)
         (macher-agent-initialize-skills ctx))
       res)))
-
-(advice-add 'gptel--restore-state :around #'macher-agent--gptel-restore-advice)
 
 ;;; Backend and Model Resolution
 
@@ -1290,10 +1288,6 @@ Side effects: Mutates info property list of the active backend FSM if bound."
                                       :description "")))
           (apply orig-fn fsm dummy (cdr args)))
       (apply orig-fn fsm args))))
-
-(advice-add 'gptel--handle-pre-tool :around #'macher-agent--bind-active-fsm-advice)
-(advice-add 'gptel--handle-tool-use :around #'macher-agent--bind-active-fsm-advice)
-(advice-add 'gptel--handle-post-tool :around #'macher-agent--bind-active-fsm-advice)
 
 (provide 'macher-agent-gptel)
 ;;; macher-agent-gptel.el ends here

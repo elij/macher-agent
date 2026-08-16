@@ -48,22 +48,58 @@ Return the result message string displayed in the echo area."
   (macher-agent-add-pending-instruction (format "USER OVERRIDE: %s" instruction))
   (message "Instruction queued! The agent will see this when its current tool finishes."))
 
-(defun macher-agent--main-gptel-setup ()
-  "Initialise `macher-agent' configuration in `gptel' buffers.
+(define-minor-mode macher-agent-mode
+  "Minor mode for macher-agent session management."
+  :lighter " MA"
+  (if macher-agent-mode
+      (progn
+        (macher-agent-gptel-mode-setup)
+        (macher-agent-setup-gptel-buffer)
+        (macher-agent--wrap-macher-tools))
+    (remove-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer t)
+    (remove-hook 'gptel-prompt-transform-functions #'macher-agent--transform-inject-context t)
+    (dolist (transformer macher-agent-prompt-transformers)
+      (remove-hook 'gptel-prompt-transform-functions transformer t))
+    (remove-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope t)))
 
-Perform the complete setup sequence for gptel integration by executing
-`macher-agent-gptel-mode-setup', `macher-agent-setup-gptel-buffer',
-and wrapping available macher tools with `macher-agent--wrap-macher-tools'.
+(defun macher-agent-install ()
+  "Explicitly install macher-agent global hooks, advices, and wrap tools."
+  (interactive)
+  (advice-add 'gptel--fsm-transition :around #'macher-agent--inject-media-fsm-advice)
+  (advice-add 'gptel--insert-response :around #'macher-agent--protect-nil-responses)
+  (advice-add 'gptel-curl--stream-insert-response
+              :around #'macher-agent--protect-nil-responses)
+  (advice-add 'gptel--restore-state :around #'macher-agent--gptel-restore-advice)
+  (advice-add 'gptel--handle-pre-tool :around #'macher-agent--bind-active-fsm-advice)
+  (advice-add 'gptel--handle-tool-use :around #'macher-agent--bind-active-fsm-advice)
+  (advice-add 'gptel--handle-post-tool :around #'macher-agent--bind-active-fsm-advice)
+  (advice-add 'macher--workspace-hash :override #'macher-agent--safe-workspace-hash)
+  (advice-add 'gptel--fsm-transition :after #'macher-agent--trigger-patch-on-complete)
+  (advice-add 'gptel--base64-encode :around #'macher-agent--gptel-base64-encode-advice)
+  
+  (add-hook 'gptel-pre-tool-call-functions #'macher-agent--log-gptel-pre-tool)
+  (add-hook 'macher-agent-context-mutated-hook #'macher-agent--mutation-dispatcher)
+  
+  (with-eval-after-load 'macher
+    (add-to-list
+     'macher-workspace-types-alist
+     '(agent . (:get-root macher-agent--get-root
+                          :get-name macher-agent--get-name
+                          :get-files macher-agent--get-files)))
 
-Side effects: Configures buffer-local variables, mode hooks, and tool
-wrappers for `gptel-mode'.
+    (defun macher-agent-workspace-agent ()
+      "Identify if the current buffer is a workspace and return the workspace.
 
-Return the result of `macher-agent--wrap-macher-tools'."
-  (macher-agent-gptel-mode-setup)
-  (macher-agent-setup-gptel-buffer)
-  (macher-agent--wrap-macher-tools))
+Return the workspace struct, or nil."
+      (when (bound-and-true-p macher-agent--is-workspace)
+        (bound-and-true-p macher--workspace)))
 
-(add-hook 'gptel-mode-hook #'macher-agent--main-gptel-setup)
+    (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent))
+
+  (with-eval-after-load 'gptel-transient
+    (ignore-errors
+      (transient-suffix-put 'gptel-menu 'gptel--infix-tools :save-history nil)
+      (transient-suffix-put 'gptel-menu 'gptel--infix-system-message :save-history nil))))
 
 (provide 'macher-agent)
 ;;; macher-agent.el ends here

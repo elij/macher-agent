@@ -443,8 +443,6 @@ Side effects: Removes cached tools or re-initialises skills on change."
     (when (and path (macher-agent--is-managed-path-p path))
       nil)))
 
-(add-hook 'macher-agent-context-mutated-hook #'macher-agent--mutation-dispatcher)
-
 (defun macher-agent--locate-tool-source
     (tool-name context dir-context script-paths _workspace)
   "Locate tool source content for TOOL-NAME across VFS and disk candidates.

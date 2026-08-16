@@ -202,8 +202,6 @@ Side effects: Appends tool call entry to active context audit log."
                      args)))
     (macher-agent-log-tool-intent context "gptel-tool" tool-name tool-args)))
 
-(add-hook 'gptel-pre-tool-call-functions #'macher-agent--log-gptel-pre-tool)
-
 (defun macher-agent-force-review ()
   "Trigger the diff review screen for pending virtual edits manually.
 

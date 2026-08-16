@@ -142,7 +142,10 @@ You can install and configure the package using `use-package`.
 (use-package macher-agent
   :vc (:url "https://github.com/elij/macher-agent/")
   :ensure t
-  :after (gptel macher))
+  :after (gptel macher)
+  :config
+  (macher-agent-install)
+  (add-hook 'gptel-mode-hook #'macher-agent-mode))
 
 ```
 
