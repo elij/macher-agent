@@ -98,8 +98,6 @@ Side effects: None."
                 (t (format "%s" workspace)))))
     (md5 (or path "unknown-workspace"))))
 
-(advice-add 'macher--workspace-hash :override #'macher-agent--safe-workspace-hash)
-
 (cl-defun macher-agent--make-vfs-context (&key workspace contents prompt)
   "Create a native `macher-context' struct using `macher--make-context'.
 
@@ -477,7 +475,7 @@ request completion."
       (when-let*
           ((process-fn (bound-and-true-p macher-process-request-function)))
         (macher-agent--with-protected-context-contents context
-                                                       (funcall process-fn 'complete context fsm))))))
+          (funcall process-fn 'complete context fsm))))))
 
 (defun macher-agent--context-p (ctx)
   "Determine whether CTX is a valid `macher-context' struct.
@@ -527,22 +525,6 @@ Side effects: Modifies native data slot of CTX."
 Return the unwrapped workspace structure, or nil if unbound."
   (let ((ws (bound-and-true-p macher--workspace)))
     (macher-agent--unwrap-workspace ws)))
-
-(with-eval-after-load 'macher
-  (add-to-list
-   'macher-workspace-types-alist
-   '(agent . (:get-root macher-agent--get-root
-                        :get-name macher-agent--get-name
-                        :get-files macher-agent--get-files)))
-
-  (defun macher-workspace-agent ()
-    "Identify if the current buffer is a workspace and return the workspace.
-
-Return the workspace struct, or nil."
-    (when (bound-and-true-p macher-agent--is-workspace)
-      (bound-and-true-p macher--workspace)))
-
-  (add-hook 'macher-workspace-functions #'macher-workspace-agent))
 
 (defun macher-agent-trigger-patch (&optional ctx)
   "Retrieve the underlying patch buffer for CTX.
@@ -1311,8 +1293,6 @@ display upon completion."
                  (context (macher-agent--resolve-context fsm)))
             (with-current-buffer buffer
               (macher-agent--process-completed-fsm-buffer context buffer fsm))))))))
-
-(advice-add 'gptel--fsm-transition :after #'macher-agent--trigger-patch-on-complete)
 
 (provide 'macher-agent-macher)
 ;;; macher-agent-macher.el ends here
