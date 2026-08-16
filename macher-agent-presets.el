@@ -10,7 +10,6 @@
 (require 'subr-x)
 (require 'org)
 (require 'macher-agent-core)
-(require 'macher-agent-vfs)
 
 (defcustom macher-agent-skill-directories nil
   "Specify user-defined directories to scan for skill definition files.
@@ -32,26 +31,6 @@ This variable holds the absolute path string to the package's bundled
 skills directory.
 
 Return the absolute file path string.
-
-Side effects: None.")
-
-(defvar macher-agent-tools-registry (make-hash-table :test 'equal)
-  "Store global hash table for all loaded agent tools.
-
-This variable maps tool names to tool structures across sessions when
-workspace-specific registries are not active.
-
-Return a hash table mapping canonical tool names to tool structures.
-
-Side effects: None.")
-
-(defvar macher-agent-global-skills-alist nil
-  "Store global association list for all loaded agent skills metadata.
-
-This association list maps skill symbols to property lists containing
-system prompts, tool lists, descriptions, and other metadata.
-
-Return an association list of skill metadata or nil.
 
 Side effects: None.")
 
@@ -172,19 +151,22 @@ Return the resolved content string, or nil if unresolved.
 Side effects: None."
   (when context
     (or
-     (let ((contents (macher-agent--get-context-contents context)))
+     (let ((contents (when (fboundp 'macher-agent--get-context-contents)
+                       (macher-agent--get-context-contents context))))
        (cl-loop for cand in candidates
                 thereis (when-let* ((entry (cl-find cand contents :key #'car :test #'equal)))
                           (if (consp (cdr entry))
                               (cddr entry)
                             (cdr entry)))))
      (when-let* ((ws (macher-agent--get-context-workspace context))
-                 (vfs-buffers (macher-agent-workspace-vfs-buffers ws)))
+                 (vfs-buffers (when (fboundp 'macher-agent-workspace-vfs-buffers)
+                                (macher-agent-workspace-vfs-buffers ws))))
        (cl-loop for cand in candidates
                 thereis (gethash cand vfs-buffers)))
      (cl-loop for cand in candidates
-              thereis (ignore-errors
-                        (macher-agent--read-context-file context cand))))))
+              thereis (when (fboundp 'macher-agent--read-context-file)
+                        (ignore-errors
+                          (macher-agent--read-context-file context cand)))))))
 
 (defun macher-agent--extract-skill-frontmatter-and-body ()
   "Extract frontmatter metadata and body string from the current buffer.
@@ -675,33 +657,6 @@ Side effects: Loads script files and registers skill metadata."
         (dolist (path files)
           (macher-agent--try-load-skill-from-path path context))))))
 
-(defun macher-agent--get-system-message-name (sys-msg)
-  "Find skill name matching SYS-MSG system message prompt in registered skills.
-
-SYS-MSG is the system message prompt text string to match.
-
-Return the short skill name string, or nil if not found.
-
-Side effects: None."
-  (when (and sys-msg (stringp sys-msg) (not (string-empty-p sys-msg)))
-    (let* ((ctx (ignore-errors (macher-agent-resolve-context)))
-           (ws (when ctx (macher-agent--get-context-workspace ctx)))
-           (ws-skills (when ws (macher-agent-workspace-skills-alist ws)))
-           (global-skills macher-agent-global-skills-alist))
-      (or
-       (cl-loop for (sym . meta) in ws-skills
-                if (equal (or (plist-get meta :system) "") sys-msg)
-                return (symbol-name sym))
-       (cl-loop for (sym . meta) in global-skills
-                if (equal (or (plist-get meta :system) "") sys-msg)
-                return (symbol-name sym))
-       (cl-loop for (sym . msg) in (bound-and-true-p gptel-directives)
-                for prompt = (if (stringp msg) msg (plist-get msg :system))
-                if (equal prompt sys-msg)
-                return (symbol-name sym))))))
-
-(make-obsolete 'macher-agent--get-system-message-name nil "0.4.0")
-
 (defun macher-agent-initialize-skills (&optional context dir)
   "Initialise agent skills from all registered directories and contexts.
 
@@ -763,6 +718,7 @@ Side effects: Registers skills, configures directives, and sets up menus."
        for tool-names = (mapcar #'macher-agent-canonical-tool-name tools)
        do (when system-prompt
             (setf (alist-get sym gptel-directives) system-prompt)
+            (setf (alist-get sym (default-value 'gptel-directives)) system-prompt)
             (let ((preset-spec (list :description (or desc (format "Agent Profile: %s" sym))
                                      :system system-prompt)))
               (when model (setq preset-spec (plist-put preset-spec :model model)))
@@ -962,48 +918,6 @@ Return the first resolved gptel tool structure, or nil if unresolved.
 Side effects: Resolves tools via environment context."
   (car (macher-agent-normalize-tools t-item)))
 
-(defun macher-tool-valid-p (tool)
-  "Validate whether TOOL is a valid gptel tool structure.
-
-TOOL is the object to inspect.
-
-Return non-nil if TOOL is a valid gptel tool, otherwise nil.
-
-Side effects: None."
-  (and tool (fboundp 'gptel-tool-p) (gptel-tool-p tool)))
-
-(defun macher-agent--extract-raw-tool-name (tool)
-  "Extract raw name representation from TOOL structure or list.
-
-TOOL is a string, symbol, plist, or gptel tool structure.
-
-Return the raw tool name representation or TOOL unchanged if unrecognised.
-
-Side effects: None."
-  (cond
-   ((stringp tool) tool)
-   ((and (fboundp 'gptel-tool-p) (gptel-tool-p tool))
-    (gptel-tool-name tool))
-   ((symbolp tool) (symbol-name tool))
-   ((and (listp tool) (plist-get tool :name))
-    (plist-get tool :name))
-   ((and (listp tool) (plist-get tool :function))
-    (let ((fn (plist-get tool :function)))
-      (if (listp fn) (plist-get fn :name) fn)))
-   (t tool)))
-
-(defsubst macher-agent-canonical-tool-name (tool)
-  "Extract and coerce TOOL into a canonical string name.
-
-TOOL is a gptel tool struct, symbol, plist, or raw string to convert.
-
-Return the canonical tool name string, or nil if TOOL is nil.
-
-Side effects: None."
-  (when tool
-    (let ((raw-name (macher-agent--extract-raw-tool-name tool)))
-      (format "%s" (if (symbolp raw-name) (symbol-name raw-name) raw-name)))))
-
 (defun macher-agent--cache-tool (tool registry)
   "Cache TOOL in REGISTRY using its canonical string name.
 
@@ -1016,20 +930,6 @@ Side effects: Inserts canonical tool mapping into REGISTRY."
   (when (macher-tool-valid-p tool)
     (when-let* ((canonical-name (macher-agent-canonical-tool-name tool)))
       (puthash canonical-name tool registry))))
-
-(defun macher-agent-preset-pipe--exclusive (state item)
-  "Apply the `:exclusive' preset modifier in ITEM to STATE."
-  (pcase item
-    (`(preset ,_sym ,spec)
-     (if (plist-get spec :exclusive)
-         (progn
-           (plist-put state :system nil)
-           (plist-put state :tools nil)
-           (plist-put state :ptc-primitives nil)
-           (plist-put state :boot-directive nil)
-           state)
-       state))
-    (_ state)))
 
 (provide 'macher-agent-presets)
 ;;; macher-agent-presets.el ends here

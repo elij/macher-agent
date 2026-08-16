@@ -5,46 +5,31 @@
   :category "event"
   :args '((:name "final_answer" :type string :description "The final answer, data, or summary of completed work."))
   :command-fn
-  (lambda (payload _context _root)
+  (lambda (payload context _root)
     (if (bound-and-true-p macher-agent-task-finished)
         (progn
+          (when (or (bound-and-true-p macher-agent--is-ephemeral)
+                    (bound-and-true-p macher-agent--is-background))
+            (setq-local macher-agent--ready-to-reap t))
           (when (fboundp 'gptel-abort)
             (ignore-errors
               (condition-case nil
                   (gptel-abort (current-buffer))
                 (wrong-number-of-arguments
                  (gptel-abort)))))
+          (when (fboundp 'macher-agent-bridge-abort)
+            (ignore-errors (macher-agent-bridge-abort (current-buffer))))
           "ERROR: Task has already been submitted.")
-      (let* ((final_answer (plist-get payload :final_answer))
-             (frame (if (fboundp 'macher-agent--pop-parent)
-                        (macher-agent--pop-parent)
-                      (list :parent-buffer (bound-and-true-p macher-agent--parent-buffer)
-                            :parent-callback (bound-and-true-p macher-agent--parent-callback)
-                            :a2a-callback (bound-and-true-p macher-agent--a2a-callback)
-                            :task-id (bound-and-true-p macher-agent--current-task-id))))
-             (a2a-cb (plist-get frame :a2a-callback))
-             (parent-cb (plist-get frame :parent-callback))
-             (task-id
-              (or
-               (plist-get frame :task-id) (bound-and-true-p macher-agent--current-task-id))))
-
+      (let ((final_answer (plist-get payload :final_answer)))
         (setq-local macher-agent--task-result final_answer)
-        (unless (bound-and-true-p macher-agent--parent-stack)
+        (when (fboundp 'macher-agent-submit-task-result)
+          (macher-agent-submit-task-result final_answer context))
+        (unless (or (bound-and-true-p macher-agent--routing-stack)
+                    (bound-and-true-p macher-agent--parent-stack))
           (setq-local macher-agent-task-finished t)
-          (setq-local macher-agent--ready-to-reap t))
-
-        (cond
-         (a2a-cb
-          (funcall a2a-cb
-                   (list :type 'ARTIFACT_UPDATE
-                         :task-id task-id
-                         :message (list :status 'success
-                                        :data final_answer
-                                        :buffer-name (buffer-name)))))
-         (parent-cb
-          (funcall parent-cb
-                   (list :status 'success :data final_answer :buffer-name (buffer-name)))))
-
+          (when (or (bound-and-true-p macher-agent--is-background)
+                    (bound-and-true-p macher-agent--is-ephemeral))
+            (setq-local macher-agent--ready-to-reap t)))
         final_answer)))
   :success-fn
   (lambda (res _payload)

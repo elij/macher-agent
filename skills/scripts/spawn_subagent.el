@@ -14,7 +14,7 @@
   (lambda (payload context root)
     (let* ((name (plist-get payload :name))
            (preset-list (append (plist-get payload :presets) nil))
-           (buf (macher-agent-add-subagent name preset-list nil root context)))
+           (buf (macher-agent-add-subagent name preset-list (current-buffer) root context)))
       (when (bufferp buf)
         (buffer-name buf))))
   :success-fn

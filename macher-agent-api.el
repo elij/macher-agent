@@ -11,10 +11,7 @@
 (require 'org)
 (require 'org-macro)
 (require 'macher-agent-core)
-(require 'macher-agent-sandbox)
-(require 'macher-agent-vfs)
 (require 'macher-agent-presets)
-(require 'macher-agent-macher)
 (require 'macher-agent-gptel)
 (require 'macher-agent-orchestration)
 (require 'macher-agent-tools)
@@ -50,7 +47,8 @@ FILE is the relative file path string.
 Return the file content string, or nil if not found.
 
 Side effects: None."
-  (macher-agent--read-context-file context file))
+  (if (fboundp 'macher-agent--read-context-file)
+      (macher-agent--read-context-file context file)))
 
 (defun macher-agent-context-update (context file content)
   "Update FILE in CONTEXT with new CONTENT string.
@@ -62,7 +60,8 @@ CONTENT is the new text content string.
 Return nil.
 
 Side effects: Mutates CONTEXT in place to store updated file content."
-  (macher-agent--update-context-file context file content))
+  (if (fboundp 'macher-agent--update-context-file)
+      (macher-agent--update-context-file context file content)))
 
 (defun macher-agent-scope-add-file (buffer-name context)
   "Add BUFFER-NAME to the authorised scope in CONTEXT.
@@ -111,12 +110,9 @@ Side effects: Modifies sub-agent buffer local state and directives."
                                  ((vectorp preset) (append preset nil))
                                  (t (list preset)))))
           (setq-local macher-agent-presets preset-list)
-          (when (fboundp 'macher-agent--apply-preset)
-            (macher-agent--apply-preset preset-list))))
-      (when (fboundp 'macher-agent-sync-prompt-transformer)
-        (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t))
-      (when (fboundp 'macher-agent--enforce-tool-scope)
-        (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t))
+          (macher-agent--apply-preset preset-list)))
+      (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
+      (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t)
       (when (and (stringp instructions) (not (string-empty-p instructions)))
         (erase-buffer)
         (insert instructions)))
@@ -132,7 +128,8 @@ Return the project root path string, or nil if unresolved.
 Side effects: None."
   (if (macher-agent-workspace-p workspace)
       (macher-agent-workspace-project-root workspace)
-    (macher--workspace-root workspace)))
+    (when (fboundp 'macher--workspace-root)
+      (macher--workspace-root workspace))))
 
 (defun macher-context-workspace-root (context)
   "Retrieve the project root directory from CONTEXT structure.
@@ -142,21 +139,9 @@ CONTEXT is the active context structure.
 Return the project root path string, or nil if unresolved.
 
 Side effects: None."
-  (when-let* ((workspace (when context (macher-agent--get-context-workspace context))))
+  (when-let* ((workspace (when context
+                           (macher-agent--get-context-workspace context))))
     (macher-agent-workspace-project-root workspace)))
-
-(defun macher-normalise-preset-name (preset)
-  "Convert PRESET to a uniform symbol without leading character symbols.
-
-PRESET is the preset string or symbol to normalise.
-
-Return the normalised preset symbol, or nil if PRESET is invalid.
-
-Side effects: None."
-  (when (and preset (or (symbolp preset) (stringp preset)))
-    (let* ((raw-str (if (symbolp preset) (symbol-name preset) preset))
-           (clean-str (replace-regexp-in-string "^@+" "" raw-str)))
-      (intern clean-str))))
 
 (defun macher-agent-log-tool-intent (context type target args)
   "Log tool execution intent entry to CONTEXT audit log.
@@ -197,7 +182,7 @@ Return nil.
 Side effects: Appends tool call entry to active context audit log."
   (let ((context (ignore-errors (macher-agent-resolve-context)))
         (tool-name (macher-agent-canonical-tool-name tool))
-        (tool-args (if (and (listp tool) (plist-member tool :args))
+        (tool-args (if (and (macher-agent--plist-p tool) (plist-member tool :args))
                        (plist-get tool :args)
                      args)))
     (macher-agent-log-tool-intent context "gptel-tool" tool-name tool-args)))
@@ -221,9 +206,12 @@ Side effects: Generates diff patch buffers and displays review interface."
       (when (fboundp 'macher-agent--auto-sync-context)
         (macher-agent--auto-sync-context context))
 
-      (if (not (macher-agent--context-has-changes-p context))
+      (if (not (if (fboundp 'macher-agent--context-has-changes-p)
+                   (macher-agent--context-has-changes-p context)
+                 nil))
           (message "No pending edits to review.")
-        (macher--build-patch context fsm)
+        (when (fboundp 'macher--build-patch)
+          (macher--build-patch context fsm))
         (message "SUCCESS: Patch review screen(s) generated for pending edits."))))))
 
 (defvar macher-agent--allow-gptel-restore nil
@@ -248,22 +236,26 @@ Side effects: Evaluates sandboxed Lisp expression."
   (let ((macher-agent-sandbox--primitives (make-hash-table :test 'eq))
         (macher-agent-sandbox--functions (make-hash-table :test 'eq))
         (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
-    (macher-agent-sandbox--init extra-operations)
+    (when (fboundp 'macher-agent-sandbox--init)
+      (macher-agent-sandbox--init extra-operations))
     (let ((context (ignore-errors (macher-agent-resolve-context)))
-          (iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
+          (iterator (when (fboundp 'macher-agent-sandbox--eval-iter)
+                      (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil)))
           (yield-val nil)
           (next-yield nil))
-      (condition-case err
-          (while t
-            (setq next-yield (iter-next iterator yield-val))
-            (when (consp next-yield)
-              (let ((target (or (plist-get next-yield :target)
-                                (plist-get next-yield :name)
-                                (car next-yield)))
-                    (args (plist-get next-yield :args)))
-                (macher-agent-log-tool-intent context "ptc" target args)))
-            (setq yield-val next-yield))
-        (iter-end-of-sequence (cdr err))))))
+      (if (null iterator)
+          (error "macher-agent-sandbox--eval-iter is unmapped")
+        (condition-case err
+            (while t
+              (setq next-yield (iter-next iterator yield-val))
+              (when (consp next-yield)
+                (let ((target (or (plist-get next-yield :target)
+                                  (plist-get next-yield :name)
+                                  (car next-yield)))
+                      (args (plist-get next-yield :args)))
+                  (macher-agent-log-tool-intent context "ptc" target args)))
+              (setq yield-val next-yield))
+          (iter-end-of-sequence (cdr err)))))))
 
 (defun macher-agent-apply-patch ()
   "Apply the active patch from `diff-mode' context back to physical files.
@@ -274,8 +266,10 @@ Side effects: Invokes external process (`git` or `patch`) to apply patch."
   (unless (derived-mode-p 'diff-mode) (user-error "Not in a patch/diff buffer"))
   (let* ((patch-content (buffer-substring-no-properties (point-min) (point-max)))
          (ctx (ignore-errors (macher-agent-resolve-context)))
-         (ws (or (when ctx (macher-agent--get-context-workspace ctx))
-                 (macher-agent--get-active-workspace)))
+         (ws (or (when ctx
+                   (macher-agent--get-context-workspace ctx))
+                 (when (fboundp 'macher-agent--get-active-workspace)
+                   (macher-agent--get-active-workspace))))
          (root (if ws
                    (macher-agent-workspace-project-root ws)
                  (or (locate-dominating-file default-directory ".git") default-directory)))
@@ -303,7 +297,8 @@ Side effects: Invokes external process (`git` or `patch`) to apply patch."
 Return nil.
 Side effects: Inserts diff string into the current buffer."
   (interactive)
-  (if-let* ((patch-buf (macher-agent-trigger-patch))
+  (if-let* ((patch-buf (when (fboundp 'macher-agent-trigger-patch)
+                         (macher-agent-trigger-patch)))
             (is-live (buffer-live-p patch-buf))
             (content
              (with-current-buffer

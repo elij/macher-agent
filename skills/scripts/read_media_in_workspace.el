@@ -37,8 +37,7 @@ the agent's visual context."
  at: %s" abs-path))
 
      (let* ((mime (mailcap-file-name-to-mime-type abs-path))
-            (fsm (when (bound-and-true-p macher-agent--active-fsm)
-                   macher-agent--active-fsm))
+            (fsm (macher-agent-get-active-fsm))
             (info (when fsm
                     (macher-agent--extract-fsm-info fsm))))
        (unless mime

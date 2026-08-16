@@ -8,9 +8,10 @@ Use this tool if you need feedback from the agent after execution."
                  (:type object :properties
                         (:buffer_name (:type string)
                                       :instructions (:type string)
-                                      :presets (:type array :items (:type string))))))
+                                      :presets (:type array :items (:type string))
+                                      :ephemeral (:type boolean :description "Whether sub-agent should be reaped immediately upon task completion.")))))
   :command-fn
-  (lambda (payload _context _root callback)
+  (lambda (payload context _root callback)
     (let*
         ((raw-tasks (plist-get payload :tasks))
          (a2a-payloads
@@ -28,7 +29,8 @@ Use this tool if you need feedback from the agent after execution."
               :message (list :instructions (plist-get task-obj :instructions))
               :metadata (list :buffer_name (plist-get task-obj :buffer_name)
                               :presets (append (plist-get task-obj :presets) nil)
-                              :suppress_patch t))))))
+                              :suppress-patch t
+                              :ephemeral (plist-get task-obj :ephemeral)))))))
       (macher-agent-a2a-dispatch 
        a2a-payloads 
        (lambda (a2a-results)
@@ -48,7 +50,8 @@ Use this tool if you need feedback from the agent after execution."
                   (if (eq status 'success)
                       (list :status 'success :data data :buffer-name buf-name)
                     (list :status 'error :error err :buffer-name buf-name))))))
-           (funcall callback (vconcat lisp-results)))))))
+           (funcall callback (vconcat lisp-results))))
+       context)))
   :success-fn
   (lambda (results)
     (let ((output (list "All sub-agents completed:\n\n")))

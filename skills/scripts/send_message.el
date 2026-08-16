@@ -20,7 +20,7 @@
                                   :message (list :instructions (plist-get payload :message))
                                   :metadata (list :buffer_name actual-name
                                                   :background t
-                                                  :suppress_patch t))))
+                                                  :suppress-patch t))))
           (macher-agent-a2a-dispatch (list a2a-payload) nil)
           
           (format "SYSTEM: Message successfully dispatched to %s." actual-name)))))

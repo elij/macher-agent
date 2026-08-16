@@ -15,6 +15,9 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'macher-agent-core)
+(require 'macher-agent-gptel)
+(require 'macher-agent-tools)
 
 (defgroup macher-agent-zero-mem nil
   "Zero-Token Memory Operations for LLM agents."
@@ -195,10 +198,6 @@ Return an association list of (EntityNode . ActivationScore)."
                (push (cons (cons :ent g-ent) 0.8) aligned-activations)))
            (macher-agent-zero-mem-graph-entity-index graph)))))
     aligned-activations))
-
-(defalias 'macher-agent-zero-mem-pagerank #'macher-agent-zero-mem-pagerank-fixed-point
-  "Default Stationary Personalised PageRank distribution over GRAPH using
-fixed-point arithmetic.")
 
 (defconst macher-agent-zero-mem-pr-scale 65536
   "Fixed point scaling factor for PageRank.")
@@ -393,6 +392,184 @@ Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
           (when trace
             (push trace results))))
       (nreverse results))))
+
+(defvar macher-agent-memory-vector-storage (make-hash-table :test 'equal)
+  "Vector storage repository committing interaction histories and trace graphs.
+
+Maps session or buffer identifiers to compiled relational trace graphs.")
+
+(defun macher-agent-memory--persist-interaction (&optional buffer)
+  "Commit conversation history in BUFFER to vector storage.
+
+BUFFER is the optional interaction buffer, defaulting to the current buffer.
+
+Return the committed vector storage graph structure, or nil if no traces exist.
+
+Side effects: Populates `macher-agent-memory-vector-storage` with interaction traces."
+  (let* ((buf (or buffer (current-buffer)))
+         (buf-name (cond
+                    ((bufferp buf) (buffer-name buf))
+                    ((stringp buf) buf)
+                    (t (format "%s" buf))))
+         (target-buf (if (bufferp buf) buf (get-buffer buf-name))))
+    (when (and target-buf (buffer-live-p target-buf))
+      (let* ((traces (with-current-buffer target-buf
+                       (let ((content (buffer-substring-no-properties (point-min) (point-max)))
+                             (lines nil)
+                             (idx 0))
+                         (dolist (line (split-string content "\n" t))
+                           (let ((trimmed (string-trim line)))
+                             (unless (string-empty-p trimmed)
+                               (setq idx (1+ idx))
+                               (push (list :id idx
+                                           :text trimmed
+                                           :timestamp (float-time)
+                                           :metadata (list :buffer buf-name :line idx))
+                                     lines))))
+                         (nreverse lines))))
+             (graph (when traces (macher-agent-zero-mem-build-graph traces))))
+        (when graph
+          (puthash buf-name graph macher-agent-memory-vector-storage)
+          graph)))))
+
+(defun macher-agent-memory-pipe--inject-tool (state orig-buf _presets _skills _redirect)
+  "Inject the search tool into STATE if buffer exceeds size limits."
+  (let* ((buf (or orig-buf
+                  (when (macher-agent-transmission-state-p state)
+                    (macher-agent-transmission-state-target-buffer state))
+                  (current-buffer)))
+         (max-chars (macher-agent--get-max-context-chars buf))
+         (buf-size (if (and buf (buffer-live-p buf))
+                       (with-current-buffer buf (buffer-size))
+                     0)))
+    (when (> buf-size max-chars)
+      (let* ((tools (macher-agent-transmission-state-tools state))
+             (mem-tool (or (ignore-errors (macher-agent-resolve-tool "search_conversation_history" nil nil nil))
+                           'search_conversation_history))
+             (already-has-mem (cl-some (lambda (tl)
+                                         (let ((name (cond
+                                                      ((symbolp tl) (symbol-name tl))
+                                                      ((stringp tl) tl)
+                                                      ((and (fboundp 'gptel-tool-p)
+                                                            (gptel-tool-p tl)
+                                                            (fboundp 'gptel-tool-name))
+                                                       (gptel-tool-name tl))
+                                                      ((consp tl) (plist-get tl :name))
+                                                      (t nil))))
+                                           (and name (string= name "search_conversation_history"))))
+                                       tools)))
+        (unless already-has-mem
+          (setf (macher-agent-transmission-state-tools state)
+                (append tools (list mem-tool)))))))
+  state)
+
+(defun macher-agent-memory-pipe--truncate-buffer (state orig-buf _presets _skills _redirect)
+  "Truncate the physical buffer if it exceeds calculated token limits."
+  (when (and orig-buf (buffer-live-p orig-buf))
+    (with-current-buffer orig-buf
+      (let ((max-chars (macher-agent--get-max-context-chars orig-buf)))
+        (when (> (buffer-size) max-chars)
+          (save-excursion
+            (goto-char (point-min))
+            (let* ((safe-min (if (and (looking-at "^---\n")
+                                      (re-search-forward "^---\n" nil t 2))
+                                 (point)
+                               (point-min)))
+                   (target-pt (max safe-min (- (point-max) max-chars)))
+                   (safe-pt safe-min)
+                   (found nil)
+                   (match nil)
+                   (safe-boundary-p
+                    (lambda (m)
+                      (let* ((end-pt (prop-match-end m))
+                             (next-pt (save-excursion
+                                        (goto-char end-pt)
+                                        (if-let* ((next-m (text-property-search-forward 'gptel 'response t)))
+                                            (prop-match-beginning next-m)
+                                          (point-max)))))
+                        (not (save-excursion
+                               (goto-char end-pt)
+                               (re-search-forward "^[ \t]*\\(```\\|#\\+begin_src \\)tool" next-pt t)))))))
+              (goto-char target-pt)
+              (while (and (not found)
+                          (setq match (text-property-search-backward 'gptel 'response t))
+                          (>= (prop-match-beginning match) safe-min))
+                (when (funcall safe-boundary-p match)
+                  (setq safe-pt (prop-match-end match) found t)))
+              (unless found
+                (goto-char target-pt)
+                (while (and (not found)
+                            (setq match (text-property-search-forward 'gptel 'response t)))
+                  (when (funcall safe-boundary-p match)
+                    (setq safe-pt (prop-match-end match) found t))))
+              (when (> safe-pt safe-min)
+                (let ((lines-deleted (count-lines safe-min safe-pt)))
+                  (delete-region safe-min safe-pt)
+                  (goto-char safe-min)
+                  (insert (format "\n[... SYSTEM ALERT: macher-agent truncated %d lines of early history to conserve tokens. If you need this context, use the `search_conversation_history` tool ...]\n\n" lines-deleted))
+                  (when (looking-at "^[ \t\n\r]+")
+                    (replace-match ""))))))))))
+  state)
+
+(defun macher-agent-memory-pipe--inject-directive (state _orig-buf _presets _skills _redirect)
+  "Append search directive to STATE if memory tools are active."
+  (let* ((tools (macher-agent-transmission-state-tools state))
+         (has-mem (cl-some (lambda (tl)
+                             (let ((name (cond
+                                          ((symbolp tl) (symbol-name tl))
+                                          ((stringp tl) tl)
+                                          ((and (fboundp 'gptel-tool-p)
+                                                (gptel-tool-p tl)
+                                                (fboundp 'gptel-tool-name))
+                                           (gptel-tool-name tl))
+                                          ((consp tl) (plist-get tl :name))
+                                          (t nil))))
+                               (and name (string= name "search_conversation_history"))))
+                           tools)))
+    (when has-mem
+      (let ((directive "CRITICAL DIRECTIVE: Early conversation history has been truncated. You MUST use the `search_conversation_history` tool to retrieve missing context if necessary."))
+        (push directive (macher-agent-transmission-state-directives state)))))
+  state)
+
+(defun macher-agent-memory-search-zero-mem (keywords orig-buf &optional ctx-lines)
+  "Search for KEYWORDS in ORIG-BUF using Zero-Mem PageRank retrieval."
+  (if (not (buffer-live-p orig-buf))
+      "Error: Cannot locate original conversation buffer."
+    (let* ((traces (macher-agent--buffer-to-traces orig-buf))
+           (top-k (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
+           (kws (if (listp keywords) keywords (list keywords))))
+      (if (null traces)
+          (format "No matches found in history for keywords: %s" (string-join kws ", "))
+        (let* ((graph (macher-agent-zero-mem-build-graph traces))
+               (retrieved (macher-agent-zero-mem-retrieve keywords graph :top-k top-k))
+               (results nil))
+          (dolist (tr retrieved)
+            (let ((line (or (plist-get (macher-agent-zero-mem-trace-metadata tr) :line)
+                            (macher-agent-zero-mem-trace-id tr)
+                            (plist-get tr :id)))
+                  (text (macher-agent-zero-mem-trace-text tr)))
+              (push (format "--- Match near line %d ---\n%s\n" line text) results)))
+          (if results
+              (string-join (nreverse results) "\n")
+            (format "No matches found in history for keywords: %s" (string-join kws ", "))))))))
+
+(defun macher-agent-zero-mem-install ()
+  "Install zero-token memory hooks and dynamic pipeline steps."
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-tool 45)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-memory-pipe--truncate-buffer 55)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-directive 85)
+  (add-hook 'macher-agent-task-flush-hook #'macher-agent-memory--persist-interaction)
+  ;; Dynamically override the core search backend
+  (setq macher-agent-search-backend-function #'macher-agent-memory-search-zero-mem))
+
+(defun macher-agent-zero-mem-uninstall ()
+  "Uninstall zero-token memory hooks and dynamic pipeline steps."
+  (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-tool)
+  (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-memory-pipe--truncate-buffer)
+  (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-directive)
+  (remove-hook 'macher-agent-task-flush-hook #'macher-agent-memory--persist-interaction)
+  ;; Dynamically reset the core search backend
+  (setq macher-agent-search-backend-function #'macher-agent-search-glob))
 
 (provide 'macher-agent-zero-mem)
 ;;; macher-agent-zero-mem.el ends here

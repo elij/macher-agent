@@ -8,14 +8,16 @@
   :args nil
   :command-fn
   (lambda (&optional _payload context _root)
-    (let ((tools-list nil)
-          (seen (make-hash-table :test 'equal)))
+    (let* ((ctx (or context (when (fboundp 'macher-agent-resolve-context)
+                              (ignore-errors (macher-agent-resolve-context)))))
+           (tools-list nil)
+           (seen (make-hash-table :test 'equal)))
       (dolist (table (list (when (and (boundp 'macher-agent-tools-registry)
                                       (hash-table-p macher-agent-tools-registry))
                              macher-agent-tools-registry)
                            (when (fboundp 'macher-agent-workspace-tools-registry)
                              (let ((ws-reg (condition-case nil
-                                               (macher-agent-workspace-tools-registry context)
+                                               (macher-agent-workspace-tools-registry ctx)
                                              (error nil))))
                                (when (hash-table-p ws-reg)
                                  ws-reg)))))

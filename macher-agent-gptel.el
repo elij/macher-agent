@@ -11,7 +11,6 @@
 (require 'gptel)
 (require 'text-property-search)
 (require 'macher-agent-core)
-(require 'macher-agent-vfs)
 (require 'macher-agent-presets)
 
 (defvar gptel--ptc-primitives nil)
@@ -20,7 +19,6 @@
 (defvar gptel--has-tools nil)
 
 (defvar gptel-system-prompt)
-(defvar macher-agent-active-workspaces)
 (defvar macher-agent-token-multiplier 4
   "Estimated characters per token used for context truncation.")
 
@@ -59,10 +57,85 @@ Side effects: None."
   :type 'integer
   :group 'macher-agent)
 
-(defcustom macher-agent-max-context-chars '((nil . 2000000))
-  "Alist mapping gptel model symbols to their maximum allowed context characters."
-  :type '(alist :key-type symbol :value-type integer)
-  :group 'macher-agent)
+(defun macher-agent--fsm-hijack-transform (callback fsm)
+  "Mutate the FSM to inject media, capture prompts, protect callbacks, and trigger patches."
+  (let* ((info (gptel-fsm-info fsm))
+         (orig-cb (plist-get info :callback))
+         (b-prop (macher-agent--extract-prop info :buffer))
+         (target-buf (if (eq b-prop 'macher-missing) nil b-prop)))
+
+    (when (and target-buf (buffer-live-p target-buf))
+      (with-current-buffer target-buf
+        (setq-local macher--fsm-latest fsm)))
+
+    (let* ((prompt-start
+            (if (or (bound-and-true-p gptel-mode) 
+                    (bound-and-true-p gptel-track-response))
+                (if (and (> (point-max) (point-min)) 
+                         (get-text-property (1- (point-max)) 'gptel))
+                    (point-max)
+                  (or (previous-single-property-change (point-max) 'gptel) (point-min)))
+              (point-min)))
+           (raw-prompt
+            (if (fboundp 'gptel--trim-prefixes)
+                (gptel--trim-prefixes
+                 (buffer-substring-no-properties prompt-start (point-max)))
+              (string-trim (buffer-substring-no-properties prompt-start (point-max))))))
+      (when (and raw-prompt (not (string-empty-p raw-prompt)))
+        (setf (gptel-fsm-info fsm) (plist-put info :prompt raw-prompt))
+        (let ((ctx (when (and target-buf (buffer-live-p target-buf))
+                     (buffer-local-value 'macher-agent--persistent-context target-buf))))
+          (when ctx
+            (when (fboundp 'macher-agent--set-context-prompt)
+              (macher-agent--set-context-prompt ctx raw-prompt))
+            (when (fboundp 'macher-agent--set-context-data)
+              (macher-agent--set-context-data ctx :prompt raw-prompt))
+            (ignore-errors (setf (macher-context-prompt ctx) raw-prompt))))))
+
+    (when orig-cb
+      (setf (gptel-fsm-info fsm)
+            (plist-put (gptel-fsm-info fsm) :callback
+                       (lambda (response &rest args)
+                         (let ((info-arg (car args)))
+                           (when (or response (plist-get info-arg :tool-use))
+                             (apply orig-cb (or response "") args)))))))
+    
+    (let* ((handlers (gptel-fsm-handlers fsm))
+           (all-states (delete-dups (append (mapcar #'car handlers) '(WAIT DONE ERRS ABRT))))
+           (augmented-handlers
+            (cl-loop
+             for state in all-states
+             for funcs = (alist-get state handlers)
+             collect (cons state 
+                           (cond
+                            ((eq state 'WAIT)
+                             (cons #'macher-agent--inject-media-fsm-logic funcs))
+                            ((memq state '(DONE ERRS ABRT))
+                             (append funcs (list #'macher-agent-gptel--trigger-flush)))
+                            (t funcs))))))
+      (setf (gptel-fsm-handlers fsm) augmented-handlers)))
+  
+  (funcall callback))
+
+(defun macher-agent--restore-local-state ()
+  "Restore agent variables natively after Emacs parses file-local variables."
+  (when (or (local-variable-p 'gptel-model)
+            (local-variable-p 'gptel-backend))
+    (setq-local macher-agent--is-restored-session t)
+
+    (let ((current-root (macher-agent-root default-directory)))
+      (when current-root
+        (macher-agent--init-workspace-state current-root)))
+
+    (when (fboundp 'gptel--restore-state)
+      (ignore-errors (gptel--restore-state)))
+
+    (let* ((restored-ctx (bound-and-true-p macher-agent--persistent-context))
+           (ctx (or restored-ctx (ignore-errors (macher-agent-resolve-context))))
+           (current-root (macher-agent-root default-directory)))
+      (when ctx
+        (macher-agent--register-context-workspace-paths ctx current-root)
+        (macher-agent-initialize-skills ctx)))))
 
 (defun macher-agent--get-max-context-chars (&optional buf)
   "Resolve max context characters based on the model in the current buffer."
@@ -72,185 +145,6 @@ Side effects: None."
     (or (alist-get model-sym macher-agent-max-context-chars)
         (alist-get nil macher-agent-max-context-chars)
         2000000)))
-
-;;; Programmatic Tool Calling (PTC)
-
-(defun macher-agent--build-tool-arg-type-spec (arg lisp-name lisp-arg-name)
-  "Build type spec and optional deftype string for ARG.
-
-Construct type spec and optional deftype definition for tool parameter ARG.
-LISP-NAME is the Lisp function symbol for the tool.
-LISP-ARG-NAME is the string name of the argument.
-
-Return a cons cell (TYPE-SPEC . DEFTYPE-STR).
-Side effects: None."
-  (let* ((arg-type (plist-get arg :type))
-         (items (plist-get arg :items))
-         (props (when items (plist-get items :properties))))
-    (cond
-     ((and (member arg-type '(array "array")) props)
-      (let ((type-name (intern (format "%s-%s" lisp-name lisp-arg-name)))
-            (prop-strs nil))
-        (cl-loop for (p-key p-val) on props by #'cddr
-                 for p-type = (plist-get p-val :type)
-                 do (push (format ":%s %s"
-                                  p-key
-                                  (pcase p-type
-                                    ((or 'string "string") 'string)
-                                    ((or 'number "number") 'number)
-                                    ((or 'boolean "boolean") 'boolean)
-                                    ((or 'array "array") '(or null (list string)))
-                                    (_ 't)))
-                          prop-strs))
-        (cons (list 'list type-name)
-              (format "(cl-deftype %s () \n  \"Property list for %s.\"\n  '(plist %s))"
-                      type-name lisp-arg-name
-                      (string-join (nreverse prop-strs) " ")))))
-
-     ((member arg-type '(array "array"))
-      (cons '(or null (list string)) nil))
-
-     ((member arg-type '(object "object"))
-      (cons 'plist nil))
-
-     (t
-      (cons (pcase arg-type
-              ((or 'string "string") 'string)
-              ((or 'number "number") 'number)
-              ((or 'boolean "boolean") 'boolean)
-              (_ 't))
-            nil)))))
-
-(defun macher-agent--format-tool-defun
-    (name lisp-name desc arg-names arg-types return-type dummy-return &optional deftypes)
-  "Format tool defun string for tool NAME.
-
-Construct Lisp function definition string for tool NAME using given specs.
-LISP-NAME is the function symbol.
-DESC is the tool description string.
-ARG-NAMES is the list of argument name strings.
-ARG-TYPES is the list of argument type specifications.
-RETURN-TYPE is the declared return type specification.
-DUMMY-RETURN is the dummy return value string representation.
-DEFTYPES is an optional list of deftype strings.
-
-Return a formatted defun string representation.
-Side effects: None."
-  (let* ((formatted-arg-types (mapcar (lambda (t-spec)
-                                        (if (symbolp t-spec)
-                                            (symbol-name t-spec)
-                                          (prin1-to-string t-spec)))
-                                      (nreverse arg-types)))
-         (defun-str
-          (format "%s -> (defun %s (%s)\n  %S\n  (declare (type (function (%s) %s)))\n  %s)"
-                  name
-                  lisp-name
-                  (string-join (nreverse arg-names) " ")
-                  desc
-                  (string-join formatted-arg-types " ")
-                  (if (symbolp return-type)
-                      (symbol-name return-type) (prin1-to-string return-type))
-                  dummy-return)))
-    (if deftypes
-        (concat (string-join (nreverse deftypes) "\n\n") "\n\n" defun-str)
-      defun-str)))
-
-(defun macher-agent--format-tool-lisp-docstring (tool-obj)
-  "Infer declarative Lisp signature for TOOL-OBJ.
-
-Extract schema and metadata from TOOL-OBJ to construct a declarative
-Lisp signature string with type hints.
-
-Return formatted tool Lisp signature string.
-Side effects: None."
-  (let* ((name (gptel-tool-name tool-obj))
-         (lisp-name (intern (replace-regexp-in-string "_" "-" name)))
-         (desc (gptel-tool-description tool-obj))
-         (args (gptel-tool-args tool-obj))
-         (deftypes nil)
-         (arg-names nil)
-         (arg-types nil)
-         (is-delegate (string-match-p "delegate" name))
-         (return-type (if is-delegate '(list string) 'string))
-         (dummy-return (if is-delegate "(list \"\")" "\"\"")))
-
-    (dolist (arg args)
-      (let* ((raw-name (if (symbolp (plist-get arg :name))
-                           (symbol-name (plist-get arg :name))
-                         (plist-get arg :name)))
-             (lisp-arg-name (replace-regexp-in-string "_" "-" raw-name))
-             (spec-pair (macher-agent--build-tool-arg-type-spec arg lisp-name lisp-arg-name))
-             (type-spec (car spec-pair))
-             (deftype-str (cdr spec-pair)))
-        (push lisp-arg-name arg-names)
-        (when deftype-str
-          (push deftype-str deftypes))
-        (push type-spec arg-types)))
-
-    (macher-agent--format-tool-defun
-     name lisp-name desc arg-names arg-types return-type dummy-return deftypes)))
-
-(defun macher-agent--filter-ptc-matching-tools (tools active)
-  "Filter TOOLS matching any active primitive in ACTIVE.
-
-Iterate through TOOLS list and collect tool objects matching active
-primitive symbols or names present in ACTIVE.
-
-Return list of matching gptel tool objects.
-Side effects: None."
-  (cl-loop for t-obj in tools
-           when
-           (and (gptel-tool-p t-obj)
-                (cl-some
-                 (lambda (prim)
-                   (string=
-                    (replace-regexp-in-string "_" "-"
-                                              (if (symbolp prim)
-                                                  (symbol-name prim)
-                                                prim))
-                    (replace-regexp-in-string "_" "-" (gptel-tool-name t-obj))))
-                 active))
-           collect t-obj))
-
-(defun macher-agent--tools-require-complex-types-p (tools)
-  "Check if any of the TOOLS require complex object or array arguments."
-  (cl-some (lambda (tool)
-             (cl-some (lambda (arg)
-                        (let ((type (plist-get arg :type)))
-                          (member type '(array "array" object "object"))))
-                      (gptel-tool-args tool)))
-           tools))
-
-(defun macher-agent--inject-ptc-prompt
-    (existing-prompt &optional active-primitives available-tools)
-  "Append Programmatic Tool Calling instructions to EXISTING-PROMPT.
-
-Dynamically append Programmatic Tool Calling instructions with compiler hints
-to EXISTING-PROMPT.
-ACTIVE-PRIMITIVES is an optional list of active primitive symbols or names.
-AVAILABLE-TOOLS is an optional list of gptel tool objects.
-
-Return modified prompt string with PTC instructions, or EXISTING-PROMPT.
-Side effects: None."
-  (let* ((active (or active-primitives (bound-and-true-p macher-agent--active-ptc-primitives)))
-         (tools (or available-tools (bound-and-true-p gptel-tools)))
-         (matching-tools (macher-agent--filter-ptc-matching-tools tools active)))
-    (if (null matching-tools)
-        existing-prompt
-      (concat
-       (if-let* ((prompt existing-prompt)) prompt "")
-       "\n\n=== PROGRAMMATIC TOOL CALLING (PTC) ===\n"
-       "You are equipped with a `ptc_execution` tool. Instead of outputting multiple sequential \\\n"
-       "JSON tool calls, you MUST use `ptc_execution` to orchestrate complex tasks via an Emacs \\\n"
-       "Lisp script.\n\n"
-       "lisp tool aliases:\n"
-       (string-join
-        (mapcar #'macher-agent--format-tool-lisp-docstring matching-tools) "\n\n")
-       (if (macher-agent--tools-require-complex-types-p matching-tools)
-           "\n\n;; JSON TO EMACS LISP MAPPING RULES:\n;; 1. JSON Objects MUST translate to flat property lists using keywords (for example, `(:key \"value\")`). DO NOT use alists or dotted pairs.\n;; 2. JSON Arrays MUST translate to standard Lisp lists. Construct them using the `list` function rather than quoting.\n;; Syntax example for complex arguments: `(tool-name (list (list :buffer_name \"agent\" :instructions \"Task\")))`"
-         "")
-       "\n\n;; EXPECTED SCRIPT RETURN TYPE:\n"
-       "Keep everything within a let*. Return the output object without formatting.\n"))))
 
 ;;; Prompt Transformation and Inline Skill Extraction
 
@@ -270,7 +164,7 @@ Side effects: Modifies buffer text by stripping matched inline tags."
       (goto-char prompt-start)
       (while (re-search-forward "@\\([[:alnum:]_-]+\\)" nil t)
         (when (or (= (match-beginning 0) (point-min))
-                  (memq (char-before (match-beginning 0)) '(?\s ?\t ?\n ?\r ?>)))
+                  (memq (char-before (match-beginning 0)) '(32 ?\t ?\n ?\r 62)))
           (let ((sym (intern (match-string-no-properties 1))))
             (when (assoc sym known)
               (setq inline-preset-used t)
@@ -343,66 +237,6 @@ Side effects: Stubs duplicate tool usage blocks with JSON omitted notice."
               ((functionp fn)))
     (funcall fn)))
 
-(defun macher-agent-transformer-snip-context (async-fn _fsm)
-  "Truncate hidden prompt buffer to maximum character limit safely.
-
-ASYNC-FN is a function to call asynchronously.
-_FSM is the finite-state machine object.
-
-Return nil.
-Side effects: Truncates context history in temporary prompt buffer."
-  (let ((max-chars (macher-agent--get-max-context-chars)))
-    (when (> (buffer-size) max-chars)
-      (save-excursion
-        (goto-char (point-min))
-        (let* ((safe-min (if (and (looking-at "^---\n")
-                                  (re-search-forward "^---\n" nil t 2))
-                             (point)
-                           (point-min)))
-               (target-pt (max safe-min (- (point-max) max-chars)))
-               (safe-pt safe-min)
-               (found nil)
-               (match nil)
-               (safe-boundary-p
-                (lambda (m)
-                  (let* ((end-pt (prop-match-end m))
-                         (next-pt (save-excursion
-                                    (goto-char end-pt)
-                                    (if-let* ((next-m (text-property-search-forward 'gptel 'response t)))
-                                        (prop-match-beginning next-m)
-                                      (point-max)))))
-                    (not (save-excursion
-                           (goto-char end-pt)
-                           (re-search-forward "^[ \t]*\\(```\\|#\\+begin_src \\)tool" next-pt t)))))))
-
-          (goto-char target-pt)
-          (while (and (not found)
-                      (setq match (text-property-search-backward 'gptel 'response t))
-                      (>= (prop-match-beginning match) safe-min))
-            (when (funcall safe-boundary-p match)
-              (setq safe-pt (prop-match-end match) found t)))
-
-          (unless found
-            (goto-char target-pt)
-            (while (and (not found)
-                        (setq match (text-property-search-forward 'gptel 'response t)))
-              (when (funcall safe-boundary-p match)
-                (setq safe-pt (prop-match-end match) found t))))
-
-          (when-let* (((> safe-pt safe-min))
-                      (lines-deleted (count-lines safe-min safe-pt)))
-            (delete-region safe-min safe-pt)
-            (goto-char safe-min)
-            (insert (format "\n[... SYSTEM ALERT: macher-agent truncated %d lines of early \
-history to conserve tokens. If you need this context, use the `search_conversation_history` tool \
-...]\n\n" lines-deleted))
-            (when (looking-at "^[ \t\n\r]+")
-              (replace-match "")))))))
-
-  (when-let* ((fn async-fn)
-              ((functionp fn)))
-    (funcall fn)))
-
 (defun macher-agent--transformer-sync-context (context orig-buf)
   "Synchronise workspace context in ORIG-BUF buffer using CONTEXT.
 
@@ -412,8 +246,7 @@ Side effects: Updates buffer local state."
     (when context
       (when (fboundp 'macher-agent--auto-sync-context)
         (macher-agent--auto-sync-context context))
-      (when (fboundp 'macher-agent-initialize-skills)
-        (macher-agent-initialize-skills context)))
+      (macher-agent-initialize-skills context))
 
     (when-let* ((active-sys (or (bound-and-true-p macher-agent-base-system-prompt)
                                 (bound-and-true-p gptel-system-prompt)))
@@ -421,7 +254,7 @@ Side effects: Updates buffer local state."
                 (ui-fallback-sym (cl-loop for (s . sys) in directives
                                           when (equal sys active-sys) return s)))
       (let ((existing (bound-and-true-p macher-agent-presets)))
-        (when-let* (((not (memq ui-fallback-sym existing))))
+        (unless (memq ui-fallback-sym existing)
           (setq-local macher-agent-presets (list ui-fallback-sym)))))
 
     context))
@@ -441,7 +274,7 @@ Side effects: May set `macher-agent-presets' buffer-locally in ORIG-BUF."
                 (ui-fallback-sym (cl-loop for (s . sys) in directives
                                           when (equal sys active-sys) return s)))
       (let ((existing (bound-and-true-p macher-agent-presets)))
-        (when-let* (((not (memq ui-fallback-sym existing))))
+        (unless (memq ui-fallback-sym existing)
           (setq-local macher-agent-presets (list ui-fallback-sym)))))))
 
 (defun macher-agent--transformer-resolve-skills (buffer-presets inline-skills known)
@@ -461,7 +294,7 @@ Side effects: None."
           (progn
             (setq acc (list p))
             (setq exclusive-found t))
-        (when-let* (((not exclusive-found)))
+        (unless exclusive-found
           (push p acc))))))
 
 (defun macher-agent--transformer-detect-redirect
@@ -480,18 +313,17 @@ Side effects: None."
               (skill (car inline-skills)))
     skill))
 
-(defvar macher-agent-transmission-pipeline-functions
-  '(macher-agent-pipe--hydrate-base-state
-    macher-agent-pipe--apply-skills-and-presets
-    macher-agent-pipe--extract-redirect
-    macher-agent-pipe--inject-dynamic-context-tools
-    macher-agent-pipe--process-hidden-blocks
-    macher-agent-pipe--init-core-directives
-    macher-agent-pipe--append-boot-directive
-    macher-agent-pipe--append-ptc-directive
-    macher-agent-pipe--drain-thought-queue
-    macher-agent-pipe--compile-directives)
-  "Chained reducer pipeline to build final transmission state payload.")
+(defun macher-agent-transmission-install ()
+  "Register core transmission pipeline steps in strict execution order."
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--hydrate-base-state 10)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--apply-skills-and-presets 20)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--extract-redirect 30)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--inject-dynamic-context-tools 40)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--process-hidden-blocks 50)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--init-core-directives 60)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--append-boot-directive 70)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--drain-thought-queue 90)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--compile-directives 100))
 
 (defun macher-agent-pipe--hydrate-base-state (state orig-buf _presets _skills _redirected-skill)
   "Extract pristine local variables from ORIG-BUF into STATE."
@@ -548,30 +380,19 @@ Currently a STATE pass-through, but acts as a hook for sanitization."
 (defun macher-agent-pipe--init-core-directives (state orig-buf _presets _skills _redirect)
   "Mandate the task submission rule if ORIG-BUF is a subagent."
   (when (buffer-local-value 'macher-agent--is-subagent orig-buf)
-    (push "CRITICAL DIRECTIVE: You MUST use the `submit_task_result` tool to submit your final \
-answer when you are completely finished. Do NOT output your final answer as standard text. IMMEDIATELY \
-STOP after."
+    (push "CRITICAL DIRECTIVE: You MUST use the `submit_task_result' tool to submit your final answer when you are completely finished. Do NOT output your final answer as standard text. IMMEDIATELY STOP after."
           (macher-agent-transmission-state-directives state)))
   state)
 
 (defun macher-agent-pipe--append-boot-directive (state orig-buf _presets _skills _redirect)
   "Append boot directive from ORIG-BUF to STATE on initial request turn."
-  (let ((boot-dir (buffer-local-value 'macher-agent--boot-directive orig-buf)))
+  (let ((boot-dir (when (and orig-buf (buffer-live-p orig-buf))
+                    (with-current-buffer orig-buf
+                      (bound-and-true-p macher-agent--boot-directive)))))
     (when (and boot-dir (stringp boot-dir) (not (string-empty-p boot-dir))
                (not (with-current-buffer orig-buf
                       (text-property-any (point-min) (point-max) 'gptel 'response))))
       (push boot-dir (macher-agent-transmission-state-directives state))))
-  state)
-
-(defun macher-agent-pipe--append-ptc-directive (state _orig-buf _presets _skills _redirect)
-  "Append Programmatic Tool Calling hint directives and aliases."
-  (let ((prims (macher-agent-transmission-state-ptc-primitives state)))
-    (when prims
-      (let* ((tools (macher-agent-transmission-state-tools state))
-             (compiled-ptc-block (macher-agent--inject-ptc-prompt "" prims tools)))
-        (unless (string-empty-p compiled-ptc-block)
-          (push (string-trim compiled-ptc-block)
-                (macher-agent-transmission-state-directives state))))))
   state)
 
 (defun macher-agent-pipe--drain-thought-queue (state orig-buf _presets _skills _redirect)
@@ -596,10 +417,12 @@ to the base prompt for this single request frame."
 
 (defun macher-agent--compile-transmission-payload (orig-buf presets skills redirected-skill)
   "Build final network state for ORIG-BUF by passing state through pipeline."
-  (seq-reduce (lambda (state pipe-fn)
-                (funcall pipe-fn state orig-buf presets skills redirected-skill))
-              macher-agent-transmission-pipeline-functions
-              (make-macher-agent-transmission-state :target-buffer orig-buf)))
+  (let ((initial-state (make-macher-agent-transmission-state :target-buffer orig-buf))
+        (all-steps (macher-agent-get-pipeline-steps 'transmission)))
+    (seq-reduce (lambda (state pipe-fn)
+                  (funcall pipe-fn state orig-buf presets skills redirected-skill))
+                all-steps
+                initial-state)))
 
 (defun macher-agent-pipe--extract-redirect (state orig-buf _presets _skills redirected-skill)
   "Route redirected skill text in STATE and natively merge its tools."
@@ -662,18 +485,21 @@ Return nil.
 Side effects: Synchronises context, updates buffer local state,
 and transforms prompt."
   (let* ((temp-buf (current-buffer))
-         (active-fsm (or fsm
-                         (bound-and-true-p gptel--fsm)
-                         (bound-and-true-p macher-agent--active-fsm)
-                         (bound-and-true-p gptel--fsm-last)))
+         (active-fsm (macher-agent-get-active-fsm fsm))
          (info (when-let* ((fsm-obj active-fsm)
                            ((fboundp 'gptel-fsm-info)))
                  (ignore-errors (gptel-fsm-info fsm-obj))))
          (orig-buf (or (and info (plist-get info :buffer)) temp-buf))
-         (context (macher-agent--resolve-context active-fsm)))
+         (context (macher-agent-resolve-context active-fsm)))
 
     (when (buffer-live-p orig-buf)
       (macher-agent--transformer-sync-context context orig-buf)
+      (when context
+        (when-let* ((info-prompt (and info (plist-get info :prompt))))
+          (unless (macher-agent--get-context-prompt context)
+            (macher-agent--set-context-prompt context info-prompt)))
+        (when-let* ((p (macher-agent--get-context-prompt context)))
+          (macher-agent--set-context-prompt context p)))
       (let* ((prompt-start
               (save-excursion
                 (goto-char (or (previous-single-property-change (point-max) 'gptel)
@@ -728,6 +554,10 @@ and transforms prompt."
 
 ;;; Transmission and Sub-Agent Reaping
 
+(defvar-local macher-agent--reap-timer nil
+  "Timer object tracking scheduled asynchronous buffer reap.")
+(put 'macher-agent--reap-timer 'permanent-local t)
+
 (defun macher-agent--schedule-buffer-reap (&optional buf)
   "Schedule BUF to be reaped asynchronously.
 
@@ -737,22 +567,153 @@ reaping and disposal.
 Return timer object created by `run-at-time'.
 Side effects: Schedules asynchronous timer to reap target buffer."
   (let ((target-buf (or buf (current-buffer))))
-    (run-at-time 0 nil (lambda ()
-                         (when (buffer-live-p target-buf)
-                           (macher-agent--reap-buffer target-buf))))))
+    (if (buffer-live-p target-buf)
+        (with-current-buffer target-buf
+          (when (timerp macher-agent--reap-timer)
+            (cancel-timer macher-agent--reap-timer))
+          (let ((timer (run-at-time 0 nil
+                                    (lambda ()
+                                      (when (buffer-live-p target-buf)
+                                        (macher-agent--reap-buffer target-buf))))))
+            (setq-local macher-agent--reap-timer timer)
+            timer))
+      nil)))
+
+(defun macher-agent-sweep-subagents (originator-name)
+  "Sweep and reap all active sub-agent buffers associated with ORIGINATOR-NAME.
+
+ORIGINATOR-NAME is a string or buffer identifying the originator or orchestrator.
+
+Query `macher-agent--a2a-ownership' with workspace scope awareness, recursively
+sweep and reap nested sub-agents (grandchildren), resolve live buffer objects,
+do not kill sub-agents still busy executing background tasks or whose
+`macher-agent-task-finished' is nil, schedule disposal for finished sub-agents,
+and update `macher-agent-active-subagents', workspace active subagents, and
+`macher-agent--a2a-ownership'.
+
+Return nil.
+Side effects: Marks sub-agent buffers for reaping, schedules disposal,
+and updates registries."
+  (let* ((orig-buf (cond
+                    ((bufferp originator-name) (when (buffer-live-p originator-name) originator-name))
+                    ((stringp originator-name) (get-buffer originator-name))
+                    (t nil)))
+         (orig-name (cond
+                     ((stringp originator-name) originator-name)
+                     ((bufferp originator-name) (buffer-name originator-name))
+                     (t nil)))
+         (visited (make-hash-table :test 'equal)))
+    (when orig-name
+      (letrec
+          ((sweep-subagent-tree
+            (lambda (parent-ident)
+              (let* ((p-buf (cond
+                             ((bufferp parent-ident) (when (buffer-live-p parent-ident) parent-ident))
+                             ((stringp parent-ident) (get-buffer parent-ident))
+                             (t nil)))
+                     (p-name (cond
+                              ((stringp parent-ident) parent-ident)
+                              ((bufferp parent-ident) (buffer-name parent-ident))
+                              (t nil)))
+                     (p-ws (when p-buf
+                             (or (let ((ctx (buffer-local-value 'macher-agent--persistent-context p-buf)))
+                                   (when ctx (ignore-errors (macher-agent--get-context-workspace ctx))))
+                                 (when (fboundp 'macher-workspace)
+                                   (ignore-errors (macher-workspace p-buf))))))
+                     (p-ws-root (when p-ws
+                                  (ignore-errors (macher-agent-workspace-project-root p-ws))))
+                     (p-scoped-key (when (and p-ws-root p-name)
+                                     (format "%s::%s" (expand-file-name p-ws-root) p-name)))
+                     (all-scoped-keys
+                      (if (and p-buf (buffer-live-p p-buf) p-scoped-key)
+                          (list p-scoped-key)
+                        (when (and p-name (boundp 'macher-agent--a2a-ownership) (hash-table-p macher-agent--a2a-ownership))
+                          (let ((suffix (format "::%s" p-name))
+                                (matched nil))
+                            (maphash (lambda (k _v)
+                                       (when (and (stringp k) (string-suffix-p suffix k))
+                                         (push k matched)))
+                                     macher-agent--a2a-ownership)
+                            matched))))
+                     (parent-keys
+                      (delete-dups
+                       (delq nil (cons p-name all-scoped-keys))))
+                     (raw-subagents
+                      (delete-dups
+                       (let ((acc nil))
+                         (when (and (boundp 'macher-agent--a2a-ownership) (hash-table-p macher-agent--a2a-ownership))
+                           (dolist (k parent-keys)
+                             (let ((v (gethash k macher-agent--a2a-ownership nil)))
+                               (when (listp v)
+                                 (setq acc (append acc v))))))
+                         acc))))
+                (dolist (name-or-buf raw-subagents)
+                  (let* ((child-buf (if (bufferp name-or-buf) name-or-buf (get-buffer name-or-buf)))
+                         (child-name (if (bufferp name-or-buf) (buffer-name name-or-buf) name-or-buf)))
+                    (when (and child-name (not (gethash child-name visited)))
+                      (puthash child-name t visited)
+                      (funcall sweep-subagent-tree child-name)
+                      (if (and child-buf (buffer-live-p child-buf))
+                          (with-current-buffer child-buf
+                            (let* ((is-sub (macher-agent-subagent-p))
+                                   (ready (macher-agent-ready-to-reap-p))
+                                   (finished (bound-and-true-p macher-agent-task-finished)))
+                              (when (and is-sub (or ready finished))
+                                (setq-local macher-agent--ready-to-reap t)
+                                (macher-agent--schedule-buffer-reap child-buf)
+                                (macher-agent--remove-active-subagent-registries child-name child-buf))))
+                        (macher-agent--remove-active-subagent-registries child-name nil))))))
+              (when (and (boundp 'macher-agent--a2a-ownership) (hash-table-p macher-agent--a2a-ownership))
+                (dolist (k parent-keys)
+                  (let* ((current-list (gethash k macher-agent--a2a-ownership nil))
+                         (remaining (when (listp current-list)
+                                      (cl-remove-if-not
+                                       (lambda (entry)
+                                         (let* ((c-buf (if (bufferp entry) entry (get-buffer entry)))
+                                                (c-name (if (bufferp entry) (buffer-name entry) entry)))
+                                           (and c-buf (buffer-live-p c-buf)
+                                                (with-current-buffer c-buf
+                                                  (let ((is-sub (macher-agent-subagent-p))
+                                                        (ready (macher-agent-ready-to-reap-p))
+                                                        (finished (bound-and-true-p macher-agent-task-finished)))
+                                                    (not (and is-sub (or ready finished))))))))
+                                       current-list))))
+                    (if remaining
+                        (puthash k remaining macher-agent--a2a-ownership)
+                      (remhash k macher-agent--a2a-ownership))))))))
+        (funcall sweep-subagent-tree orig-name)))))
 
 (defun macher-agent-post-response-reaper (_beg _end)
-  "Reap sub-agent buffer if flagged for disposal.
+  "Reap sub-agent buffer or sweep sub-agents for orchestrator on completion.
 
-Check if current buffer is a sub-agent and ready to be reaped.
+Check if current buffer is a sub-agent and ready to be reaped.  If the
+current buffer is a top-level orchestrator (`macher-agent--is-subagent' is nil)
+and no tool calls were generated in the current response cycle for this buffer,
+conclude the workflow and sweep all owned sub-agents.
+
 _BEG is the starting position of the text region integer.
 _END is the ending position of the text region integer.
 
 Return nil.
-Side effects: May schedule current buffer for asynchronous disposal."
-  (when (and (macher-agent-subagent-p)
-             (macher-agent-ready-to-reap-p))
-    (macher-agent--schedule-buffer-reap (current-buffer))))
+Side effects: May schedule current buffer for asynchronous disposal or
+trigger `macher-agent-sweep-subagents'."
+  (if (macher-agent-subagent-p)
+      (when (or (macher-agent-ready-to-reap-p)
+                (bound-and-true-p macher-agent-task-finished)
+                (and (bound-and-true-p macher-agent--is-ephemeral)
+                     (bound-and-true-p macher-agent-task-finished))
+                (and (bound-and-true-p macher-agent--is-background)
+                     (bound-and-true-p macher-agent-task-finished)))
+        (setq-local macher-agent--ready-to-reap t)
+        (macher-agent--schedule-buffer-reap (current-buffer)))
+    (let* ((cur (current-buffer))
+           (matching-fsm (macher-agent-get-active-fsm))
+           (info (when matching-fsm (macher-agent--extract-fsm-info matching-fsm)))
+           (fsm-buf (when info (plist-get info :buffer)))
+           (matching-info (when (and fsm-buf (eq fsm-buf cur)) info))
+           (tool-calls (and matching-info (plist-get matching-info :tool-use))))
+      (unless tool-calls
+        (macher-agent-sweep-subagents (buffer-name cur))))))
 
 (defun macher-agent--make-transmit-response-hook (_success-cb error-cb)
   "Create a post-response hook closure for transmit.
@@ -770,7 +731,7 @@ Side effects: None."
        (when (macher-agent-subagent-p)
          (let*
              ((res (string-trim (buffer-substring-no-properties (point-min) (point-max))))
-              (fsm (bound-and-true-p gptel--fsm-last))
+              (fsm (macher-agent-get-active-fsm))
               (info (and fsm (fboundp 'gptel-fsm-info) (ignore-errors (gptel-fsm-info fsm))))
               (err-data (and info (plist-get info :error))))
            (when error-cb
@@ -816,60 +777,49 @@ calls `gptel-send'."
 
 (defvar macher-agent--in-media-injection nil
   "Track whether media injection is currently in progress.
-
-Prevent recursive media injection loops during state transitions.
-
-Return non-nil when media injection is active, nil otherwise.
-Side effects: Global dynamic binding flag.")
+Prevent recursive media injection loops during state transitions.")
 
 (defun macher-agent--perform-pending-media-injection (fsm)
-  "Inject pending media into FSM payload if pending media exists.
-
-Extract pending visual data from context of state machine FSM and inject
-it into payload prompts.
-
-Return nil.
-Side effects: Invokes media injection functions and resets `:pending-media'
-in CTX."
-  (let* ((info (macher-agent--extract-fsm-info fsm))
-         (ctx (plist-get info :macher-agent-context))
+  "Inject pending media into FSM payload if pending media exists."
+  (let* ((info (ignore-errors (gptel-fsm-info fsm)))
+         (b-prop (macher-agent--extract-prop info :buffer))
+         (target-buf (if (eq b-prop 'macher-missing) nil b-prop))
+         (ctx-raw (or (macher-agent--extract-prop info :macher-agent-context)
+                      (macher-agent--extract-prop info :macher-context)))
+         (ctx (if (not (eq ctx-raw 'macher-missing)) ctx-raw
+                (when (and target-buf (buffer-live-p target-buf))
+                  (buffer-local-value 'macher-agent--persistent-context target-buf))))
          (pending (when ctx (macher-agent--get-context-data ctx :pending-media))))
     (when pending
       (let* ((macher-agent--in-media-injection t)
              (msg-plist (list :role "user"
-                              :content "Tool execution complete. \
-Here is the requested visual data:"))
+                              :content "Tool execution complete. Here is the requested visual data:"))
              (prompts (list msg-plist))
              (gptel-context pending))
-
         (when (fboundp 'gptel--inject-media)
-          (gptel--inject-media (plist-get info :backend) prompts))
-
+          ;; Dynamically intercept base64 encoding just for this block!
+          ;; gptel expects a file path, but 'pending' contains massive base64 strings.
+          ;; This intercepts the read and feeds the base64 directly to the API formatter,
+          ;; achieving exactly what the old global advice did, but 100% MELPA compliant.
+          (cl-letf (((symbol-function 'gptel--base64-encode)
+                     (lambda (file)
+                       (if (and (stringp file) (> (length file) 1000) (not (file-exists-p file)))
+                           file
+                         (with-temp-buffer
+                           (insert-file-contents-literally file)
+                           (base64-encode-region (point-min) (point-max) :no-line-break)
+                           (buffer-string))))))
+            (gptel--inject-media (plist-get info :backend) prompts)))
         (when (fboundp 'gptel--inject-prompt)
           (gptel--inject-prompt (plist-get info :backend)
                                 (plist-get info :data)
                                 (car prompts)))
-
         (macher-agent--set-context-data ctx :pending-media nil)))))
 
-(defun macher-agent--inject-media-fsm-advice (orig-fun fsm &rest args)
-  "Inject pending tool media into FSM payload before WAIT transition.
-
-Advise FSM state transitions to handle pending tool media before entering
-WAIT state.
-ORIG-FUN is the original FSM transition function.
-FSM is the active state machine structure.
-ARGS represents additional transition arguments.
-
-Return result of calling ORIG-FUN.
-Side effects: May inject media into FSM payload prior to state transition."
-  (if macher-agent--in-media-injection
-      (apply orig-fun fsm args)
-    (let* ((new-state (car args))
-           (target-state (or new-state (ignore-errors (gptel--fsm-next fsm)))))
-      (when (or (eq target-state 'WAIT) (null target-state))
-        (macher-agent--perform-pending-media-injection fsm))
-      (apply orig-fun fsm args))))
+(defun macher-agent--inject-media-fsm-logic (fsm)
+  "Inject pending tool media into FSM payload when entering WAIT state."
+  (unless macher-agent--in-media-injection
+    (macher-agent--perform-pending-media-injection fsm)))
 
 ;;; Response Protection and Callback Management
 
@@ -938,29 +888,6 @@ Side effects: Modifies `macher-agent-active-workspaces' hash-table entries."
       (puthash (directory-file-name
                 (expand-file-name ctx-root)) ctx macher-agent-active-workspaces))))
 
-(defun macher-agent--gptel-restore-advice (orig-fun &rest args)
-  "Bypass `gptel--restore-state' unless allowed, tagging buffer.
-
-Guard state restoration, initialising workspace state and skills when permitted.
-ORIG-FUN is the original restoration function.
-ARGS represents arguments passed to ORIG-FUN.
-
-Return result of calling ORIG-FUN.
-Side effects: May set `macher-agent--is-restored-session' and update workspaces."
-  (when macher-agent--allow-gptel-restore
-    (setq-local macher-agent--is-restored-session t)
-    (let ((current-root (macher-agent-root default-directory)))
-      (when current-root
-        (macher-agent--init-workspace-state current-root)))
-    (let* ((res (apply orig-fun args))
-           (restored-ctx (bound-and-true-p macher-agent--persistent-context))
-           (ctx (or restored-ctx (ignore-errors (macher-agent-resolve-context))))
-           (current-root (macher-agent-root default-directory)))
-      (when ctx
-        (macher-agent--register-context-workspace-paths ctx current-root)
-        (macher-agent-initialize-skills ctx))
-      res)))
-
 ;;; Backend and Model Resolution
 
 (defun macher-agent--find-model-in-backend (backend model-str)
@@ -1011,17 +938,98 @@ _ARGS represents unused arguments passed from hook.
 Return a block list if TOOL is out of scope, otherwise nil.
 Side effects: None."
   (let* ((canonical-name (macher-agent-canonical-tool-name tool))
-         (fsm-obj (or fsm
-                      (bound-and-true-p macher-agent--active-fsm)
-                      (macher-agent--get-fsm-latest)))
+         (fsm-obj (macher-agent-get-active-fsm fsm))
          (info (when fsm-obj (gptel-fsm-info fsm-obj)))
          (fsm-tools (when info (plist-get info :tools)))
          (authorised-names (mapcar #'macher-agent-canonical-tool-name fsm-tools)))
     (unless (and canonical-name (member canonical-name authorised-names))
       (list
-       :block (format "ERROR: Tool '%s' is not accessible in this context or is no longer \
-available. Please select another tool or approach."
+       :block (format "ERROR: Tool '%s' is not accessible in this context or is no longer available. Please select another tool or approach."
                       (or canonical-name tool))))))
+
+(defvar macher-agent--wrapped-tools-hash (make-hash-table :test 'eq)
+  "Track wrapped `gptel-tool' instances in a hash table.
+
+Store `gptel-tool' objects that have already been wrapped
+by Macher Agent to prevent duplicate tool wrapping.
+
+Return the hash table instance.
+
+Side effects: Global variable storing hash table state.")
+
+(defun macher-agent--wrap-single-tool (tool)
+  "Wrap single TOOL to intercept orphaned context.
+
+Modify function slot of `gptel-tool' structure TOOL to
+intercept calls, transfer user prompt from orphaned
+context to sub-agent persistent context, and inject
+context into active FSM.
+
+Return non-nil if TOOL was wrapped, or nil if already
+wrapped.
+
+Side effects: Mutates function slot of TOOL and updates
+`macher-agent--wrapped-tools-hash'."
+  (let ((orig-fn (gptel-tool-function tool)))
+    (when (and orig-fn (not (gethash tool macher-agent--wrapped-tools-hash)))
+      (setf (gptel-tool-function tool)
+            (lambda (orphaned-context callback &rest args)
+              (let* ((fsm (macher-agent-get-active-fsm))
+                     (target-buf (or (when (and fsm (fboundp 'gptel-fsm-info))
+                                       (ignore-errors (plist-get (gptel-fsm-info fsm) :buffer)))
+                                     (current-buffer)))
+                     (agent-ctx (macher-agent-resolve-context (or fsm target-buf))))
+                (if agent-ctx
+                    (progn
+                      (when (macher-agent-valid-context-p orphaned-context)
+                        (when-let* ((user-prompt
+                                     (or (macher-agent--get-context-prompt orphaned-context)
+                                         (when (fboundp 'macher-context-prompt)
+                                           (ignore-errors (macher-context-prompt orphaned-context)))
+                                         (macher-agent--get-context-data orphaned-context :prompt))))
+                          (macher-agent--set-context-prompt agent-ctx user-prompt)))
+                      (when (fboundp 'macher-agent--inject-context-into-fsm-info)
+                        (macher-agent--inject-context-into-fsm-info agent-ctx fsm))
+                      (with-current-buffer target-buf
+                        (apply orig-fn agent-ctx callback args)))
+                  (with-current-buffer target-buf
+                    (apply orig-fn orphaned-context callback args))))))
+      (puthash tool t macher-agent--wrapped-tools-hash))))
+
+(defun macher-agent--wrap-macher-tools ()
+  "Wrap all Macher tools to inject persistent VFS context.
+
+Iterate through tools registered under the \"macher\"
+category in `gptel--known-tools', filter out and delete
+`search_in_workspace', and apply
+`macher-agent--wrap-single-tool' to each remaining tool.
+
+Return nil.
+
+Side effects: Mutates tool functions in `gptel--known-tools' and populates
+`macher-agent--wrapped-tools-hash'."
+  (when-let* ((tools-entry (assoc "macher" (bound-and-true-p gptel--known-tools))))
+    (let* ((macher-tools (cdr tools-entry))
+           (filtered (cl-remove-if
+                      (lambda (item)
+                        (let* ((tool (if (consp item) (cdr item) item))
+                               (name (cond
+                                      ((and (fboundp 'gptel-tool-p) (gptel-tool-p tool))
+                                       (gptel-tool-name tool))
+                                      ((macher-tool-valid-p tool)
+                                       (gptel-tool-name tool))
+                                      ((consp item) (car item))
+                                      ((stringp item) item)
+                                      ((symbolp item) (symbol-name item))
+                                      (t nil))))
+                          (and name (string= (format "%s" name) "search_in_workspace"))))
+                      macher-tools)))
+      (setcdr tools-entry filtered)
+      (dolist (item filtered)
+        (let ((tool (if (consp item) (cdr item) item)))
+          (when (or (and (fboundp 'gptel-tool-p) (gptel-tool-p tool))
+                    (macher-tool-valid-p tool))
+            (macher-agent--wrap-single-tool tool)))))))
 
 (defun macher-agent-setup-gptel-buffer ()
   "Set up a gptel buffer with macher-agent capabilities.
@@ -1073,13 +1081,18 @@ transformer hook."
                       (make-macher-agent-workspace :project-root workspace-root)))
        (canonical-context
         (or existing
-            (macher-agent--make-vfs-context :workspace workspace :contents nil)))
-       (buffer-context (macher-agent--clone-context canonical-context)))
+            (when (fboundp 'macher-agent--make-vfs-context)
+              (macher-agent--make-vfs-context :workspace workspace :contents nil))))
+       (buffer-context (if (and canonical-context (fboundp 'macher-agent--clone-context))
+                           (macher-agent--clone-context canonical-context)
+                         canonical-context)))
     (setq-local macher--workspace workspace)
-    (macher-agent--inject-context-state buffer-context)
+    (when (and buffer-context (fboundp 'macher-agent--inject-context-state))
+      (macher-agent--inject-context-state buffer-context))
 
     (unless existing
-      (macher-agent--register-active-workspace-root workspace-root canonical-context))
+      (when (and canonical-context (fboundp 'macher-agent--register-active-workspace-root))
+        (macher-agent--register-active-workspace-root workspace-root canonical-context)))
 
     (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
 
@@ -1169,8 +1182,6 @@ Side effects: Creates new chat buffer and sets buffer-local agent variables."
       (gptel-mode)
       (insert content)
 
-      (setq-local macher-agent-parent-buffer parent-name)
-
       (when-let* ((backend active-backend))
         (setq-local gptel-backend backend))
       (when-let* ((model active-model))
@@ -1191,21 +1202,26 @@ Side effects: Creates new chat buffer and sets buffer-local agent variables."
   "Clear the persistent VFS context for the current sub-agent buffer.
 
 Return nil.
-Side effects: Clears `macher-agent--persistent-context` and resets FSM context."
+Side effects: Clears `macher-agent--persistent-context' and resets FSM context."
   (interactive)
   (if (not (bound-and-true-p macher-agent--persistent-context))
       (message "Macher-Agent: No persistent context to clear in buffer '%s'." (buffer-name))
     (let*
-        ((ws (or (and (bound-and-true-p macher-agent--persistent-context)
-                      (macher-agent--get-context-workspace macher-agent--persistent-context))
-                 (ignore-errors (macher-workspace (current-buffer)))
-                 (bound-and-true-p macher--workspace)))
-         (fresh-ctx (when ws (macher-agent--make-vfs-context :workspace ws :contents nil)))
-         (root (and ws (macher-agent-workspace-project-root ws)))
+        ((raw-ws (or (and (bound-and-true-p macher-agent--persistent-context)
+                          (macher-agent--get-context-workspace macher-agent--persistent-context))
+                     (ignore-errors (macher-workspace (current-buffer)))
+                     (bound-and-true-p macher--workspace)))
+         (ws (if (stringp raw-ws) (cons 'agent raw-ws) raw-ws))
+         (fresh-ctx (when (and ws (fboundp 'macher-agent--make-vfs-context))
+                      (macher-agent--make-vfs-context :workspace ws :contents nil)))
+         (root (and ws (or (macher-agent-workspace-project-root ws)
+                           (when (fboundp 'macher--workspace-root)
+                             (macher--workspace-root ws)))))
          (expanded-root (and root (expand-file-name root))))
       (setq macher-agent--persistent-context fresh-ctx)
       (when (and expanded-root (not (bound-and-true-p macher-agent--is-subagent)))
-        (macher-agent--register-active-workspace-root expanded-root fresh-ctx))
+        (when (fboundp 'macher-agent--register-active-workspace-root)
+          (macher-agent--register-active-workspace-root expanded-root fresh-ctx)))
       (macher-agent-bridge-reset-fsm-context fresh-ctx)
       (message
        "Macher-Agent: VFS context successfully cleared. Agent reset to physical baseline."))))
@@ -1216,7 +1232,11 @@ Side effects: Clears `macher-agent--persistent-context` and resets FSM context."
 
 (defun macher-agent-bridge-abort (buffer)
   "Bridge function to abort network transmission in BUFFER."
-  (gptel-abort buffer))
+  (ignore-errors
+    (condition-case nil
+        (gptel-abort buffer)
+      (wrong-number-of-arguments
+       (gptel-abort)))))
 
 ;;;
 
@@ -1230,43 +1250,6 @@ Side effects: Clears `macher-agent--persistent-context` and resets FSM context."
    :async t
    :function command-fn))
 
-(defun macher-agent--extract-fsm-info (fsm)
-  "Extract the info plist from a finite-state machine (FSM).
-
-FSM is the finite-state machine object or info plist.
-
-Return the info property list."
-  (cond
-   ((null fsm) nil)
-   ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm)) (gptel-fsm-info fsm))
-   ((listp fsm) fsm)
-   ((fboundp 'gptel-fsm-info) (ignore-errors (gptel-fsm-info fsm)))
-   (t nil)))
-
-(defun macher-agent--extract-fsm-context (fsm)
-  "Extract the active context from a finite-state machine (FSM).
-
-FSM is the finite-state machine object.
-
-Return the active context structure, or nil."
-  (when-let* ((fsm fsm)
-              (info (macher-agent--extract-fsm-info fsm)))
-    (or (plist-get info :macher-agent-context)
-        (plist-get info :macher--context))))
-
-(defun macher-agent-bridge-get-active-context ()
-  "Retrieve the active context from the backend state machine."
-  (let ((fsm (or (bound-and-true-p macher-agent--active-fsm)
-                 (macher-agent--get-fsm-latest))))
-    (macher-agent--extract-fsm-context fsm)))
-
-(defun macher-agent-bridge-get-target-buffer ()
-  "Retrieve the target buffer of the current backend execution."
-  (let* ((fsm (or (bound-and-true-p macher-agent--active-fsm)
-                  (macher-agent--get-fsm-latest)))
-         (info (ignore-errors (gptel-fsm-info fsm))))
-    (plist-get info :buffer)))
-
 (defun macher-agent-bridge-reset-fsm-context (fresh-ctx)
   "Bridge function to reset context in the backend state machine to FRESH-CTX.
 
@@ -1274,34 +1257,34 @@ FRESH-CTX is the new context structure.
 
 Return nil.
 Side effects: Mutates info property list of the active backend FSM if bound."
-  (when (and (boundp 'gptel--fsm) gptel--fsm)
-    (let ((info (gptel-fsm-info gptel--fsm)))
-      (when (plist-get info :macher--context)
-        (setf (gptel-fsm-info gptel--fsm) (plist-put info :macher--context fresh-ctx))
-        (setf (gptel-fsm-info gptel--fsm)
+  (when-let* ((fsm (macher-agent-get-active-fsm)))
+    (let ((info (gptel-fsm-info fsm)))
+      (when (or (plist-get info :macher--context)
+                (plist-get info :macher-context)
+                (plist-get info :macher-agent-context))
+        (setf (gptel-fsm-info fsm) (plist-put info :macher--context fresh-ctx))
+        (setf (gptel-fsm-info fsm) (plist-put info :macher-context fresh-ctx))
+        (setf (gptel-fsm-info fsm)
               (plist-put info :macher-agent-context fresh-ctx))))))
 
 ;;;
 
-(defun macher-agent--bind-active-fsm-advice (orig-fn fsm &rest args)
-  "Capture FSM state machine with ORIG-FN during tool handling execution."
-  (let* ((macher-agent--active-fsm fsm)
-         (tool (car-safe args))
-         (info (when fsm (ignore-errors (gptel-fsm-info fsm))))
-         (target-buf (when info (plist-get info :buffer)))
-         (ctx (when (and target-buf (buffer-live-p target-buf))
-                (buffer-local-value 'macher-agent--persistent-context target-buf))))
-
-    (when ctx
-      (when (fboundp 'macher-agent--auto-sync-context)
-        (macher-agent--auto-sync-context ctx)))
-
-    (if (and args (not tool))
-        (let ((dummy (gptel-make-tool :name "unavailable_tool"
-                                      :function #'ignore
-                                      :description "")))
-          (apply orig-fn fsm dummy (cdr args)))
-      (apply orig-fn fsm args))))
+(defun macher-agent-gptel--trigger-flush (fsm &rest _args)
+  "Broadcast task completion using the associated agent context."
+  (when (and fsm (fboundp 'gptel-fsm-state) (memq (gptel-fsm-state fsm) '(DONE ERRS ABRT)))
+    (let* ((macher-agent--active-fsm fsm)
+           (info (ignore-errors (gptel-fsm-info fsm)))
+           (b-prop (macher-agent--extract-prop info :buffer))
+           (target-buf (if (eq b-prop 'macher-missing) nil b-prop))
+           (agent-ctx (or (ignore-errors (macher-agent-resolve-context fsm))
+                          (when (and target-buf (buffer-live-p target-buf))
+                            (buffer-local-value 'macher-agent--persistent-context target-buf)))))
+      (when agent-ctx
+        (if (and target-buf (buffer-live-p target-buf))
+            (with-current-buffer target-buf
+              (setq-local macher-agent--pending-instructions-queue nil)
+              (macher-agent-run-task-flush-hook agent-ctx))
+          (macher-agent-run-task-flush-hook agent-ctx))))))
 
 (provide 'macher-agent-gptel)
 ;;; macher-agent-gptel.el ends here

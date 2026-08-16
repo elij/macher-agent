@@ -16,7 +16,7 @@ non-blocking manner using A2A payloads.  You must supply at least one preset."
                                        :items (:type string)))
                   :required ["buffer_name" "instructions"])))
   :command-fn
-  (lambda (payload _context _root)
+  (lambda (payload context _root)
     (let*
         ((raw-tasks (plist-get payload :tasks))
          (a2a-payloads
@@ -30,12 +30,11 @@ non-blocking manner using A2A payloads.  You must supply at least one preset."
              (list
               :type 'SEND_MESSAGE
               :task-id task-id
-              :message (list :role "ROLE_USER"
-                             :parts (list (list :text (plist-get task-obj :instructions))))
+              :message (list :instructions (plist-get task-obj :instructions))
               :metadata (list :buffer_name (plist-get task-obj :buffer_name)
                               :presets (append (plist-get task-obj :presets) nil)
                               :background t
-                              :suppress_patch t))))))
+                              :suppress-patch t))))))
 
       (dolist (payload a2a-payloads)
         (macher-agent-a2a-dispatch
@@ -46,7 +45,8 @@ non-blocking manner using A2A payloads.  You must supply at least one preset."
                   (status (or (plist-get res :status) (plist-get msg :status)))
                   (buf-name (or (plist-get res :buffer-name) (plist-get msg :buffer-name))))
              (message "Background subagent %s task execution completed with status: %s"
-                      buf-name status)))))
+                      buf-name status)))
+         context))
       
       (mapcar (lambda (p) (plist-get (plist-get p :metadata) :buffer_name)) a2a-payloads)))
   :success-fn
