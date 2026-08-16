@@ -764,13 +764,27 @@ ERROR-CB is the error callback function.
 Return a closure function for `gptel-post-response-functions'.
 Side effects: None."
   (let ((hook-fn nil))
-    (setq hook-fn
-          (lambda (_beg _end)
-            (when (macher-agent-subagent-p)
-              (let ((res (string-trim (buffer-substring-no-properties (point-min) (point-max)))))
-                (when (and error-cb (string-empty-p res))
-                  (funcall error-cb "Buffer stopped silently or returned empty."))))
-            (remove-hook 'gptel-post-response-functions hook-fn t)))
+    (setq
+     hook-fn
+     (lambda (_beg _end)
+       (when (macher-agent-subagent-p)
+         (let*
+             ((res (string-trim (buffer-substring-no-properties (point-min) (point-max))))
+              (fsm (bound-and-true-p gptel--fsm-last))
+              (info (and fsm (fboundp 'gptel-fsm-info) (ignore-errors (gptel-fsm-info fsm))))
+              (err-data (and info (plist-get info :error))))
+           (when error-cb
+             (cond
+              (err-data
+               (let ((err-msg (if (stringp err-data) err-data
+                                (or (plist-get err-data :message)
+                                    (format "%s" err-data)))))
+                 (funcall error-cb err-msg)))
+              ((string-empty-p res)
+               (funcall error-cb "Buffer stopped silently or returned empty."))
+              ((not (bound-and-true-p macher-agent-task-finished))
+               (funcall error-cb "Agent halted without invoking submit_task_result."))))))
+       (remove-hook 'gptel-post-response-functions hook-fn t)))
     hook-fn))
 
 (defun macher-agent-gptel-transmit (task-context callbacks)
