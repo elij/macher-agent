@@ -196,65 +196,6 @@ Return an association list of (EntityNode . ActivationScore)."
            (macher-agent-zero-mem-graph-entity-index graph)))))
     aligned-activations))
 
-(defun macher-agent-zero-mem-pagerank-float (query graph &optional iterations)
-  "Compute Stationary Personalised PageRank for QUERY over GRAPH.
-ITERATIONS defaults to 15.  Return a hash table mapping nodes to
-PageRank scores."
-  (let* ((iters (or iterations 15))
-         (gamma macher-agent-zero-mem-damping-factor)
-         (pi-table (make-hash-table :test 'equal))
-         (reset-vector (make-hash-table :test 'equal))
-         (nodes nil)
-         (adj-list (macher-agent-zero-mem-graph-adj-list graph)))
-
-    ;; 1. Collect all valid nodes
-    (maphash (lambda (node _trans) (push node nodes)) adj-list)
-
-    ;; 2. Establish the normalised Reset Distribution r_q [37]
-    (let* ((alignments (macher-agent-zero-mem-align-query query graph))
-           (align-sum (cl-loop for (_node . val) in alignments sum val)))
-      (if (> align-sum 0.0)
-          ;; Distribute reset probability over aligned query entity nodes
-          (dolist (align alignments)
-            (puthash (car align) (/ (cdr align) align-sum) reset-vector))
-        ;; Fallback: uniform reset distribution over all Document nodes
-        (let* ((doc-count 0)
-               (doc-nodes nil))
-          (dolist (node nodes)
-            (when (eq (car node) :doc)
-              (push node doc-nodes)
-              (setq doc-count (1+ doc-count))))
-          (if (> doc-count 0)
-              (dolist (dn doc-nodes)
-                (puthash dn (/ 1.0 (float doc-count)) reset-vector))
-            ;; Ultimate fallback: absolute uniform over all nodes
-            (let ((uniform-prob (/ 1.0 (float (length nodes)))))
-              (dolist (node nodes) (puthash node uniform-prob reset-vector)))))))
-
-    ;; 3. Initialise pi distribution to match the reset vector
-    (maphash (lambda (node val) (puthash node val pi-table)) reset-vector)
-
-    ;; 4. Iterative Power Method for PageRank: pi = (1-gamma)*r + gamma * P^T * pi [37]
-    (cl-loop repeat iters do
-             (let ((next-pi (make-hash-table :test 'equal)))
-               ;; Add the (1-gamma)*r_q prior to next state
-               (maphash (lambda (node r-val)
-                          (puthash node (* (- 1.0 gamma) r-val) next-pi))
-                        reset-vector)
-               ;; Propagate state over transitions: gamma * P^T * pi
-               (maphash
-                (lambda (u-node u-val)
-                  (let ((transitions (gethash u-node adj-list)))
-                    (dolist (trans transitions)
-                      (let* ((v-node (car trans))
-                             (weight (cdr trans))
-                             (current-v (gethash v-node next-pi 0.0)))
-                        (puthash v-node (+ current-v (* gamma u-val weight)) next-pi)))))
-                pi-table)
-               (setq pi-table next-pi)))
-
-    pi-table))
-
 (defalias 'macher-agent-zero-mem-pagerank #'macher-agent-zero-mem-pagerank-fixed-point
   "Default Stationary Personalised PageRank distribution over GRAPH using
 fixed-point arithmetic.")
@@ -425,14 +366,11 @@ mapping nodes to PageRank scores."
 
 ;;;; 4. Dual-View Evidence Retrieval and Fusion
 
-(cl-defun macher-agent-zero-mem-retrieve (query graph &key (top-k 5) (iterations 15) (algorithm 'fixed-point))
+(cl-defun macher-agent-zero-mem-retrieve (query graph &key (top-k 5) (iterations 15))
   "Execute Dual-View Evidence retrieval for QUERY on GRAPH.
 ITERATIONS specifies the number of PageRank diffusion iterations.
-ALGORITHM specifies PageRank implementation: `fixed-point' (default) or `float'.
 Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
-  (let* ((pi-table (if (eq algorithm 'float)
-                       (macher-agent-zero-mem-pagerank-float query graph iterations)
-                     (macher-agent-zero-mem-pagerank-fixed-point query graph iterations)))
+  (let* ((pi-table (macher-agent-zero-mem-pagerank-fixed-point query graph iterations))
          (doc-scores nil)
          (traces-ht (macher-agent-zero-mem-graph-traces graph)))
 

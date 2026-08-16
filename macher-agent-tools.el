@@ -902,7 +902,7 @@ Options are `glob' (regex search) and `zero-mem' (PageRank vector search)."
         (let* ((graph (macher-agent-zero-mem-build-graph traces))
                (retrieved
                 (macher-agent-zero-mem-retrieve
-                 query graph :top-k top-k :algorithm 'fixed-point))
+                 query graph :top-k top-k))
                (results nil))
           (dolist (tr retrieved)
             (let ((line (or (plist-get (macher-agent-zero-mem-trace-metadata tr) :line)
