@@ -47,7 +47,7 @@
 ;;;; 1. Naive Named Entity Recognition (NER)
 
 (defun macher-agent-zero-mem-naive-ner (text)
-  "Extract entity strings from TEXT using deterministic heuristic rules [28].
+  "Extract entity strings from TEXT using deterministic heuristic rules.
 Return a deduplicated list of lowercase strings representing the entities."
   (let ((case-fold-search nil) ; Case-sensitive matching
         (entities nil))
@@ -80,7 +80,7 @@ Return a deduplicated list of lowercase strings representing the entities."
 (cl-defstruct (macher-agent-zero-mem-trace
                (:constructor macher-agent-zero-mem-trace-create)
                (:type list))
-  "Represents an individual context unit/document node (V_d) [29, 31]."
+  "Represents an individual context unit/document node (V_d)."
   id         ; Integer unique ID
   text       ; Raw string content [28]
   timestamp  ; Float time or integer sequence
@@ -130,7 +130,7 @@ Return a `macher-agent-zero-mem-graph' struct."
         (dolist (ent (macher-agent-zero-mem-trace-entities trace))
           (puthash ent (cons tid (gethash ent entity-index)) entity-index))))
 
-    ;; Step 3: Populate Adjacency Weights (E_de & E_dd) [29]
+    ;; Step 3: Populate Adjacency Weights (E_de & E_dd)
     (let ((n-traces (length trace-list)))
       (dolist (trace trace-list)
         (let* ((tid (macher-agent-zero-mem-trace-id trace))
@@ -142,13 +142,13 @@ Return a `macher-agent-zero-mem-graph' struct."
           ;; Transition from Document to Entities (E_de)
           (when (> e-weight-sum 0.0)
             (dolist (ent ents)
-              ;; w(d_i, e) [Equation 4] is c(e, d_i)/sum(c(e', d_i)).
+              ;; w(d_i, e) is c(e, d_i)/sum(c(e', d_i)).
               ;; For naive NER, occurrences are binary, so weight is 1.0 / count(entities)
               (let* ((raw-w (/ 1.0 e-weight-sum))
                      (scaled-w (* macher-agent-zero-mem-entity-transition-ratio raw-w)))
                 (push (cons (cons :ent ent) scaled-w) doc-transitions))))
 
-          ;; Transition to Chronological Neighbors (E_dd) [29, 30]
+          ;; Transition to Chronological Neighbors (E_dd)
           (let ((neighbors nil))
             (when (> tid 0) (push (1- tid) neighbors))
             (when (< tid (1- n-traces)) (push (1+ tid) neighbors))
@@ -167,7 +167,7 @@ Return a `macher-agent-zero-mem-graph' struct."
                 (n-tids (float (length tids)))
                 (ent-transitions nil))
            (dolist (tid tids)
-             ;; Uniform transition back to documents that contain the entity [35]
+             ;; Uniform transition back to documents that contain the entity
              (push (cons (cons :doc tid) (/ 1.0 n-tids)) ent-transitions))
            (puthash ent-node ent-transitions adj-list)))
        entity-index))
@@ -181,22 +181,30 @@ Return a `macher-agent-zero-mem-graph' struct."
 ;;;; 3. Query Alignment & PageRank Diffusion
 
 (defun macher-agent-zero-mem-align-query (query graph)
-  "Extract and align QUERY entities with GRAPH's Entity nodes [35].
+  "Extract and align QUERY entities with GRAPH's Entity nodes.
 Return an association list of (EntityNode . ActivationScore)."
-  (let* ((q-entities (macher-agent-zero-mem-naive-ner query))
-         (aligned-activations nil))
+  (let* ((case-fold-search t)
+         (entity-index (macher-agent-zero-mem-graph-entity-index graph))
+         (q-entities (or (macher-agent-zero-mem-naive-ner query)
+                         (split-string (downcase query) "[^[:alnum:]-_]+" t)))
+         (aligned-activations nil)
+         (seen-ents (make-hash-table :test 'equal)))
     (dolist (q-ent q-entities)
-      (when q-ent ; Safeguard against nil query entities
-        (if (gethash q-ent (macher-agent-zero-mem-graph-entity-index graph))
-            (push (cons (cons :ent q-ent) 1.0) aligned-activations)
-          (maphash
-           (lambda (g-ent _tids)
-             ;; Safeguard against corrupted nil keys in the graph index
-             (when (and g-ent
-                        (or (string-match-p (regexp-quote q-ent) g-ent)
-                            (string-match-p (regexp-quote g-ent) q-ent)))
-               (push (cons (cons :ent g-ent) 0.8) aligned-activations)))
-           (macher-agent-zero-mem-graph-entity-index graph)))))
+      (when (and q-ent (> (length q-ent) 1))
+        (maphash
+         (lambda (g-ent _tids)
+           (when g-ent
+             (cond
+              ((and (string-equal-ignore-case q-ent g-ent)
+                    (not (gethash g-ent seen-ents)))
+               (puthash g-ent t seen-ents)
+               (push (cons (cons :ent g-ent) 1.0) aligned-activations))
+              ((and (or (string-match-p (regexp-quote q-ent) g-ent)
+                        (string-match-p (regexp-quote g-ent) q-ent))
+                    (not (gethash g-ent seen-ents)))
+               (puthash g-ent t seen-ents)
+               (push (cons (cons :ent g-ent) 0.8) aligned-activations)))))
+         entity-index)))
     aligned-activations))
 
 (defconst macher-agent-zero-mem-pr-scale 65536
@@ -373,7 +381,7 @@ Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
          (doc-scores nil)
          (traces-ht (macher-agent-zero-mem-graph-traces graph)))
 
-    ;; 1. Filter and normalise document scores [41]
+    ;; 1. Filter and normalise document scores
     (maphash
      (lambda (node score)
        (when (eq (car node) :doc)
@@ -382,7 +390,7 @@ Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
 
     (setq doc-scores (sort doc-scores (lambda (a b) (> (cdr a) (cdr b)))))
 
-    ;; 2. Retrieve top-K document nodes [55]
+    ;; 2. Retrieve top-K document nodes
     (let ((top-ids (cl-loop for (id . _score) in doc-scores
                             repeat top-k
                             collect id))
@@ -559,7 +567,6 @@ Side effects: Populates `macher-agent-memory-vector-storage` with interaction tr
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-memory-pipe--truncate-buffer 55)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-directive 85)
   (add-hook 'macher-agent-task-flush-hook #'macher-agent-memory--persist-interaction)
-  ;; Dynamically override the core search backend
   (setq macher-agent-search-backend-function #'macher-agent-memory-search-zero-mem))
 
 (defun macher-agent-zero-mem-uninstall ()
@@ -568,7 +575,6 @@ Side effects: Populates `macher-agent-memory-vector-storage` with interaction tr
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-memory-pipe--truncate-buffer)
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-directive)
   (remove-hook 'macher-agent-task-flush-hook #'macher-agent-memory--persist-interaction)
-  ;; Dynamically reset the core search backend
   (setq macher-agent-search-backend-function #'macher-agent-search-glob))
 
 (provide 'macher-agent-zero-mem)
