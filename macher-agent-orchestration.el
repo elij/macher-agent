@@ -113,9 +113,9 @@ Side effects: Spawns or signals sub-agent buffers and updates registries."
          (shared-state (list :results (make-hash-table :test 'equal)
                              :total total
                              :final-callback final-callback
-                             :parent-buf actual-parent-buf
+                             :parent-buffer actual-parent-buf
                              :parent-fsm actual-parent-fsm
-                             :parent-ctx parent-ctx
+                             :parent-context parent-ctx
                              :original-payloads normalized-payloads)))
     (if (= total 0)
         (when final-callback (funcall final-callback nil))
@@ -188,7 +188,7 @@ Side effects: None."
                       (bound-and-true-p macher-agent--current-task-id)
                       (macher-agent--generate-uuid)))
          (shared (plist-get state :shared-state))
-         (parent-buf (plist-get shared :parent-buf)))
+         (parent-buf (plist-get shared :parent-buffer)))
 
     (unless (plist-get msg :task-id)
       (setq msg (plist-put (copy-sequence msg) :task-id task-id))
@@ -236,7 +236,7 @@ target buffer."
            (presets (plist-get meta :presets))
            (buf-name (plist-get state :target-name))
            (shared (plist-get state :shared-state))
-           (parent-buf (let ((pb (macher-agent--extract-prop shared :parent-buf)))
+           (parent-buf (let ((pb (macher-agent--extract-prop shared :parent-buffer)))
                          (and (not (eq pb 'macher-missing)) pb)))
            (parent-ctx (or (ignore-errors (macher-agent-resolve-context shared))
                            (when (and parent-buf (buffer-live-p parent-buf))
@@ -293,7 +293,7 @@ Side effects: Modifies the global `macher-agent--task-registry' and
            (child-buf (plist-get state :child-buf))
            (child-name (buffer-name child-buf))
            (shared (plist-get state :shared-state))
-           (parent-buf (plist-get shared :parent-buf)))
+           (parent-buf (plist-get shared :parent-buffer)))
 
       (when task-id
         (puthash task-id originator-name macher-agent--task-registry))
@@ -424,7 +424,7 @@ routing stack of the child buffer."
          (suppress-patch (plist-get meta :suppress-patch))
          (shared (plist-get state :shared-state))
          (results (plist-get shared :results))
-         (parent-buf (plist-get shared :parent-buf))
+         (parent-buf (plist-get shared :parent-buffer))
          (parent-name (or (plist-get state :originator-name)
                           (when (and parent-buf (buffer-live-p parent-buf))
                             (buffer-name parent-buf))))
@@ -1155,7 +1155,7 @@ Side effects: None."
 (defun macher-agent-subagent-pipe--normalize-args (state)
   "Pipeline step 1: Normalize overloaded arguments in STATE."
   (let ((presets (plist-get state :presets))
-        (parent (plist-get state :parent-buf))
+        (parent (plist-get state :parent-buffer))
         (dir (plist-get state :dir))
         (ctx (plist-get state :context)))
 
@@ -1195,7 +1195,7 @@ Side effects: None."
       (setq parent (current-buffer)))
 
     (plist-put (plist-put (plist-put (plist-put state :presets presets)
-                                     :parent-buf parent)
+                                     :parent-buffer parent)
                           :dir dir)
                :context ctx)))
 
@@ -1203,7 +1203,7 @@ Side effects: None."
   "Pipeline step 2.
 
 Resolve context, clone it, and determine target directory in STATE."
-  (let* ((parent (plist-get state :parent-buf))
+  (let* ((parent (plist-get state :parent-buffer))
          (dir (plist-get state :dir))
          (ctx (plist-get state :context))
          (resolved-ctx (or ctx
@@ -1226,7 +1226,7 @@ Resolve context, clone it, and determine target directory in STATE."
   "Pipeline step 3: Create and initialize subagent buffer in STATE."
   (let* ((name (plist-get state :name))
          (target-dir (plist-get state :target-dir))
-         (parent (plist-get state :parent-buf))
+         (parent (plist-get state :parent-buffer))
          (cloned-ctx (plist-get state :cloned-ctx))
          (presets (plist-get state :presets))
          (buf (get-buffer-create name)))
@@ -1316,7 +1316,7 @@ tracking lists."
   (interactive "sSub-agent name: ")
   (let ((initial-state (list :name name
                              :presets presets
-                             :parent-buf parent-buf
+                             :parent-buffer parent-buf
                              :dir dir
                              :context context)))
     (plist-get (seq-reduce (lambda (state pipe-fn)

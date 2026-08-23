@@ -693,8 +693,16 @@ Side effects: Mutates CTX structure."
   (cond
    ((null fsm) nil)
    ((macher-agent-valid-context-p fsm) fsm)
-   (t (let ((info (ignore-errors (macher-agent--extract-fsm-info fsm))))
-        (or (ignore-errors (macher-agent-resolve-context info))
+   (t (let* ((info (ignore-errors (macher-agent--extract-fsm-info fsm)))
+             (fsm-ctx (when (or (listp info) (hash-table-p info))
+                        (cl-some (lambda (k)
+                                   (let ((v (macher-agent--extract-prop info k)))
+                                     (when (and (not (eq v 'macher-missing))
+                                                (macher-agent-valid-context-p v))
+                                       v)))
+                                 '(:context :macher-agent-context :macher--context :macher-context :target-context :parent-context)))))
+        (or fsm-ctx
+            (ignore-errors (macher-agent-resolve-context info))
             (macher-agent-resolve-from-transit-payload info))))))
 
 (defun macher-agent--transform-inject-context (async-fn fsm)
@@ -810,8 +818,12 @@ Side effects: None."
     state))
 
 (defconst macher-agent-transit-context-keys
-  '(:target-context :parent-context :parent-ctx :context :ctx :macher-agent-context :macher-context :macher--context)
-  "Property keys to inspect when extracting context structures from transit payloads.")
+  '(:target-context :parent-context :context)
+  "Authoritative list of keys used to pass context structures in transit payloads.")
+
+(defconst macher-agent-transit-buffer-keys
+  '(:target-buffer :parent-buffer :buffer :buffer-name)
+  "Authoritative list of keys used to pass buffer references in transit payloads.")
 
 (defun macher-agent-resolve-from-transit-payload (payload-or-state)
   "Extract context from PAYLOAD-OR-STATE using transit keys."
@@ -847,7 +859,7 @@ Side effects: None."
         (let* ((b-raw (cl-some (lambda (k)
                                  (let ((v (macher-agent--extract-prop payload-or-state k)))
                                    (unless (eq v 'macher-missing) v)))
-                               '(:target-buffer :parent-buf :parent-buffer :buffer :buf :buffer-name :originator :originator-buffer)))
+                               macher-agent-transit-buffer-keys))
                (buf (when b-raw (if (bufferp b-raw) b-raw (and (stringp b-raw) (get-buffer b-raw))))))
           (when (and buf (buffer-live-p buf))
             (let ((bctx (buffer-local-value 'macher-agent--persistent-context buf)))

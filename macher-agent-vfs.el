@@ -970,10 +970,8 @@ PAYLOAD is the outgoing artifact property list.
 
 Return updated PAYLOAD property list."
   (let* ((payload-buf (when-let* ((raw-buf (and (macher-agent--plist-p payload)
-                                                (or (plist-get payload :buffer-name)
-                                                    (plist-get payload :buf)
-                                                    (plist-get payload :buffer)
-                                                    (plist-get payload :target-buffer)))))
+                                                (cl-some (lambda (k) (plist-get payload k))
+                                                         macher-agent-transit-buffer-keys))))
                         (if (bufferp raw-buf)
                             raw-buf
                           (when (stringp raw-buf) (get-buffer raw-buf)))))
@@ -1269,9 +1267,8 @@ Return a cons cell of cloned contexts (FILE-CONTEXT . BUFFER-CONTEXT)."
 (defun macher-agent-vfs--merge-payload (payload)
   "Merge Virtual File System PAYLOAD into the target parent context directly.
 
-Exhaustively extracts target context from PAYLOAD keys (:target-context,
-:parent-context, :parent-ctx, :context), `macher-agent-storage--extract-context',
-workspace-id, shared-state, and buffer local persistent context.
+Exhaustively extracts target context from PAYLOAD keys (`macher-agent-transit-context-keys'),
+`macher-agent-storage--extract-context', workspace-id, shared-state, and buffer local persistent context.
 Applies file diffs and child-context modifications to the resolved parent context,
 handling deletions when diff items have nil content.
 Synchronises `macher-agent--persistent-context' across relevant buffers and
@@ -1304,12 +1301,9 @@ Return updated PAYLOAD."
       (when (boundp 'macher-agent--persistent-context)
         (setq macher-agent--persistent-context parent-ctx))
 
-      (let* ((buf-candidates (list (macher-agent--extract-prop payload :target-buffer)
-                                   (macher-agent--extract-prop payload :parent-buf)
-                                   (macher-agent--extract-prop payload :parent-buffer)
-                                   (macher-agent--extract-prop payload :buffer)
-                                   (macher-agent--extract-prop payload :buf)
-                                   (macher-agent--extract-prop payload :buffer-name)))
+      (let* ((buf-candidates (mapcar (lambda (k)
+                                       (macher-agent--extract-prop payload k))
+                                     macher-agent-transit-buffer-keys))
              (live-bufs (cl-remove-if-not #'buffer-live-p
                                           (mapcar (lambda (b)
                                                     (cond ((bufferp b) b)
