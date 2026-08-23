@@ -584,35 +584,27 @@ Uses `macher-agent--get-context-prompt' and strips local variables and header pr
   state)
 
 (defun macher-agent-memory-search-zero-mem (keywords orig-buf &optional ctx-lines)
-  "Search for KEYWORDS exclusively in the truncated portion of ORIG-BUF."
+  "Search for KEYWORDS in ORIG-BUF using zero-mem PageRank search."
   (if (not (buffer-live-p orig-buf))
       "Error: Cannot locate original conversation buffer."
-    (let* ((max-chars (macher-agent--get-max-context-chars orig-buf))
-           (buf-len (with-current-buffer orig-buf (buffer-size)))
-           (event-horizon-pt (with-current-buffer orig-buf
-                               (max (point-min) (- (point-max) max-chars)))))
-      (if (<= buf-len max-chars)
-          "Notice: No conversation history has been truncated yet. All context is active."
-        (let* ((traces (with-current-buffer orig-buf
-                         (save-restriction
-                           (narrow-to-region (point-min) event-horizon-pt)
-                           (macher-agent--buffer-to-traces (current-buffer)))))
-               (top-k (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
-               (kws (if (listp keywords) keywords (list keywords))))
-          (if (null traces)
-              (format "No matches found in truncated history for keywords: %s" (string-join kws ", "))
-            (let* ((graph (macher-agent-zero-mem-build-graph traces))
-                   (retrieved (macher-agent-zero-mem-retrieve keywords graph :top-k top-k))
-                   (results nil))
-              (dolist (tr retrieved)
-                (let ((line (or (plist-get (macher-agent-zero-mem-trace-metadata tr) :line)
-                                (macher-agent-zero-mem-trace-id tr)
-                                (plist-get tr :id)))
-                      (text (macher-agent-zero-mem-trace-text tr)))
-                  (push (format "--- Match near line %d ---\n%s\n" line text) results)))
-              (if results
-                  (string-join (nreverse results) "\n")
-                (format "No matches found in truncated history for keywords: %s" (string-join kws ", "))))))))))
+    (let* ((traces (with-current-buffer orig-buf
+                     (macher-agent--buffer-to-traces (current-buffer))))
+           (top-k (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
+           (kws (if (listp keywords) keywords (list keywords))))
+      (if (null traces)
+          (format "No matches found in history for: %s" (string-join kws ", "))
+        (let* ((graph (macher-agent-zero-mem-build-graph traces))
+               (retrieved (macher-agent-zero-mem-retrieve keywords graph :top-k top-k))
+               (results nil))
+          (dolist (tr retrieved)
+            (let ((line (or (plist-get (macher-agent-zero-mem-trace-metadata tr) :line)
+                            (macher-agent-zero-mem-trace-id tr)
+                            (plist-get tr :id)))
+                  (text (macher-agent-zero-mem-trace-text tr)))
+              (push (format "--- Match near line %d ---\n%s\n" line text) results)))
+          (if results
+              (string-join (nreverse results) "\n")
+            (format "No matches found in history for: %s" (string-join kws ", "))))))))
 
 (defun macher-agent-zero-mem-install ()
   "Install zero-token memory hooks and dynamic pipeline steps."

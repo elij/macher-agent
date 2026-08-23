@@ -735,7 +735,8 @@ Return the canonical key path string, or PATH if non-string."
       path
     (let* ((ws-root (and context (macher-agent--get-context-root context)))
            (buf (get-buffer path))
-           (is-pure-buffer (and buf (null (buffer-file-name buf)))))
+           (has-slash (string-match-p "/" path))
+           (is-pure-buffer (and buf (null (buffer-file-name buf)) (not has-slash))))
       (if (and ws-root (not is-pure-buffer) (not (string-prefix-p "*" path)))
           (expand-file-name path ws-root)
         (if (and (string-prefix-p "*" path) (not (string-suffix-p "*" path)))
@@ -955,18 +956,8 @@ Side effects: May update CTX dirty state and persist state if synced."
         (run-hooks 'macher-agent-context-mutated-hook)))))
 
 (defun macher-agent-storage--extract-context (payload)
-  "Extract the target context structure from PAYLOAD property list.
-
-Inspects PAYLOAD strictly for context identifiers via `macher-agent-resolve-context'.
-
-PAYLOAD is the incoming payload property list.
-
-Return the resolved context structure, or nil."
-  (let* ((t-ctx (macher-agent--extract-prop payload :target-context))
-         (ctx (macher-agent--extract-prop payload :context))
-         (direct-ctx (cl-some (lambda (x) (unless (eq x 'macher-missing) x)) (list t-ctx ctx))))
-    (or direct-ctx
-        (ignore-errors (macher-agent-resolve-context payload)))))
+  "Extract the target context structure from PAYLOAD property list."
+  (ignore-errors (macher-agent-resolve-context payload)))
 
 (defun macher-agent-vfs--compose-artifact (payload)
   "Compose artifact by attaching the child context struct and any modified diffs.
@@ -978,24 +969,42 @@ along with `:diff' when modified entries exist.
 PAYLOAD is the outgoing artifact property list.
 
 Return updated PAYLOAD property list."
-  (let* ((payload-buf (when-let* ((buf-name (and (macher-agent--plist-p payload)
-                                                 (plist-get payload :buffer-name))))
-                        (get-buffer buf-name)))
-         (target-ctx (or (and (macher-agent--plist-p payload) (plist-get payload :child-context))
-                         (and (buffer-live-p payload-buf)
-                              (buffer-local-value 'macher-agent--persistent-context payload-buf))
-                         (bound-and-true-p macher-agent--persistent-context)
+  (let* ((payload-buf (when-let* ((raw-buf (and (macher-agent--plist-p payload)
+                                                (or (plist-get payload :buffer-name)
+                                                    (plist-get payload :buf)
+                                                    (plist-get payload :buffer)
+                                                    (plist-get payload :target-buffer)))))
+                        (if (bufferp raw-buf)
+                            raw-buf
+                          (when (stringp raw-buf) (get-buffer raw-buf)))))
+         (target-ctx (or (when (and (macher-agent--plist-p payload)
+                                    (plist-member payload :child-context))
+                           (let ((c (plist-get payload :child-context)))
+                             (when (macher-agent-valid-context-p c) c)))
+                         (when (fboundp 'macher-agent-resolve-from-transit-payload)
+                           (macher-agent-resolve-from-transit-payload payload))
+                         (when (and payload-buf (buffer-live-p payload-buf))
+                           (let ((c (buffer-local-value 'macher-agent--persistent-context payload-buf)))
+                             (when (macher-agent-valid-context-p c) c)))
+                         (when (bound-and-true-p macher-agent--persistent-context)
+                           (when (macher-agent-valid-context-p macher-agent--persistent-context)
+                             macher-agent--persistent-context))
                          (ignore-errors (macher-agent-resolve-context payload))
                          (ignore-errors (macher-agent-resolve-context (current-buffer)))))
-         (contents (when target-ctx (macher-agent--get-context-contents target-ctx)))
+         (contents (when (and target-ctx (fboundp 'macher-agent--get-context-contents))
+                     (macher-agent--get-context-contents target-ctx)))
          (modified-entries (when contents
                              (cl-remove-if-not #'macher-agent-vfs-entry-modified-p contents))))
-    (setq payload (copy-sequence payload))
-    (when target-ctx
-      (setq payload (plist-put payload :child-context target-ctx)))
-    (when modified-entries
-      (setq payload (plist-put payload :diff modified-entries)))
-    payload))
+    (if (macher-agent--plist-p payload)
+        (let ((res (copy-sequence payload)))
+          (when (and target-ctx (macher-agent-valid-context-p target-ctx))
+            (setq res (plist-put res :child-context target-ctx)))
+          (if modified-entries
+              (setq res (plist-put res :diff modified-entries))
+            (when (plist-member res :diff)
+              (setq res (plist-put res :diff nil))))
+          res)
+      payload)))
 
 (defun macher-agent-vfs-handle-flush (&optional ctx)
   "Execute disk overlay if suppressed, or broadcast patch request via core hooks."
@@ -1258,23 +1267,61 @@ Return a cons cell of cloned contexts (FILE-CONTEXT . BUFFER-CONTEXT)."
   parent-ctx)
 
 (defun macher-agent-vfs--merge-payload (payload)
-  "Merge Virtual File System payload into the target parent context directly."
-  (let ((child-ctx (plist-get payload :child-context))
-        (diff (plist-get payload :diff))
-        (parent-ctx (or (ignore-errors (macher-agent-storage--extract-context payload))
-                        (ignore-errors (macher-agent-resolve-context payload)))))
+  "Merge Virtual File System PAYLOAD into the target parent context directly.
+
+Exhaustively extracts target context from PAYLOAD keys (:target-context,
+:parent-context, :parent-ctx, :context), `macher-agent-storage--extract-context',
+workspace-id, shared-state, and buffer local persistent context.
+Applies file diffs and child-context modifications to the resolved parent context,
+handling deletions when diff items have nil content.
+Synchronises `macher-agent--persistent-context' across relevant buffers and
+updates `:target-context' on the returned payload plist.
+
+PAYLOAD is the property list or data structure containing merge artifacts.
+
+Return updated PAYLOAD."
+  (let ((parent-ctx (ignore-errors (macher-agent-resolve-context payload)))
+        (child-ctx (let ((c (macher-agent--extract-prop payload :child-context)))
+                     (if (and (not (eq c 'macher-missing)) (macher-agent-valid-context-p c)) c nil)))
+        (diff (let ((d (macher-agent--extract-prop payload :diff)))
+                (if (and (not (eq d 'macher-missing)) (listp d)) d nil))))
+
     (when parent-ctx
-      (when child-ctx
+      (when (and child-ctx (not (eq child-ctx parent-ctx)))
         (macher-agent--merge-contexts parent-ctx child-ctx))
+
       (when diff
-        (dolist (item diff)
-          (let* ((path (car-safe item))
-                 (orig (if (consp (cdr item)) (cadr item) nil))
-                 (curr (if (consp (cdr item)) (cddr item) (cdr item))))
-            (when path
-              (macher-agent--update-context-file parent-ctx path curr))))
-        (macher-agent--set-context-dirty-p parent-ctx t))
-      (setq payload (plist-put (copy-sequence payload) :target-context parent-ctx)))
+        (let ((any-mutated nil))
+          (dolist (item diff)
+            (let* ((path (car-safe item))
+                   (curr (if (consp (cdr item)) (cddr item) (cdr item))))
+              (when path
+                (macher-agent--update-context-file parent-ctx path curr)
+                (setq any-mutated t))))
+          (when any-mutated
+            (macher-agent--set-context-dirty-p parent-ctx t))))
+
+      (when (boundp 'macher-agent--persistent-context)
+        (setq macher-agent--persistent-context parent-ctx))
+
+      (let* ((buf-candidates (list (macher-agent--extract-prop payload :target-buffer)
+                                   (macher-agent--extract-prop payload :parent-buf)
+                                   (macher-agent--extract-prop payload :parent-buffer)
+                                   (macher-agent--extract-prop payload :buffer)
+                                   (macher-agent--extract-prop payload :buf)
+                                   (macher-agent--extract-prop payload :buffer-name)))
+             (live-bufs (cl-remove-if-not #'buffer-live-p
+                                          (mapcar (lambda (b)
+                                                    (cond ((bufferp b) b)
+                                                          ((stringp b) (get-buffer b))
+                                                          (t nil)))
+                                                  (cl-remove 'macher-missing buf-candidates)))))
+        (dolist (b live-bufs)
+          (with-current-buffer b
+            (setq-local macher-agent--persistent-context parent-ctx))))
+
+      (when (macher-agent--plist-p payload)
+        (setq payload (plist-put (copy-sequence payload) :target-context parent-ctx))))
     payload))
 
 (provide 'macher-agent-vfs)
