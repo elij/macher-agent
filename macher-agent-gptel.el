@@ -69,9 +69,9 @@ Side effects: None."
         (setq-local macher--fsm-latest fsm)))
 
     (let* ((prompt-start
-            (if (or (bound-and-true-p gptel-mode) 
+            (if (or (bound-and-true-p gptel-mode)
                     (bound-and-true-p gptel-track-response))
-                (if (and (> (point-max) (point-min)) 
+                (if (and (> (point-max) (point-min))
                          (get-text-property (1- (point-max)) 'gptel))
                     (point-max)
                   (or (previous-single-property-change (point-max) 'gptel) (point-min)))
@@ -99,14 +99,14 @@ Side effects: None."
                          (let ((info-arg (car args)))
                            (when (or response (plist-get info-arg :tool-use))
                              (apply orig-cb (or response "") args)))))))
-    
+
     (let* ((handlers (gptel-fsm-handlers fsm))
            (all-states (delete-dups (append (mapcar #'car handlers) '(WAIT DONE ERRS ABRT))))
            (augmented-handlers
             (cl-loop
              for state in all-states
              for funcs = (alist-get state handlers)
-             collect (cons state 
+             collect (cons state
                            (cond
                             ((eq state 'WAIT)
                              (cons #'macher-agent--inject-media-fsm-logic funcs))
@@ -114,7 +114,7 @@ Side effects: None."
                              (append funcs (list #'macher-agent-gptel--trigger-flush)))
                             (t funcs))))))
       (setf (gptel-fsm-handlers fsm) augmented-handlers)))
-  
+
   (funcall callback))
 
 (defun macher-agent--restore-local-state ()
