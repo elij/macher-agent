@@ -692,18 +692,10 @@ Side effects: Mutates CTX structure."
   "Extract active context from FSM."
   (cond
    ((null fsm) nil)
-   ((macher-agent-valid-context-p fsm)
-    fsm)
-   (t
-    (when-let* ((info (macher-agent--extract-fsm-info fsm)))
-      (if (macher-agent--plist-p info)
-          (or (plist-get info :macher-agent-context)
-              (plist-get info :macher-context)
-              (plist-get info :macher--context))
-        (when (and (consp info) (consp (car info)))
-          (or (cdr-safe (assq :macher-agent-context info))
-              (cdr-safe (assq :macher-context info))
-              (cdr-safe (assq :macher--context info)))))))))
+   ((macher-agent-valid-context-p fsm) fsm)
+   (t (let ((info (ignore-errors (macher-agent--extract-fsm-info fsm))))
+        (or (ignore-errors (macher-agent-resolve-context info))
+            (macher-agent-resolve-from-transit-payload info))))))
 
 (defun macher-agent--transform-inject-context (async-fn fsm)
   "Inject the originating buffer context into the FSM info list.
@@ -816,6 +808,52 @@ Side effects: None."
       (when (functionp step)
         (setq state (funcall step state))))
     state))
+
+(defconst macher-agent-transit-context-keys
+  '(:target-context :parent-context :parent-ctx :context :ctx :macher-agent-context :macher-context :macher--context)
+  "Property keys to inspect when extracting context structures from transit payloads.")
+
+(defun macher-agent-resolve-from-transit-payload (payload-or-state)
+  "Extract context from PAYLOAD-OR-STATE using transit keys."
+  (cond
+   ((macher-agent-valid-context-p payload-or-state)
+    payload-or-state)
+
+   ((and (macher-agent--plist-p payload-or-state)
+         (plist-member payload-or-state :resolved)
+         (plist-member payload-or-state :input))
+    (if (plist-get payload-or-state :resolved)
+        payload-or-state
+      (let* ((input (plist-get payload-or-state :input))
+             (ctx (when input (macher-agent-resolve-from-transit-payload input))))
+        (if (and ctx (macher-agent-valid-context-p ctx))
+            (plist-put payload-or-state :resolved ctx)
+          payload-or-state))))
+
+   ((or (listp payload-or-state) (hash-table-p payload-or-state))
+    (or (cl-loop for key in macher-agent-transit-context-keys
+                 for val = (macher-agent--extract-prop payload-or-state key)
+                 when (and (not (eq val 'macher-missing))
+                           (macher-agent-valid-context-p val))
+                 return val)
+        (let ((shared (macher-agent--extract-prop payload-or-state :shared-state)))
+          (when (and (not (eq shared 'macher-missing))
+                     (or (hash-table-p shared) (listp shared)))
+            (cl-loop for key in macher-agent-transit-context-keys
+                     for val = (macher-agent--extract-prop shared key)
+                     when (and (not (eq val 'macher-missing))
+                               (macher-agent-valid-context-p val))
+                     return val)))
+        (let* ((b-raw (cl-some (lambda (k)
+                                 (let ((v (macher-agent--extract-prop payload-or-state k)))
+                                   (unless (eq v 'macher-missing) v)))
+                               '(:target-buffer :parent-buf :parent-buffer :buffer :buf :buffer-name :originator :originator-buffer)))
+               (buf (when b-raw (if (bufferp b-raw) b-raw (and (stringp b-raw) (get-buffer b-raw))))))
+          (when (and buf (buffer-live-p buf))
+            (let ((bctx (buffer-local-value 'macher-agent--persistent-context buf)))
+              (when (macher-agent-valid-context-p bctx) bctx))))))
+
+   (t nil)))
 
 (defun macher-agent-resolve-context (&optional input)
   "Resolve context from optional INPUT using context-resolution pipeline.

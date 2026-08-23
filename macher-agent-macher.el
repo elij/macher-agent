@@ -354,37 +354,6 @@ Side effects: None."
             state)
         state))))
 
-(defun macher-agent-ctx-pipe--payload-explicit (state)
-  "Context pipeline step 2: Resolve context from explicit payload or buffer in STATE.
-
-If `:resolved' in STATE is nil and `:input' is a payload plist containing
-`:context', `:target-context', or `:ctx', or a `:buffer-name' buffer with
-active context, set `:resolved' to that context structure.
-
-STATE is the context resolution state plist (:input ... :resolved
-... :expanded-root ...).
-
-Return the updated STATE plist.
-Side effects: None."
-  (if (and (macher-agent--plist-p state) (plist-get state :resolved))
-      state
-    (let* ((input (when (macher-agent--plist-p state) (plist-get state :input)))
-           (ctx (macher-agent--extract-prop input :context))
-           (t-ctx (macher-agent--extract-prop input :target-context))
-           (c-ctx (macher-agent--extract-prop input :ctx))
-           (direct-ctx (cl-some (lambda (x) (unless (eq x 'macher-missing) x)) (list ctx t-ctx c-ctx)))
-           (b-name (macher-agent--extract-prop input :buffer-name))
-           (b-buf (macher-agent--extract-prop input :buf))
-           (buf-name (cl-some (lambda (x) (unless (eq x 'macher-missing) x)) (list b-name b-buf)))
-           (buf (when buf-name (if (bufferp buf-name) buf-name (and (stringp buf-name) (get-buffer buf-name)))))
-           (buf-ctx (when (and buf (buffer-live-p buf)) (buffer-local-value 'macher-agent--persistent-context buf))))
-      (cond
-       ((macher-agent-valid-context-p direct-ctx)
-        (plist-put state :resolved direct-ctx))
-       ((macher-agent-valid-context-p buf-ctx)
-        (plist-put state :resolved buf-ctx))
-       (t state)))))
-
 (defun macher-agent-ctx-pipe--workspace-id (state)
   "Context pipeline step 2.5: Resolve context from workspace-id fallback."
   (if (and (macher-agent--plist-p state) (plist-get state :resolved))
@@ -416,39 +385,6 @@ Side effects: None."
                     (puthash (file-name-as-directory expanded) ctx macher-agent-active-workspaces)
                     (puthash (directory-file-name expanded) ctx macher-agent-active-workspaces))
                   (plist-put state :resolved ctx)))))
-        state))))
-
-(defun macher-agent-ctx-pipe--payload-shared (state)
-  "Context pipeline step 3: Resolve context from shared state in STATE input.
-
-If `:resolved' in STATE is nil and `:input' contains `:shared-state' with
-an explicit context or parent buffer context, set `:resolved' to that context.
-
-STATE is the context resolution state plist (:input ... :resolved
-... :expanded-root ...).
-
-Return the updated STATE plist.
-Side effects: None."
-  (if (and (macher-agent--plist-p state) (plist-get state :resolved))
-      state
-    (let* ((input (when (macher-agent--plist-p state) (plist-get state :input)))
-           (shared (macher-agent--extract-prop input :shared-state))
-           (shared-obj (if (eq shared 'macher-missing) nil shared)))
-      (if shared-obj
-          (let* ((ctx (macher-agent--extract-prop shared-obj :context))
-                 (t-ctx (macher-agent--extract-prop shared-obj :target-context))
-                 (c-ctx (macher-agent--extract-prop shared-obj :ctx))
-                 (shared-ctx (cl-some (lambda (x) (unless (eq x 'macher-missing) x)) (list ctx t-ctx c-ctx)))
-                 (p-buf (macher-agent--extract-prop shared-obj :parent-buf))
-                 (parent-buf (if (eq p-buf 'macher-missing) nil p-buf))
-                 (buf (when parent-buf (if (bufferp parent-buf) parent-buf (and (stringp parent-buf) (get-buffer parent-buf)))))
-                 (parent-ctx (when (and buf (buffer-live-p buf)) (buffer-local-value 'macher-agent--persistent-context buf))))
-            (cond
-             ((macher-agent-valid-context-p shared-ctx)
-              (plist-put state :resolved shared-ctx))
-             ((macher-agent-valid-context-p parent-ctx)
-              (plist-put state :resolved parent-ctx))
-             (t state)))
         state))))
 
 (defun macher-agent-ctx-pipe--fsm (state)
@@ -584,10 +520,10 @@ Side effects: May initialise workspace state for current directory."
   "Install context resolution pipeline steps."
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--explicit 10)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--buffer 15)
-  (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--payload-explicit 20)
+  (when (fboundp 'macher-agent-resolve-from-transit-payload)
+    (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-resolve-from-transit-payload 15))
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--subagent 22)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--workspace-id 25)
-  (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--payload-shared 30)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--fsm 40)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--canonical 60)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--fsm-fallback 70)

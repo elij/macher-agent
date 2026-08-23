@@ -33,13 +33,4 @@
                            (plist-get context :buffer)))))
       (if (not (buffer-live-p orig-buf))
           "Error: Original buffer not found."
-        (let* ((max-chars (macher-agent--get-max-context-chars orig-buf))
-               (buf-len (with-current-buffer orig-buf (buffer-size)))
-               (event-horizon-pt (with-current-buffer orig-buf
-                                   (max (point-min) (- (point-max) max-chars)))))
-          (if (<= buf-len max-chars)
-              "Notice: No conversation history has been truncated yet. All context is active."
-            (with-current-buffer orig-buf
-              (save-restriction
-                (narrow-to-region (point-min) event-horizon-pt)
-                (macher-agent-search-dispatch query (current-buffer) context-lines)))))))))
+        (macher-agent-search-dispatch query orig-buf context-lines)))))
