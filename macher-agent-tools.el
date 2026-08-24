@@ -6,24 +6,14 @@
 
 ;;; Code:
 
-(require 'json)
 (require 'cl-lib)
-(require 'map)
-(require 'transient)
 (require 'subr-x)
 (require 'macher-agent-core)
-(require 'macher-agent-presets)
-(require 'macher-agent-orchestration)
+(require 'macher-agent-gptel)
 
 ;;; Customisation Variables
 
 (put 'macher-agent--pending-instructions-queue 'permanent-local t)
-
-(defvar-local macher-agent--final-result nil
-  "Store the synthesised final answer from the sub-agent.
-
-Return final result string or object.
-Side effects: None.")
 
 ;;; Execution Helpers
 
@@ -65,11 +55,12 @@ Side effects: Signals error if value does not match expected primitive type."
            ((or 'string "string")   (stringp value))
            ((or 'number "number")   (numberp value))
            ((or 'integer "integer") (integerp value))
-           ((or 'boolean "boolean") (memq value '(t :json-false)))
+           ((or 'boolean "boolean") (not (null (memq value '(t :json-false)))))
            ((or 'array "array")      (vectorp value))
            ((or 'object "object")   (or (listp value) (hash-table-p value)))
            (_ (error "%s" (format "Unknown schema type: %S" type))))))
-    (unless is-valid
+    (if is-valid
+        t
       (error "%s" (format "The '%s' parameter must be an %s, not %s"
                           name type (type-of value))))))
 
@@ -146,8 +137,17 @@ Side effects: Signals error if missing required properties or invalid types."
       (cl-loop
        for (k v-spec) on props by #'cddr
        for prop-name = (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k))
-       for child-val = (macher-agent--extract-prop value k)
-       do (if (not (eq child-val 'macher-missing))
+       for under-k = (intern (concat ":" (replace-regexp-in-string "-" "_" prop-name)))
+       for hyphen-k = (intern (concat ":" (replace-regexp-in-string "_" "-" prop-name)))
+       for has-val = (and (macher-agent--plist-p value)
+                          (or (plist-member value under-k)
+                              (plist-member value hyphen-k)
+                              (plist-member value k)))
+       for child-val = (when has-val
+                         (or (plist-get value under-k)
+                             (plist-get value hyphen-k)
+                             (plist-get value k)))
+       do (if has-val
               (macher-agent--validate-schema v-spec child-val (format "%s.%s" name prop-name))
             (when (or (and reqs
                            (let* ((hyphen-prop (replace-regexp-in-string "_" "-" prop-name))
@@ -225,16 +225,23 @@ Side effects: None."
           raw-plist
         (dolist (spec args-spec)
           (let* ((arg-name (plist-get spec :name))
-                 (val (if arg-name (macher-agent--extract-prop raw-plist arg-name) 'macher-missing)))
-            (unless (eq val 'macher-missing)
-              (let* ((name-str (if (symbolp arg-name) (symbol-name arg-name) (format "%s" arg-name)))
-                     (clean-name (if (string-prefix-p ":" name-str) (substring name-str 1) name-str))
-                     (under-name (replace-regexp-in-string "-" "_" clean-name))
-                     (hyphen-name (replace-regexp-in-string "_" "-" clean-name))
-                     (under-key (intern (concat ":" under-name)))
-                     (hyphen-key (intern (concat ":" hyphen-name))))
-                (setq result (plist-put result under-key val))
-                (setq result (plist-put result hyphen-key val))))))
+                 (name-str (if (symbolp arg-name) (symbol-name arg-name) (format "%s" arg-name)))
+                 (clean-name (if (string-prefix-p ":" name-str) (substring name-str 1) name-str))
+                 (under-key (intern (concat ":" (replace-regexp-in-string "-" "_" clean-name))))
+                 (hyphen-key (intern (concat ":" (replace-regexp-in-string "_" "-" clean-name))))
+                 (val (when (macher-agent--plist-p raw-plist)
+                        (or (when (plist-member raw-plist under-key) (plist-get raw-plist under-key))
+                            (when (plist-member raw-plist hyphen-key) (plist-get raw-plist hyphen-key))
+                            (when (plist-member raw-plist (intern clean-name)) (plist-get raw-plist (intern clean-name)))
+                            (when (plist-member raw-plist clean-name) (plist-get raw-plist clean-name))))))
+            (when (or (and (macher-agent--plist-p raw-plist)
+                           (or (plist-member raw-plist under-key)
+                               (plist-member raw-plist hyphen-key)
+                               (plist-member raw-plist (intern clean-name))
+                               (plist-member raw-plist clean-name)))
+                      val)
+              (setq result (plist-put result under-key val))
+              (setq result (plist-put result hyphen-key val)))))
         (when (and (listp raw-plist) (evenp (length raw-plist)))
           (cl-loop for (k v) on raw-plist by #'cddr
                    do (unless (plist-member result k)
@@ -251,9 +258,15 @@ Return nil upon successful validation.
 Side effects: Signals error if payload validation fails."
   (cl-loop for spec in args-spec
            for arg-name = (plist-get spec :name)
-           for val = (if arg-name (macher-agent--extract-prop payload arg-name) 'macher-missing)
-           for arg-val = (if (eq val 'macher-missing) nil val)
-           do (macher-agent--validate-schema spec arg-val)))
+           for name-str = (if (symbolp arg-name) (symbol-name arg-name) (format "%s" arg-name))
+           for clean-name = (if (string-prefix-p ":" name-str) (substring name-str 1) name-str)
+           for under-key = (intern (concat ":" (replace-regexp-in-string "-" "_" clean-name)))
+           for hyphen-key = (intern (concat ":" (replace-regexp-in-string "_" "-" clean-name)))
+           for val = (when (macher-agent--plist-p payload)
+                       (or (when (plist-member payload under-key) (plist-get payload under-key))
+                           (when (plist-member payload hyphen-key) (plist-get payload hyphen-key))
+                           (when (plist-member payload (intern clean-name)) (plist-get payload (intern clean-name)))))
+           do (macher-agent--validate-schema spec val)))
 
 (defun macher-agent--run-pre-hooks (name-sym payload)
   "Execute pre-tool and permission hooks for NAME-SYM with PAYLOAD.
@@ -333,7 +346,7 @@ failure hook on error."
         (run-hook-with-args 'macher-agent-post-tool-use-failure-hook ,name-sym ,payload cb-err)
         (funcall ,wrap-cb (list :status 'error :error (error-message-string cb-err)))))))
 
-(cl-defmacro macher-agent-make-tool (name-symbol description &key category args command-fn success-fn output-filter-fn)
+(cl-defmacro macher-agent-make-tool (name-symbol description &key category args command-fn success-fn output-filter-fn (include nil include-p))
   "Define NAME-SYMBOL as a tool compatible with gptel using DESCRIPTION.
 
 NAME-SYMBOL is the symbol naming the tool variable.
@@ -343,12 +356,14 @@ ARGS is the argument schema specification list.
 COMMAND-FN is the function executing core tool logic.
 SUCCESS-FN is the optional callback formatting successful output.
 OUTPUT-FILTER-FN is the optional filter function for final result data.
+INCLUDE is the optional inclusion mode for tool results in the buffer.
 
 Return expanding form defining and initialising the tool variable.
 Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
   (declare (indent 2))
   (let* ((stripped-name (replace-regexp-in-string "^macher-agent-tool-\\|^macher-agent-\\|-tool$" "" (symbol-name name-symbol)))
-         (name (replace-regexp-in-string "-" "_" stripped-name)))
+         (name (replace-regexp-in-string "-" "_" stripped-name))
+         (extra-args (when include-p (list :include include))))
     `(progn
        (defvar ,name-symbol nil)
        (put ',name-symbol 'command-fn ,command-fn)
@@ -361,119 +376,65 @@ Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
               (lambda (callback &rest tool-args)
                 (let*
                     ((ptc-exec (bound-and-true-p macher-agent--active-ptc-execution))
-                     (wrap-cb (macher-agent--wrap-callback callback ptc-exec))
-                     (payload (macher-agent--extract-payload tool-args ,args)))
+                     (incoming-ctx (when (macher-agent-valid-context-p callback) callback))
+                     (actual-cb (if incoming-ctx (car tool-args) callback))
+                     (actual-tool-args (if incoming-ctx (cdr tool-args) tool-args))
+                     (wrap-cb (macher-agent--wrap-callback actual-cb ptc-exec))
+                     (payload (macher-agent--extract-payload actual-tool-args ,args))
+                     (tool-call (make-macher-agent-tool-call
+                                 :name ',name-symbol
+                                 :args payload)))
                   (macher-agent--with-tool-error-handling
-                   ',name-symbol payload wrap-cb
-                   (macher-agent--validate-payload payload ,args)
+                   ',name-symbol (macher-agent-tool-call-args tool-call) wrap-cb
+                   (macher-agent--validate-payload (macher-agent-tool-call-args tool-call) ,args)
                    (let*
-                       ((context (ignore-errors (macher-agent-resolve-context)))
+                       ((fsm (macher-agent-get-active-fsm))
+                        (fsm-info (when fsm (macher-agent--extract-fsm-info fsm)))
+                        (origin-buf (when (macher-agent--plist-p fsm-info)
+                                      (or (plist-get fsm-info :origin-buffer)
+                                          (plist-get fsm-info :buffer))))
+                        (context
+                         (or incoming-ctx
+                             (when (macher-agent--plist-p fsm-info)
+                               (let ((f-ctx (plist-get fsm-info :macher-agent-context)))
+                                 (when (macher-agent-valid-context-p f-ctx)
+                                   f-ctx)))
+                             (when fsm
+                               (macher-agent-resolve-context fsm))
+                             (when (and origin-buf (buffer-live-p origin-buf))
+                               (let ((buf-ctx (buffer-local-value 'macher-agent--persistent-context origin-buf)))
+                                 (if (macher-agent-valid-context-p buf-ctx)
+                                     buf-ctx
+                                   (macher-agent-resolve-context origin-buf))))
+                             (when (bound-and-true-p macher-agent--persistent-context)
+                               (when (macher-agent-valid-context-p macher-agent--persistent-context)
+                                 macher-agent--persistent-context))
+                             (macher-agent-resolve-context (current-buffer))
+                             (macher-agent-resolve-context)))
                         (root
-                         (if context (macher-agent-context-root context) default-directory))
-                        (hook-rejection (macher-agent--run-pre-hooks ',name-symbol payload)))
+                         (if context
+                             (macher-agent-context-root context)
+                           default-directory))
+                        (hook-rejection (macher-agent--run-pre-hooks ',name-symbol (macher-agent-tool-call-args tool-call))))
                      (if hook-rejection
                          (funcall wrap-cb (list :status 'error :error hook-rejection))
                        (let*
                            ((on-success
                              (macher-agent--build-success-callback
-                              ',name-symbol payload ,success-fn
+                              ',name-symbol (macher-agent-tool-call-args tool-call) ,success-fn
                               ,output-filter-fn wrap-cb ptc-exec))
                             (cmd-fn ,command-fn)
                             (arity (func-arity cmd-fn)))
                          (if (or (eq (cdr arity) 'many)
                                  (and (numberp (cdr arity)) (>= (cdr arity) 4)))
-                             (funcall cmd-fn payload context root on-success)
-                           (let ((action-res (funcall cmd-fn payload context root)))
+                             (funcall cmd-fn (macher-agent-tool-call-args tool-call) context root on-success)
+                           (let ((action-res (funcall cmd-fn (macher-agent-tool-call-args tool-call) context root)))
                              (if (functionp action-res)
                                  (funcall action-res on-success)
-                               (funcall on-success action-res)))))))))))))))
+                               (funcall on-success action-res))))))))))
+              ,@extra-args)))))
 
-;;; Sandbox Execution
-
-(defun macher-agent--run-in-persistent-sandbox (context command on-success on-error)
-  "Execute COMMAND asynchronously within dynamically generated VFS sandbox.
-
-CONTEXT is the active agent context structure.
-COMMAND is the shell command string to execute.
-ON-SUCCESS is the success callback function.
-ON-ERROR is the error callback function.
-
-Return nil.
-Side effects: Creates temporary sandbox directory and spawns process."
-  (let* ((workspace-root (if (and context (fboundp 'macher-agent-context-root))
-                             (macher-agent-context-root context)
-                           default-directory))
-         (sandbox-dir (make-temp-file "macher-sandbox-" t))
-         (contents (when (and context (fboundp 'macher-agent--get-context-contents))
-                     (macher-agent--get-context-contents context))))
-    (condition-case err
-        (progn
-          (when (fboundp 'macher-agent--vfs-verify-clean-merge)
-            (macher-agent--vfs-verify-clean-merge workspace-root contents))
-          (when (fboundp 'macher-agent--vfs-sync-baseline)
-            (macher-agent--vfs-sync-baseline workspace-root sandbox-dir))
-          (when (and contents (fboundp 'macher-agent--vfs-apply-overlay-stateless))
-            (macher-agent--vfs-apply-overlay-stateless contents workspace-root sandbox-dir))
-
-          (let* ((out-buf (generate-new-buffer " *macher-sandbox-out*"))
-                 (default-directory (file-name-as-directory sandbox-dir)))
-            (make-process
-             :name "macher-sandbox-process"
-             :buffer out-buf
-             :command (list shell-file-name shell-command-switch command)
-             :sentinel
-             (lambda (proc _event)
-               (when (memq (process-status proc) '(exit signal))
-                 (let ((output (with-current-buffer out-buf (buffer-string)))
-                       (exit-code (process-exit-status proc)))
-
-                   (kill-buffer out-buf)
-                   (ignore-errors (delete-directory sandbox-dir t))
-
-                   (if (= exit-code 0)
-                       (funcall on-success output)
-                     (funcall on-error (list :status 'error :error output)))))))))
-      (error
-       (ignore-errors (delete-directory sandbox-dir t))
-       (funcall on-error (list :status 'error :error (error-message-string err)))))))
-
-(defun macher-agent--read-file-vfs-aware (file-path context)
-  "Read FILE-PATH prioritising uncommitted VFS memory over physical disk.
-
-FILE-PATH is the file path string to read.
-CONTEXT is the active agent context structure.
-
-Return file content string, or nil if file cannot be read.
-Side effects: None."
-  (let* ((contents (when (and context (fboundp 'macher-agent--get-context-contents))
-                     (macher-agent--get-context-contents context)))
-         (workspace-root (or (and context (fboundp 'macher-agent-context-root)
-                                  (macher-agent-context-root context))
-                             default-directory))
-         (relative-path (if (fboundp 'macher-agent-to-relative-path)
-                            (macher-agent-to-relative-path file-path workspace-root)
-                          (if (file-name-absolute-p file-path)
-                              (file-relative-name file-path workspace-root)
-                            file-path)))
-         (safe-path (if (fboundp 'macher-agent--resolve-safe-path)
-                        (macher-agent--resolve-safe-path relative-path workspace-root)
-                      (expand-file-name relative-path workspace-root)))
-         (norm-path (if (and context (fboundp 'macher-agent--normalize-path-key))
-                        (ignore-errors (macher-agent--normalize-path-key file-path context))
-                      file-path))
-         (vfs-entry
-          (when contents
-            (or (cl-find file-path contents :key #'car :test #'equal)
-                (when norm-path (cl-find norm-path contents :key #'car :test #'equal))
-                (when safe-path (cl-find safe-path contents :key #'car :test #'equal)))))
-         (vfs-content (when vfs-entry (if (consp (cdr vfs-entry)) (cddr vfs-entry) (cdr vfs-entry)))))
-    (when (and context (fboundp 'macher-agent--ensure-access-stateless))
-      (macher-agent--ensure-access-stateless contents file-path))
-    (cond
-     (vfs-content vfs-content)
-     ((and safe-path (file-exists-p safe-path))
-      (with-temp-buffer (insert-file-contents safe-path) (buffer-string)))
-     (t nil))))
+;;; Instruction Queue
 
 (defun macher-agent-add-pending-instruction (instruction)
   "Push INSTRUCTION to the end of the queue for the next network turn.
@@ -483,130 +444,10 @@ INSTRUCTION is the directive string to append to the queue.
 Return new list of pending instructions.
 
 Side effects: Updates `macher-agent--pending-instructions-queue' buffer-locally."
+  (cl-assert (stringp instruction) nil "INSTRUCTION must be a string, got: %S" instruction)
   (setq-local macher-agent--pending-instructions-queue
               (append macher-agent--pending-instructions-queue
                       (list (format "USER OVERRIDE DIRECTIVE:\n%s" instruction)))))
-
-;;; Media Integration
-
-(defvar gptel-track-media)
-(defvar gptel-context)
-(declare-function gptel-add-file "gptel")
-(declare-function gptel--parse-buffer "gptel")
-(declare-function gptel-context-remove "gptel-context" (file))
-
-(defun macher-agent--gptel-base64-encode-advice (orig-fun file)
-  "Read FILE from VFS if available before base64 encoding.
-
-ORIG-FUN is the original `gptel--base64-encode' function.
-FILE is the string path of file or raw base64 data.
-
-Return base64-encoded string representation.
-Side effects: None."
-  (if-let* ((fsm (macher-agent-get-active-fsm))
-            (info (ignore-errors (macher-agent--extract-fsm-info fsm)))
-            (ctx (or (plist-get info :macher-agent-context)
-                     (plist-get info :macher-context)
-                     (plist-get info :macher--context)))
-            (pending (when ctx
-                       (macher-agent--get-context-data ctx :pending-media)))
-            ((cl-some (lambda (item) (string= file (car item))) pending)))
-      file
-    (if-let* ((ctx (ignore-errors (macher-agent-resolve-context)))
-              (workspace (when ctx
-                           (macher-agent--get-context-workspace ctx)))
-              (workspace-root (when workspace
-                                (macher-agent-workspace-project-root workspace)))
-              (actual-name (if workspace-root
-                               (if (fboundp 'macher-agent-to-relative-path)
-                                   (macher-agent-to-relative-path file workspace-root)
-                                 (if (file-name-absolute-p file)
-                                     (file-relative-name file workspace-root)
-                                   file))
-                             file))
-              (content (when (and ctx (fboundp 'macher-agent--read-context-file))
-                         (ignore-errors (macher-agent--read-context-file ctx actual-name)))))
-        (with-temp-buffer
-          (set-buffer-multibyte nil)
-          (insert content)
-          (base64-encode-region (point-min) (point-max) :no-line-break)
-          (buffer-string))
-      (funcall orig-fun file))))
-
-;;; Memory Tools
-
-(defvar macher-agent-search-backend-function #'macher-agent-search-glob
-  "Function variable used to dispatch conversation history searches.
-Defaults to the native `macher-agent-search-glob` but can be dynamically
-overridden by memory plugins.")
-
-(defun macher-agent-search-glob (query orig-buf &optional ctx-lines)
-  "Search for QUERY in ORIG-BUF matching CTX-LINES."
-  (let ((ctx-lines (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
-        (results nil)
-        (invalid-re nil))
-    (if (not (buffer-live-p orig-buf))
-        "Error: Cannot locate original conversation buffer."
-      (with-current-buffer orig-buf
-        (save-excursion
-          (goto-char (point-min))
-          (condition-case err
-              (let ((continue t))
-                (while (and continue (re-search-forward query nil t))
-                  (let* ((match-beg (match-beginning 0))
-                         (match-end (match-end 0))
-                         (start-pt (save-excursion
-                                     (goto-char match-beg)
-                                     (forward-line (- ctx-lines))
-                                     (line-beginning-position)))
-                         (end-pt (save-excursion
-                                   (goto-char match-beg)
-                                   (forward-line ctx-lines)
-                                   (line-end-position)))
-                         (snippet (buffer-substring-no-properties start-pt end-pt)))
-                    (push (format "--- Match near line %d ---\n%s\n"
-                                  (line-number-at-pos match-beg) snippet)
-                          results)
-                    (when (= match-beg match-end)
-                      (if (eobp)
-                          (setq continue nil)
-                        (forward-char 1))))))
-            (invalid-regexp
-             (setq invalid-re (error-message-string err))))))
-      (cond
-       (invalid-re
-        (format "Error: Invalid regular expression: %s" invalid-re))
-       (results
-        (string-join (nreverse results) "\n"))
-       (t
-        (format "No matches found in history for: %s" query))))))
-
-(defun macher-agent--buffer-to-traces (buffer)
-  "Convert BUFFER content into trace plists for Zero-Mem graph construction."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (save-excursion
-        (goto-char (point-min))
-        (let ((traces nil)
-              (line-num 1))
-          (while (not (eobp))
-            (let ((line-text (buffer-substring-no-properties
-                              (line-beginning-position)
-                              (line-end-position))))
-              (unless (string-empty-p (string-trim line-text))
-                (push (list :text line-text
-                            :timestamp (float line-num)
-                            :metadata (list :line line-num))
-                      traces)))
-            (setq line-num (1+ line-num))
-            (forward-line 1))
-          (nreverse traces))))))
-
-(defun macher-agent-search-dispatch (keywords orig-buf &optional ctx-lines)
-  "Dispatch search for KEYWORDS in ORIG-BUF with CTX-LINES context."
-  (if (not (buffer-live-p orig-buf))
-      "Error: Cannot locate original conversation buffer."
-    (funcall macher-agent-search-backend-function keywords orig-buf ctx-lines)))
 
 (provide 'macher-agent-tools)
 ;;; macher-agent-tools.el ends here

@@ -4,6 +4,7 @@
     "Execute an Emacs Lisp orchestration script. Use this to orchestrate multiple tools, \
 spawn sub-agents, and handle complex asynchronous workflows in a single step."
   :category "execution"
+  :include nil
   :args
   '((
      :name "script"

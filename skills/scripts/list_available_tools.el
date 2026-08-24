@@ -8,8 +8,7 @@
   :args nil
   :command-fn
   (lambda (&optional _payload context _root)
-    (let* ((ctx (or context (when (fboundp 'macher-agent-resolve-context)
-                              (ignore-errors (macher-agent-resolve-context)))))
+    (let* ((ctx context)
            (tools-list nil)
            (seen (make-hash-table :test 'equal)))
       (dolist (table (list (when (and (boundp 'macher-agent-tools-registry)

@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.2.4
+;; Version: 0.8.2.5
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -18,13 +18,7 @@
 (require 'cl-lib)
 (require 'gptel)
 (require 'project)
-
 (require 'macher-agent-api)
-(require 'macher-agent-core)
-(require 'macher-agent-gptel)
-(require 'macher-agent-orchestration)
-(require 'macher-agent-presets)
-(require 'macher-agent-tools)
 
 (defgroup macher-agent nil
   "Agent tools within the macher edit context."
@@ -54,43 +48,29 @@ Return the result message string displayed in the echo area."
         (macher-agent-setup-gptel-buffer)
         (macher-agent--wrap-macher-tools))
     (remove-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer t)
-    (remove-hook 'gptel-prompt-transform-functions #'macher-agent--transform-inject-context t)
     (dolist (transformer macher-agent-prompt-transformers)
       (remove-hook 'gptel-prompt-transform-functions transformer t))
     (remove-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope t)))
 
-
-(defun macher-agent-pipe--base64-encode-media (state _orig-buf _presets _skills _redirect)
-  "Scan prompt payload and natively encode media files to base64 strings.
-
-Not used"
-  state)
-
 (defun macher-agent-install ()
   "Explicitly install macher-agent global hooks, tools, and FSM integrations."
   (interactive)
-
-  (when (fboundp 'macher-agent-context-resolution-install)
-    (macher-agent-context-resolution-install))
-  (when (fboundp 'macher-agent-sandbox-install)
-    (macher-agent-sandbox-install))
-  (when (fboundp 'macher-agent-zero-mem-install)
-    (macher-agent-zero-mem-install))
-  (when (fboundp 'macher-agent-vfs-install)
-    (macher-agent-vfs-install))
-  (when (fboundp 'macher-agent-transmission-install)
-    (macher-agent-transmission-install))
+  (macher-agent-context-resolution-install)
+  (macher-agent-sandbox-install)
+  (macher-agent-zero-mem-install)
+  (macher-agent-vfs-install)
+  (macher-agent-transmission-install)
 
   (add-hook 'gptel-prompt-transform-functions #'macher-agent--fsm-hijack-transform)
-
   (add-hook 'hack-local-variables-hook #'macher-agent--restore-local-state)
-
   (add-hook 'gptel-pre-tool-call-functions #'macher-agent--log-gptel-pre-tool)
   (add-hook 'macher-agent-context-mutated-hook #'macher-agent--mutation-dispatcher)
 
   (with-eval-after-load 'gptel-transient
     (ignore-errors
       (transient-suffix-put 'gptel-menu 'gptel--infix-tools :save-history nil))))
+
+(defalias 'macher-agent-setup #'macher-agent-install)
 
 (provide 'macher-agent)
 ;;; macher-agent.el ends here

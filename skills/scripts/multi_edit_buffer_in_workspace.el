@@ -24,20 +24,12 @@ order. If ANY edit fails, ALL changes are rolled back."
           (actual-name (macher-agent--resolve-buffer-name buffer_name))
           (norm-key (macher-agent--normalize-path-key actual-name context))
           (content
-           (let* ((contents (macher-agent--get-context-contents context))
-                  (entry (or (cl-find norm-key contents :key #'car :test #'equal)
-                             (cl-find actual-name contents :key #'car :test #'equal))))
+           (let* ((contents (when context (macher-agent--get-context-contents context)))
+                  (entry (or (cl-find norm-key contents :key #'macher-agent-vfs-entry-path :test #'equal)
+                             (cl-find actual-name contents :key #'macher-agent-vfs-entry-path :test #'equal))))
              (cond
               (entry (macher-agent-vfs-entry-curr entry))
-              ((get-buffer actual-name)
-               (with-current-buffer (get-buffer actual-name)
-                 (buffer-substring-no-properties (point-min) (point-max))))
-              ((and (not (file-name-absolute-p actual-name))
-                    (not (string-prefix-p "~" actual-name))
-                    (file-exists-p actual-name))
-               (with-temp-buffer
-                 (insert-file-contents actual-name)
-                 (buffer-string)))
+              ((macher-agent--read-content-from-disk-or-buffer actual-name))
               (t (error "Buffer '%s' not found in workspace" actual-name))))))
      (cl-loop for edit in (append edits nil) do
               (let* ((old-text (plist-get edit :old_text))

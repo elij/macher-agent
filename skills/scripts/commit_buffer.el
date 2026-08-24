@@ -1,28 +1,30 @@
 ;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
  macher-agent-commit-buffer-tool
- "Directly appends an Emacs buffer and synchronise the agent's memory immediately, \
-bypassing the patch review step."
+ "Propose and virtualise changes for a live Emacs buffer and synchronise the agent's memory via VFS."
  :category "execution"
- :args (list '(:name "buffer_name" :type string)
-             '(:name "content" :type string))
+ :args '((:name "buffer_name" :type string :description "The name of the target buffer")
+         (:name "content" :type string :description "The new content to virtualise for the buffer"))
  :command-fn
- (lambda (payload context _root)
-   (let* ((buffer_name (plist-get payload :buffer_name))
-          (content (plist-get payload :content))
-          (actual-name (macher-agent--resolve-buffer-name buffer_name)))
-     (macher-agent--ensure-access context actual-name)
-     (let ((target-buffer (get-buffer-create actual-name)))
-       (with-current-buffer target-buffer
-         (auto-save-visited-mode -1)
-         (goto-char (point-max))
-         (insert content)
-         (set-buffer-modified-p t))
-       (when context
-         (macher-agent--update-context-file context actual-name content)
-         (macher-agent--auto-sync-context context))
-       `((status . "success") (buffer . ,actual-name)))))
+ (lambda (payload context root)
+   (when-let* ((buffer_name (plist-get payload :buffer_name))
+               (content (plist-get payload :content)))
+     (let* ((ws-root (or (and context (macher-agent-context-root context))
+                         root
+                         default-directory))
+            (is-disk-file (and ws-root
+                               (or (file-exists-p buffer_name)
+                                   (file-exists-p (expand-file-name buffer_name ws-root))))))
+       (unless is-disk-file
+         (get-buffer-create buffer_name))
+       (let* ((actual-name (macher-agent--resolve-buffer-name buffer_name)))
+         (when context
+           (macher-agent--ensure-access context actual-name)
+           (let ((norm-key (macher-agent--normalize-path-key actual-name context)))
+             (macher-agent--update-context-file context norm-key content)))
+         `((status . "success") (buffer . ,actual-name))))))
  :success-fn
  (lambda (res _payload)
-   (format "SUCCESS: Buffer '%s' has been directly overwritten and synchronised. Awaiting user save."
+   (format "SUCCESS: Virtual edit recorded for buffer '%s'. A patch will be generated at the end of the turn."
            (cdr (assoc 'buffer res)))))
+

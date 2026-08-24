@@ -1,66 +1,51 @@
 ;; -*- lexical-binding: t; -*-
 (macher-agent-make-tool
     macher-agent-delegate-tasks-to-subagents-tool
-    "Delegate tasks to multiple sub-agents asynchronously using A2A point-to-point payloads. \
-Use this tool if you need feedback from the agent after execution."
+    "Delegate tasks concurrently to sub-agents."
   :category "collaboration"
-  :args '((:name "tasks" :type array :items
-                 (:type object :properties
-                        (:buffer_name (:type string)
-                                      :instructions (:type string)
-                                      :presets (:type array :items (:type string))
-                                      :ephemeral (:type boolean :description "Whether sub-agent should be reaped immediately upon task completion.")))))
+  :args '((:name "tasks" :type array
+                 :items (:type object
+                               :properties (:buffer_name (:type string)
+                                                         :instructions (:type string)
+                                                         :presets (:type array :items (:type string))
+                                                         :ephemeral (:type boolean))
+                               :required ["buffer_name" "instructions"])
+                 :description "List of tasks to delegate"))
   :command-fn
   (lambda (payload context _root callback)
-    (let*
-        ((raw-tasks (plist-get payload :tasks))
-         (a2a-payloads
-          (cl-loop
-           for task-obj in (append raw-tasks nil)
-           collect
-           (let
-               ((task-id
-                 (if (fboundp 'org-id-uuid)
-                     (org-id-uuid)
-                   (format "task-%04x" (random #xffff)))))
-             (list
-              :type 'SEND_MESSAGE
-              :task-id task-id
-              :message (list :instructions (plist-get task-obj :instructions))
-              :metadata (list :buffer_name (plist-get task-obj :buffer_name)
-                              :presets (append (plist-get task-obj :presets) nil)
-                              :suppress-patch t
-                              :ephemeral (plist-get task-obj :ephemeral)))))))
-      (macher-agent-a2a-dispatch 
-       a2a-payloads 
-       (lambda (a2a-results)
-         (let
-             ((lisp-results
-               (cl-loop
-                for res across (if (vectorp a2a-results) a2a-results (vconcat a2a-results))
-                collect
-                (let*
-                    ((msg (plist-get res :message))
-                     (data (or (plist-get res :data) (plist-get msg :data)))
-                     (status (or (plist-get res :status) (plist-get msg :status)))
-                     (buf-name
-                      (or
-                       (plist-get res :buffer-name) (plist-get msg :buffer-name) "sub-agent"))
-                     (err (or (plist-get res :error) (plist-get msg :error))))
-                  (if (eq status 'success)
-                      (list :status 'success :data data :buffer-name buf-name)
-                    (list :status 'error :error err :buffer-name buf-name))))))
-           (funcall callback (vconcat lisp-results))))
-       context)))
-  :success-fn
-  (lambda (results)
-    (let ((output (list "All sub-agents completed:\n\n")))
-      (cl-loop for res across (if (vectorp results) results (vconcat results))
-               do (push
-                   (format "=== Response from %s ===\n%s\n" 
-                           (plist-get res :buffer-name)
-                           (if (eq (plist-get res :status) 'success)
-                               (plist-get res :data)
-                             (plist-get res :error)))
-                   output))
-      (string-join (nreverse output) "\n"))))
+    (let* ((tasks (plist-get payload :tasks))
+           (dispatch-payloads
+            (cl-loop for task across (if (vectorp tasks) tasks (vconcat tasks))
+                     for instructions = (plist-get task :instructions)
+                     do (when (or (null instructions)
+                                  (and (stringp instructions)
+                                       (string-empty-p (string-trim instructions))))
+                          (error "ERROR: Instructions for delegated tasks cannot be empty."))
+                     collect
+                     (macher-agent-make-a2a-payload
+                      :schema-version (if (boundp 'macher-agent-a2a-schema-version)
+                                          macher-agent-a2a-schema-version
+                                        :a2a-v1)
+                      :transit-type :root-to-subagent
+                      :type 'SEND_MESSAGE
+                      :parent-context context
+                      :payload (list :instructions instructions)
+                      :message (list :instructions instructions)
+                      :metadata (list :buffer_name (plist-get task :buffer_name)
+                                      :presets (plist-get task :presets)
+                                      :ephemeral (plist-get task :ephemeral)
+                                      :suppress-patch t))))) 
+      (macher-agent-a2a-dispatch
+       dispatch-payloads
+       (lambda (results)
+         (let ((formatted-results
+                (cl-loop for res across results
+                         collect (format "=== Response from sub-agent ===\n%s\n"
+                                         (or (plist-get res :message)
+                                             (plist-get res :data)
+                                             (plist-get res :error)
+                                             res)))))
+           (funcall callback
+                    (format "All sub-agents completed:\n\n%s"
+                            (string-join formatted-results "\n")))))
+       context))))
