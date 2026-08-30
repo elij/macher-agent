@@ -3,7 +3,7 @@
     macher-agent-search-conversation-history-tool
     "Search the truncated earlier conversation history. Use this when the SYSTEM ALERT indicates context was removed. Returns matching lines and surrounding context."
   :category "execution"
-  :args '((:name "query" :type string :description "The exact text or regular expression to search for in the history.")
+  :args '((:name "query" :type string :description "The keywords with space delimiters to search for in the history.")
           (:name "context_lines" :type number :optional t :description "Number of lines to return before and after the match (default 5)."))
   :command-fn
   (lambda (payload context _root)
@@ -12,8 +12,11 @@
            (fsm (or (and context
                          (cond
                           ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p context)) context)
-                          ((and (fboundp 'macher-agent--get-context-data)
-                                (macher-agent--get-context-data context :fsm)))
+                          ((and (fboundp 'macher-agent-context-p)
+                                (macher-agent-context-p context))
+                           (let ((plugins (macher-agent-context-plugins context)))
+                             (when (macher-agent--plist-p plugins)
+                               (plist-get plugins :fsm))))
                           ((and (fboundp 'macher-agent--plist-p)
                                 (macher-agent--plist-p context)
                                 (plist-get context :buffer)) context)))
@@ -25,8 +28,11 @@
                        (ignore-errors (gptel-fsm-info fsm))))))
            (orig-buf (or (when (and info (fboundp 'macher-agent--plist-p) (macher-agent--plist-p info))
                            (plist-get info :buffer))
-                         (when (and context (fboundp 'macher-agent--get-context-data))
-                           (macher-agent--get-context-data context :buffer))
+                         (when (and context (fboundp 'macher-agent-context-p) (macher-agent-context-p context))
+                           (or (macher-agent-context-origin-buffer context)
+                               (let ((plugins (macher-agent-context-plugins context)))
+                                 (when (macher-agent--plist-p plugins)
+                                   (plist-get plugins :buffer)))))
                          (when (and (fboundp 'macher-agent--plist-p)
                                     (macher-agent--plist-p context)
                                     (bufferp (plist-get context :buffer)))

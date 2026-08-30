@@ -13,11 +13,12 @@
        (dolist (entry entries (nreverse acc))
          (let* ((buf-name (macher-agent-vfs-entry-path entry))
                 (classification
-                 (macher-agent-context-classify-entry buf-name root-dir)))
-           (when (memq classification '(buffer external))
+                 (macher-agent--classify-file-path buf-name root-dir)))
+           (when (memq classification '(buffer file external media))
              (push buf-name acc)))))))
  :success-fn
  (lambda (active-buffers _payload)
    (if active-buffers
        (mapconcat #'identity active-buffers "\n")
      "No buffers are currently in your scope.")))
+

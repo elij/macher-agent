@@ -136,31 +136,31 @@ Agents interact through point-to-point Agent-to-Agent (A2A) payloads and callbac
 
 ### Macher Agent Zero-Mem benchmarks (100,000 tokens)
 
-Memory recall beyond the `macher-agent-max-context-chars` boundary operates through the `search_conversation_history` tool.
+Memory recall beyond the `macher-agent-max-context-chars` boundary operates through the `search_conversation_history` tool, to provide a continuous memory. Subagents are also able to access the memory of the originating context using `search_parent_conversation_history`.
 
 1,000 Traces
 
-| Engine | Time | GC Cycles | GC Time |
-| --- | --- | --- | --- |
-| Float PPR | 0.050142 s | 2 | 0.034173 s |
-| Fixed-Point PPR | 0.028505 s | 1 | 0.016375 s |
-| Glob | 0.000026 s | 0 | 0 s |
+|Engine         |Time      |GC Cycles|GC Time   |
+|---------------|----------|---------|----------|
+|Float PPR      |0.050142 s|2        |0.034173 s|
+|Fixed-Point PPR|0.028505 s|1        |0.016375 s|
+|Glob           |0.000026 s|0        |0 s       |
 
 5,000 Traces
 
-| Engine | Time | GC Cycles | GC Time |
-| --- | --- | --- | --- |
-| Float PPR | 0.277900 s | 11 | 0.200374 s |
-| Fixed-Point PPR | 0.142280 s | 5 | 0.092353 s |
-| Glob | 0.000062 s | 0 | 0 s |
+|Engine         |Time      |GC Cycles|GC Time   |
+|---------------|----------|---------|----------|
+|Float PPR      |0.277900 s|11       |0.200374 s|
+|Fixed-Point PPR|0.142280 s|5        |0.092353 s|
+|Glob           |0.000062 s|0        |0 s       |
 
 10,000 Traces
 
-| Engine | Time | GC Cycles | GC Time |
-| --- | --- | --- | --- |
-| Float PPR | 0.589837 s | 20 | 0.429688 s |
-| Fixed-Point PPR | 0.293908 s | 9 | 0.197646 s |
-| Glob | 0.000115 s | 0 | 0 s |
+|Engine         |Time      |GC Cycles|GC Time   |
+|---------------|----------|---------|----------|
+|Float PPR      |0.589837 s|20       |0.429688 s|
+|Fixed-Point PPR|0.293908 s|9        |0.197646 s|
+|Glob           |0.000115 s|0        |0 s       |
 
 ### Programmatic tool calling (PTC) for token efficiency
 

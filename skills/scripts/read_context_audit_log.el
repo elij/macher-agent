@@ -26,7 +26,13 @@
            (limit (if (and (numberp raw-limit) (> raw-limit 0))
                       (round raw-limit)
                     5))
-           (raw-log (macher-agent--get-context-data context :audit-log))
+           (raw-log (cond
+                     ((and context (fboundp 'macher-agent-context-p) (macher-agent-context-p context))
+                      (let ((plugins (macher-agent-context-plugins context)))
+                        (when (macher-agent--plist-p plugins)
+                          (plist-get plugins :audit-log))))
+                     ((and context (fboundp 'macher-agent--plist-p) (macher-agent--plist-p context))
+                      (plist-get context :audit-log))))
            (filtered-log
             (if preset-str
                 (cl-remove-if-not
