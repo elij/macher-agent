@@ -214,5 +214,51 @@ Side effects: Invokes task flush hooks."
                  (ignore-errors (macher-agent-resolve-context)))))
     (macher-agent-run-task-flush-hook ctx)))
 
+
+(cl-defmacro macher-agent-execute-detached-ptc ((&key (buffer-name "*workspace-root*")
+                                                      (reap t)
+                                                      primitives
+                                                      presets
+                                                      on-success on-error)
+                                                &rest script-body)
+  "Execute SCRIPT-BODY as a sandboxed PTC script in a background workspace root."
+  (declare (indent 1) (debug t))
+  `(let ((root-buf (get-buffer-create ,buffer-name))
+         (allowed-primitives ,primitives)
+         (active-presets ,presets))
+     (with-current-buffer root-buf
+       (unless (bound-and-true-p macher-agent--persistent-context)
+         (setq-local macher-agent--persistent-context
+                     (macher-agent--make-context :id "proxy-ctx" :project-root default-directory)))
+       (when (fboundp 'macher-agent-resolve-tools)
+         (macher-agent-resolve-tools macher-agent--persistent-context active-presets))
+       (let ((native-fsm (gptel-request nil :dry-run t))
+             (script-str (prin1-to-string ',(if (> (length script-body) 1)
+                                                `(progn ,@script-body)
+                                              (car script-body))))
+             (success-cb (or ,on-success (lambda (res) (message "PTC Success: %s" res))))
+             (error-cb (or ,on-error (lambda (err) (message "PTC Error: %s" err)))))
+
+         (cl-letf (((symbol-function 'macher-agent-get-active-fsm)
+                    (lambda (&rest _) native-fsm))
+                   ((symbol-function 'macher-agent--ptc-primitive-p)
+                    (lambda (sym &rest _)
+                      (or (memq sym allowed-primitives)
+                          (and (fboundp 'macher-agent-sandbox--primitives)
+                               (hash-table-p macher-agent-sandbox--primitives)
+                               (gethash sym macher-agent-sandbox--primitives))))))
+
+           (macher-agent-execute-ptc-script
+            script-str
+            macher-agent--persistent-context
+            (lambda (res)
+              (funcall success-cb res)
+              (when ,reap (kill-buffer root-buf)))
+            (lambda (err)
+              (funcall error-cb err)
+              (when ,reap (kill-buffer root-buf)))
+            nil
+            root-buf))))))
+
 (provide 'macher-agent-api)
 ;;; macher-agent-api.el ends here

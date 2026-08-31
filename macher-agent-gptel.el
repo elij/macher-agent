@@ -80,7 +80,13 @@ Side effects: None."
           (when (and ctx (macher-agent-valid-context-p ctx))
             (setq inf (plist-put inf :macher-agent-context ctx)))
           (macher-agent--set-fsm-info fsm inf)
-          (setf (gptel-fsm-info fsm) inf))))
+          (setf (gptel-fsm-info fsm) inf))
+
+        (setq-local macher-agent--persistent-context ctx)
+        (unless (bound-and-true-p macher-agent-presets)
+          (setq-local macher-agent-presets (buffer-local-value 'macher-agent-presets target-buf)))
+        (unless gptel-tools
+          (setq-local gptel-tools (buffer-local-value 'gptel-tools target-buf)))))
 
     (let* ((prompt-buf (if (and target-buf (buffer-live-p target-buf))
                            target-buf
@@ -137,6 +143,7 @@ Side effects: None."
   (when (functionp callback)
     (funcall callback)))
 
+
 (defun macher-agent--restore-local-state ()
   "Restore agent variables natively after Emacs parses file-local variables."
   (when (or (local-variable-p 'gptel-model)
@@ -146,6 +153,7 @@ Side effects: None."
     (let ((current-root (macher-agent-root default-directory)))
       (when current-root
         (macher-agent--init-workspace-state current-root)))
+
 
     (when (fboundp 'gptel--restore-state)
       (ignore-errors (gptel--restore-state)))
