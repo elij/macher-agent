@@ -35,17 +35,19 @@
                                       :presets (plist-get task :presets)
                                       :ephemeral (plist-get task :ephemeral)
                                       :suppress-patch t))))) 
-      (macher-agent-a2a-dispatch
-       dispatch-payloads
-       (lambda (results)
-         (let ((formatted-results
-                (cl-loop for res across results
-                         collect (format "=== Response from sub-agent ===\n%s\n"
-                                         (or (plist-get res :message)
-                                             (plist-get res :data)
-                                             (plist-get res :error)
-                                             res)))))
-           (funcall callback
-                    (format "All sub-agents completed:\n\n%s"
-                            (string-join formatted-results "\n")))))
-       context))))
+      (let ((saved-fsm (macher-agent-get-active-fsm)))
+        (macher-agent-a2a-dispatch
+         dispatch-payloads
+         (let ((fsm saved-fsm))
+           (lambda (results)
+             (let ((formatted-results
+                    (cl-loop for res across results
+                             collect (format "=== Response from sub-agent ===\n%s\n"
+                                             (or (plist-get res :message)
+                                                 (plist-get res :data)
+                                                 (plist-get res :error)
+                                                 res)))))
+               (funcall callback
+                        (format "All sub-agents completed:\n\n%s"
+                                (string-join formatted-results "\n"))))))
+         context)))))

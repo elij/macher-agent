@@ -118,8 +118,12 @@ Return a property list containing skill properties.
 Side effects: Reads file or VFS buffer into a temporary buffer."
   (cl-assert (stringp filepath) nil "FILEPATH must be a string, got: %S" filepath)
   (let* ((resolved-ctx (cond
-                        ((macher-agent-valid-context-p context) context)
-                        (context (macher-agent-resolve-context context))
+                        ((or (macher-agent-context-p context) (macher-agent-valid-context-p context))
+                         context)
+                        ((or (bufferp context) (stringp context))
+                         (macher-agent-context-from-buffer context))
+                        ((macher-agent-transit-payload-p context)
+                         (macher-agent-context-from-payload context))
                         (t (bound-and-true-p macher-agent--persistent-context))))
          (workspace-root (when resolved-ctx (macher-agent-context-workspace-root resolved-ctx)))
          (abs-file (expand-file-name filepath))

@@ -12,8 +12,6 @@
 (eval-and-compile
   (require 'gv))
 
-(declare-function gptel-fsm-p "gptel" (obj))
-(declare-function gptel-fsm-info "gptel" (fsm))
 (declare-function gptel-tool-p "gptel" (tool))
 (declare-function gptel-tool-name "gptel" (tool))
 (declare-function project-current "project" (&optional maybe-prompt dir))
@@ -27,6 +25,7 @@
   (id nil :type (or null string))
   (project-root nil :type (or null string))
   (origin-buffer nil :type (or null buffer))
+  (prompt nil :type (or null string))
   (tools nil :type list)
   (skills nil :type list)
   (media-queue nil :type list)
@@ -187,12 +186,6 @@ Side effects: None.")
   :group 'macher-agent)
 
 ;; Buffer-local agent state
-(defvar-local macher-agent--active-fsm nil
-  "Store active finite-state machine (FSM) instance for current buffer.
-
-Return active FSM struct or nil.
-Side effects: Buffer-local variable.")
-
 (defvar-local macher-agent--routing-stack nil
   "Stack of routing frame property lists for current sub-agent buffer.
 
@@ -309,16 +302,6 @@ Side effects: Buffer-local variable.")
   "Initial boot directive instruction string for sub-agent execution.
 
 Return the boot directive string or nil.
-
-Side effects: Buffer-local variable.")
-
-(defvar-local macher-agent-fsm-id nil
-  "Buffer-local identifier bridging user interface buffers to the state machine.
-
-Stores the unique state machine identifier associated with the current
-user interface buffer session.
-
-Return the state machine identifier string or symbol, or nil if unassigned.
 
 Side effects: Buffer-local variable.")
 
@@ -454,73 +437,6 @@ Return non-nil if OBJECT is a valid plist, otherwise nil."
                (setq lst (cddr lst))))
            (and valid (null lst))))))
 
-(defun macher-agent-get-active-fsm (&optional current-fsm)
-  "Resolve the active finite-state machine.
-Use CURRENT-FSM or buffer-local active FSM."
-  (or (and current-fsm
-           (not (macher-agent-transit-payload-p current-fsm))
-           (not (macher-agent-context-p current-fsm))
-           (not (bufferp current-fsm))
-           (not (stringp current-fsm))
-           current-fsm)
-      (bound-and-true-p macher-agent--active-fsm)
-      (bound-and-true-p gptel--fsm)))
-
-(defun macher-agent--extract-fsm-info (fsm)
-  "Extract gptel info plist safely enforcing standard keys."
-  (cond
-   ((null fsm) nil)
-   ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm))
-    (gptel-fsm-info fsm))
-   ((and (recordp fsm) (fboundp 'gptel-fsm-info))
-    (ignore-errors (gptel-fsm-info fsm)))
-   ((macher-agent--plist-p fsm)
-    (let ((ctx (plist-get fsm :macher-agent-context))
-          (buf (plist-get fsm :buffer)))
-      (when (or ctx buf)
-        (list :macher-agent-context ctx :buffer buf))))
-   (t nil)))
-
-(defun macher-agent--set-fsm-info (fsm info)
-  "Safely update the info property list of finite-state machine FSM to INFO.
-
-FSM is the finite-state machine instance or structure.
-INFO is the new info property list value.
-
-Return INFO when FSM is non-nil, or nil when FSM is nil.
-Side effects: Modifies the info slot of FSM."
-  (when fsm
-    (cond
-     ((fboundp 'set-gptel-fsm-info)
-      (set-gptel-fsm-info fsm info))
-     ((or (recordp fsm) (vectorp fsm))
-      (when (> (length fsm) 4)
-        (aset fsm 4 info)))
-     ((fboundp '\(setf\ gptel-fsm-info\))
-      (\(setf\ gptel-fsm-info\) info fsm))
-     (t nil))
-    info))
-
-(defun macher-agent--set-fsm-handlers (fsm handlers)
-  "Safely update the handlers alist of finite-state machine FSM to HANDLERS.
-
-FSM is the finite-state machine instance or structure.
-HANDLERS is the new handlers alist.
-
-Return HANDLERS when FSM is non-nil, or nil when FSM is nil.
-Side effects: Modifies the handlers slot of FSM."
-  (when fsm
-    (cond
-     ((fboundp 'set-gptel-fsm-handlers)
-      (set-gptel-fsm-handlers fsm handlers))
-     ((or (recordp fsm) (vectorp fsm))
-      (when (> (length fsm) 3)
-        (aset fsm 3 handlers)))
-     ((fboundp '\(setf\ gptel-fsm-handlers\))
-      (\(setf\ gptel-fsm-handlers\) handlers fsm))
-     (t nil))
-    handlers))
-
 (defun macher-agent-valid-context-p (context)
   "Determine whether CONTEXT is a valid persistent context structure.
 
@@ -531,18 +447,6 @@ Return non-nil if CONTEXT is a `macher-agent-context', or nil otherwise.
 Side effects: None."
   (macher-agent-context-p context))
 
-(defun macher-agent-context-prompt (ctx)
-  "Retrieve prompt from context CTX.
-
-CTX is the `macher-agent-context' structure.
-
-Return prompt string, or nil.
-Side effects: None."
-  (when (macher-agent-context-p ctx)
-    (let ((plugins (macher-agent-context-plugins ctx)))
-      (when (macher-agent--plist-p plugins)
-        (plist-get plugins :prompt)))))
-
 (defun set-macher-agent-context-prompt (ctx val)
   "Set prompt on context CTX to VAL.
 
@@ -550,14 +454,10 @@ CTX is the `macher-agent-context' structure.
 VAL is the prompt string.
 
 Return VAL on success, or nil.
-Side effects: Updates `:prompt' in `macher-agent-context-plugins'."
+Side effects: Sets the prompt slot on CTX."
   (when (macher-agent-context-p ctx)
-    (let* ((plugins (macher-agent-context-plugins ctx))
-           (updated (plist-put (copy-sequence plugins) :prompt val)))
-      (setf (macher-agent-context-plugins ctx) updated)))
+    (setf (macher-agent-context-prompt ctx) val))
   val)
-
-(gv-define-simple-setter macher-agent-context-prompt set-macher-agent-context-prompt)
 
 (defun macher-agent-context-workspace (ctx)
   "Retrieve the tagged workspace structure from context CTX.
@@ -593,36 +493,6 @@ Side effects: None."
            (s-ws (when (macher-agent--plist-p shared) (plist-get shared :workspace))))
       (or ws-id ws t-ws proj s-ws-id s-ws)))
    (t nil)))
-
-(defun macher-agent--extract-fsm-context (fsm)
-  "Extract active context from FSM enforcing strict keys."
-  (cond
-   ((null fsm) nil)
-   ((macher-agent-valid-context-p fsm) fsm)
-   (t (let* ((info (macher-agent--extract-fsm-info fsm)))
-        (when (macher-agent--plist-p info)
-          (or (plist-get info :macher-agent-context)
-              (plist-get info :context)
-              (condition-case nil
-                  (macher-agent-resolve-from-transit-payload info)
-                (error nil))))))))
-
-(defun macher-agent--transform-inject-context (async-fn fsm)
-  "Inject the originating buffer context into the FSM info list.
-This function executes in the detached *gptel-prompt* buffer. It retrieves
-the context from the originating buffer stored in the FSM."
-  (let* ((info (if (and (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm))
-                   (gptel-fsm-info fsm)
-                 (when (fboundp 'gptel-fsm-info) (gptel-fsm-info fsm))))
-         (target-buf (when (macher-agent--plist-p info) (plist-get info :buffer))))
-    (when (and target-buf (buffer-live-p target-buf))
-      (with-current-buffer target-buf
-        (setq macher-agent--active-fsm fsm))
-      (let ((ctx (buffer-local-value 'macher-agent--persistent-context target-buf)))
-        (when (and ctx (macher-agent-valid-context-p ctx))
-          (when (fboundp 'macher-agent--inject-context-into-fsm-info)
-            (funcall 'macher-agent--inject-context-into-fsm-info ctx fsm))))))
-  (funcall async-fn))
 
 (defvar macher-agent-task-flush-hook nil
   "Hook run when an agent task flushes or completes its execution cycle.
@@ -755,22 +625,43 @@ Return the constructed and validated `macher-agent-transit-payload' struct."
    :payload (or payload message)
    :metadata metadata))
 
-(defun macher-agent-resolve-from-transit-payload (payload-or-state)
-  "Extract context from PAYLOAD-OR-STATE using transit keys.
-Reject invalid payloads with an error signal rather than falling
-back to nil silently."
-  (cond
-   ((macher-agent-valid-context-p payload-or-state)
-    payload-or-state)
+(defun macher-agent-context-from-buffer (buffer)
+  "Extract the persistent `macher-agent-context' from BUFFER.
 
-   ((macher-agent-transit-payload-p payload-or-state)
-    (or (let ((c (macher-agent-transit-payload-target-context payload-or-state)))
+BUFFER is the buffer object or buffer name string to inspect.
+
+Return the `macher-agent-context' structure stored in BUFFER's
+`macher-agent--persistent-context', or nil if BUFFER is invalid,
+not live, or context is unset.
+
+Side effects: None."
+  (let ((buf (if (bufferp buffer) buffer (and (stringp buffer) (get-buffer buffer)))))
+    (when (and buf (buffer-live-p buf))
+      (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
+        (when (macher-agent-valid-context-p ctx)
+          ctx)))))
+
+(defun macher-agent-context-from-payload (payload)
+  "Extract the active `macher-agent-context' from PAYLOAD.
+
+PAYLOAD is a `macher-agent-transit-payload' structure or a `macher-agent-context' structure.
+
+Return the resolved `macher-agent-context' structure.
+Signals an error if PAYLOAD is invalid or no context can be resolved.
+
+Side effects: None."
+  (cond
+   ((macher-agent-valid-context-p payload)
+    payload)
+
+   ((macher-agent-transit-payload-p payload)
+    (or (let ((c (macher-agent-transit-payload-target-context payload)))
           (when (macher-agent-valid-context-p c) c))
-        (let ((c (macher-agent-transit-payload-parent-context payload-or-state)))
+        (let ((c (macher-agent-transit-payload-parent-context payload)))
           (when (macher-agent-valid-context-p c) c))
-        (let ((c (macher-agent-transit-payload-child-context payload-or-state)))
+        (let ((c (macher-agent-transit-payload-child-context payload)))
           (when (macher-agent-valid-context-p c) c))
-        (let ((shared (macher-agent-transit-payload-shared-state payload-or-state)))
+        (let ((shared (macher-agent-transit-payload-shared-state payload)))
           (when (macher-agent--plist-p shared)
             (or (let ((c (plist-get shared :target-context)))
                   (when (macher-agent-valid-context-p c) c))
@@ -780,13 +671,21 @@ back to nil silently."
                   (when (macher-agent-valid-context-p c) c))
                 (let ((c (plist-get shared :context)))
                   (when (macher-agent-valid-context-p c) c)))))
-        (let* ((b-raw (macher-agent-transit-payload-target-buffer payload-or-state))
+        (let* ((b-raw (macher-agent-transit-payload-target-buffer payload))
                (buf (when b-raw (if (bufferp b-raw) b-raw (and (stringp b-raw) (get-buffer b-raw))))))
           (when (and buf (buffer-live-p buf))
             (let ((bctx (buffer-local-value 'macher-agent--persistent-context buf)))
               (when (macher-agent-valid-context-p bctx) bctx))))
-        (error "Cannot resolve context from transit payload: %S" payload-or-state)))
+        (error "Cannot resolve context from transit payload: %S" payload)))
 
+   (t
+    (error "Invalid transit payload: expected context or transit payload struct, got %S" payload))))
+
+(defun macher-agent-resolve-from-transit-payload (payload-or-state)
+  "Extract context from PAYLOAD-OR-STATE using transit keys.
+Reject invalid payloads with an error signal rather than falling
+back to nil silently."
+  (cond
    ((and (macher-agent--plist-p payload-or-state)
          (plist-member payload-or-state :resolved)
          (plist-member payload-or-state :input))
@@ -795,55 +694,13 @@ back to nil silently."
       (let* ((input (plist-get payload-or-state :input))
              (ctx (when input
                     (condition-case nil
-                        (macher-agent-resolve-from-transit-payload input)
+                        (macher-agent-context-from-payload input)
                       (error nil)))))
         (if (and ctx (macher-agent-valid-context-p ctx))
             (plist-put payload-or-state :resolved ctx)
           payload-or-state))))
-
    (t
-    (error "Invalid transit payload: expected context or transit payload struct, got %S" payload-or-state))))
-
-(defun macher-agent-resolve-context (&optional input)
-  "Resolve the active `macher-agent-context'.
-
-If INPUT is a valid `macher-agent-context' structure, return it directly.
-If INPUT is a live buffer, read `macher-agent--persistent-context' from it.
-If INPUT is a `macher-agent-transit-payload', resolve context from its slots.
-If INPUT or the active execution environment has an active FSM via
-`macher-agent-get-active-fsm', extract the context from the FSM payload.
-If `macher-agent--persistent-context' is non-nil in the current buffer,
-return it.
-Otherwise return nil.
-
-Side effects: None."
-  (cond
-   ((macher-agent-valid-context-p input)
-    input)
-   ((and (bufferp input) (buffer-live-p input))
-    (let ((ctx (buffer-local-value 'macher-agent--persistent-context input)))
-      (when (macher-agent-valid-context-p ctx)
-        ctx)))
-   ((macher-agent-transit-payload-p input)
-    (or (let ((c (macher-agent-transit-payload-target-context input)))
-          (when (macher-agent-valid-context-p c) c))
-        (let ((c (macher-agent-transit-payload-parent-context input)))
-          (when (macher-agent-valid-context-p c) c))
-        (let ((c (macher-agent-transit-payload-child-context input)))
-          (when (macher-agent-valid-context-p c) c))
-        (when-let* ((b (macher-agent-transit-payload-target-buffer input))
-                    (buf (if (bufferp b) b (and (stringp b) (get-buffer b)))))
-          (when (and buf (buffer-live-p buf))
-            (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
-              (when (macher-agent-valid-context-p ctx) ctx))))))
-   ((when-let* ((fsm (macher-agent-get-active-fsm input))
-                (ctx (macher-agent--extract-fsm-context fsm)))
-      (when (macher-agent-valid-context-p ctx)
-        ctx)))
-   ((when-let* ((ctx (bound-and-true-p macher-agent--persistent-context)))
-      (when (macher-agent-valid-context-p ctx)
-        ctx)))
-   (t nil)))
+    (macher-agent-context-from-payload payload-or-state))))
 
 (defun macher-agent-root (&optional path)
   "Resolve absolute project root path from PATH.

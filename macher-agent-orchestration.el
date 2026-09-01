@@ -16,6 +16,9 @@
 (require 'macher-agent-tools)
 (require 'macher-agent-presets)
 
+(defvar gptel--known-presets)
+(defvar gptel-directives)
+
 (defvar macher-agent-active-subagents nil
   "Store active sub-agents and their locked directories as an alist.
 
@@ -87,16 +90,11 @@ Return nil.
 
 Side effects: Spawns or signals sub-agent buffers and updates registries."
   (let* ((total (length send-message-payloads))
-         (actual-parent-fsm (macher-agent-get-active-fsm))
-         (actual-parent-buf (or (when actual-parent-fsm
-                                  (ignore-errors (plist-get (gptel-fsm-info actual-parent-fsm) :buffer)))
-                                (current-buffer)))
+         (actual-parent-buf (current-buffer))
          (parent-ctx (or (when (macher-agent-context-p parent-ctx-override) parent-ctx-override)
                          (when (and actual-parent-buf (buffer-live-p actual-parent-buf))
                            (let ((bctx (buffer-local-value 'macher-agent--persistent-context actual-parent-buf)))
-                             (when (macher-agent-context-p bctx) bctx)))
-                         (when actual-parent-fsm
-                           (macher-agent-gptel--fsm-context actual-parent-fsm actual-parent-buf))))
+                             (when (macher-agent-context-p bctx) bctx)))))
          (normalized-payloads
           (mapcar (lambda (msg)
                     (let* ((msg-type (macher-agent-transit-payload-type msg))
@@ -154,11 +152,10 @@ Side effects: Spawns or signals sub-agent buffers and updates registries."
                              :total total
                              :final-callback final-callback
                              :parent-buffer actual-parent-buf
-                             :parent-fsm actual-parent-fsm
                              :parent-context parent-ctx
                              :original-payloads normalized-payloads)))
     (if (= total 0)
-        (when final-callback (funcall final-callback nil))
+        (when final-callback (funcall final-callback []))
       (dolist (msg normalized-payloads)
         (if (eq (macher-agent-transit-payload-type msg) 'ARTIFACT_UPDATE)
             (let* ((tid (macher-agent-transit-payload-task-id msg))
@@ -406,7 +403,7 @@ Side effects: Mutates the text contents of the target buffer."
             (insert (or instructions "") "\n\n"))))
       state)))
 
-(defun macher-agent--aggregate-a2a-results (task-id msg-body results total original-payloads final-callback parent-buf parent-fsm)
+(defun macher-agent--aggregate-a2a-results (task-id msg-body results total original-payloads final-callback parent-buf)
   "Aggregate A2A results and trigger final callback when complete.
 
 TASK-ID is the completed task identifier string.
@@ -416,7 +413,6 @@ TOTAL is the integer count of expected sub-agent tasks.
 ORIGINAL-PAYLOADS is the list of initial dispatch payloads.
 FINAL-CALLBACK is the function invoked with the aggregated results vector.
 PARENT-BUF is the orchestrator parent buffer object.
-PARENT-FSM is the active orchestrator state machine instance.
 
 Return nil.
 
@@ -435,8 +431,7 @@ Side effects: Updates RESULTS hash table."
       (if (and parent-buf (buffer-live-p parent-buf))
           (with-current-buffer parent-buf
             (when final-callback
-              (let ((macher-agent--active-fsm parent-fsm))
-                (funcall final-callback (vconcat ordered-results)))))
+              (funcall final-callback (vconcat ordered-results))))
         (when final-callback
           (funcall final-callback (vconcat ordered-results)))))))
 
@@ -483,7 +478,6 @@ routing stack of the child buffer."
          (parent-name (or (plist-get state :originator-name)
                           (when (and parent-buf (buffer-live-p parent-buf))
                             (buffer-name parent-buf))))
-         (parent-fsm (plist-get shared :parent-fsm))
          (total (or (plist-get shared :total) 1))
          (final-callback (plist-get shared :final-callback))
          (original-payloads (plist-get shared :original-payloads))
@@ -495,7 +489,7 @@ routing stack of the child buffer."
       (setq state (plist-put state :a2a-msg msg)))
 
     (if err-payload
-        (macher-agent--aggregate-a2a-results task-id err-payload results total original-payloads final-callback parent-buf parent-fsm)
+        (macher-agent--aggregate-a2a-results task-id err-payload results total original-payloads final-callback parent-buf)
       (let ((child-buf (plist-get state :child-buf)))
         (when (and child-buf (buffer-live-p child-buf))
           (with-current-buffer child-buf
@@ -518,9 +512,7 @@ routing stack of the child buffer."
 
                             (when (and parent-buf (buffer-live-p parent-buf))
                               (with-current-buffer parent-buf
-                                (let ((parent-ctx (or (bound-and-true-p macher-agent--persistent-context)
-                                                      (when parent-fsm
-                                                        (macher-agent-gptel--fsm-context parent-fsm parent-buf)))))
+                                (let ((parent-ctx (bound-and-true-p macher-agent--persistent-context)))
                                   (when parent-ctx
                                     (setq-local macher-agent--persistent-context parent-ctx)
                                     (if p
@@ -534,12 +526,9 @@ routing stack of the child buffer."
                                                             (macher-agent-transit-payload-target-context artifact-payload)
                                                           (when (macher-agent--plist-p artifact-payload)
                                                             (plist-get artifact-payload :target-context)))))
-                                  (setq-local macher-agent--persistent-context merged-ctx)
-                                  (when parent-fsm
-                                    (when (fboundp 'macher-agent--inject-context-into-fsm-info)
-                                      (macher-agent--inject-context-into-fsm-info merged-ctx parent-fsm))))))
+                                  (setq-local macher-agent--persistent-context merged-ctx))))
 
-                            (macher-agent--aggregate-a2a-results actual-task-id msg-body results total original-payloads final-callback parent-buf parent-fsm))))))
+                            (macher-agent--aggregate-a2a-results actual-task-id msg-body results total original-payloads final-callback parent-buf))))))
                 (puthash task-id a2a-cb macher-agent--pending-callbacks)
                 (macher-agent--push-routing task-id parent-name suppress-patch)
                 (setq state (plist-put state :a2a-cb a2a-cb))))))))
@@ -1189,12 +1178,10 @@ Resolve context, clone it, and determine target directory in STATE."
   (let* ((parent (plist-get state :parent-buffer))
          (dir (plist-get state :dir))
          (ctx (plist-get state :context))
-         (resolved-ctx (or (when (macher-agent-context-p ctx) ctx)
-                           (when-let* ((is-live (buffer-live-p parent)))
-                             (let ((pctx (buffer-local-value 'macher-agent--persistent-context parent)))
-                               (when (macher-agent-context-p pctx) pctx)))
-                           (when (and dir (fboundp 'macher-agent-resolve-context))
-                             (ignore-errors (macher-agent-resolve-context dir)))))
+         (resolved-ctx (or (when (or (macher-agent-context-p ctx) (macher-agent-valid-context-p ctx)) ctx)
+                           (when parent (macher-agent-context-from-buffer parent))
+                           (when (and dir (boundp 'macher-agent-active-workspaces) (hash-table-p macher-agent-active-workspaces))
+                             (gethash (expand-file-name dir) macher-agent-active-workspaces))))
          (cloned-ctx (when-let* ((r-ctx resolved-ctx))
                        (if (fboundp 'macher-agent--clone-context)
                            (macher-agent--clone-context r-ctx)
@@ -1241,12 +1228,8 @@ Resolve context, clone it, and determine target directory in STATE."
         (setq-local
          macher-agent--boot-directive
          (with-current-buffer parent (bound-and-true-p macher-agent--boot-directive)))
-        (if (boundp 'gptel--known-presets)
-            (setq gptel--known-presets (buffer-local-value 'gptel--known-presets parent))
-          (setq-local gptel--known-presets (buffer-local-value 'gptel--known-presets parent)))
-        (if (boundp 'gptel-directives)
-            (setq gptel-directives (buffer-local-value 'gptel-directives parent))
-          (setq-local gptel-directives (buffer-local-value 'gptel-directives parent))))
+        (setq-local gptel--known-presets (buffer-local-value 'gptel--known-presets parent))
+        (setq-local gptel-directives (buffer-local-value 'gptel-directives parent)))
 
       (when-let* ((c-ctx cloned-ctx))
         (setq-local macher-agent--persistent-context c-ctx))

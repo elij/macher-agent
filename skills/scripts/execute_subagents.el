@@ -43,18 +43,20 @@ non-blocking manner using A2A payloads.  You must supply at least one preset."
                               :background t
                               :suppress-patch t))))))
 
-      (dolist (a2a-payload a2a-payloads)
-        (macher-agent-a2a-dispatch
-         (list a2a-payload)
-         (lambda (a2a-results)
-           (let* ((res (aref (if (vectorp a2a-results) a2a-results (vconcat a2a-results)) 0))
-                  (meta (macher-agent-transit-payload-metadata a2a-payload))
-                  (buf-name (plist-get meta :buffer_name))
-                  (is-error (eq (plist-get res :status) 'error)))
-             (if is-error
-                 (message "Background subagent %s task failed: %s" buf-name (plist-get res :error))
-               (message "Background subagent %s task execution completed successfully." buf-name))))
-         context))
+      (let ((current-fsm (macher-agent-get-active-fsm)))
+        (dolist (a2a-payload a2a-payloads)
+          (macher-agent-a2a-dispatch
+           (list a2a-payload)
+           (let ((saved-fsm current-fsm))
+             (lambda (a2a-results)
+               (let* ((res (aref (if (vectorp a2a-results) a2a-results (vconcat a2a-results)) 0))
+                      (meta (macher-agent-transit-payload-metadata a2a-payload))
+                      (buf-name (plist-get meta :buffer_name))
+                      (is-error (eq (plist-get res :status) 'error)))
+                 (if is-error
+                     (message "Background subagent %s task failed: %s" buf-name (plist-get res :error))
+                   (message "Background subagent %s task execution completed successfully." buf-name)))))
+           context)))
       
       (mapcar (lambda (p)
                 (let ((meta (macher-agent-transit-payload-metadata p)))
