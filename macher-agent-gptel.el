@@ -21,6 +21,22 @@
 (defvar macher-agent-token-multiplier 4
   "Estimated characters per token used for context truncation.")
 
+(defvar-local macher-agent--active-fsm nil
+  "Store active finite-state machine (FSM) instance for current buffer.
+
+Return active FSM struct or nil.
+Side effects: Buffer-local variable.")
+
+(defvar-local macher-agent-fsm-id nil
+  "Buffer-local identifier bridging user interface buffers to the state machine.
+
+Stores the unique state machine identifier associated with the current
+user interface buffer session.
+
+Return the state machine identifier string or symbol, or nil if unassigned.
+
+Side effects: Buffer-local variable.")
+
 (defvar-local macher-agent--is-restored-session nil
   "Track whether current buffer is restored from a saved state.
 
@@ -133,9 +149,13 @@ Side effects: None."
              collect (cons state
                            (cond
                             ((eq state 'WAIT)
-                             (cons #'macher-agent--inject-media-fsm-logic funcs))
+                             (if (memq #'macher-agent--inject-media-fsm-logic funcs)
+                                 funcs
+                               (cons #'macher-agent--inject-media-fsm-logic funcs)))
                             ((memq state '(DONE ERRS ABRT))
-                             (append funcs (list #'macher-agent-gptel--trigger-flush)))
+                             (if (memq #'macher-agent-gptel--trigger-flush funcs)
+                                 funcs
+                               (append funcs (list #'macher-agent-gptel--trigger-flush))))
                             (t funcs))))))
       (macher-agent--set-fsm-handlers fsm augmented-handlers)
       (setf (gptel-fsm-handlers fsm) augmented-handlers)))
@@ -492,7 +512,7 @@ and transforms prompt."
                  (ignore-errors (gptel-fsm-info fsm-obj))))
          (orig-buf (or (and info (plist-get info :buffer)) temp-buf))
          (context (or (when active-fsm
-                        (macher-agent-gptel--fsm-context active-fsm orig-buf))
+                        (macher-agent-gptel-context-from-fsm active-fsm orig-buf))
                       (when (and orig-buf (buffer-live-p orig-buf))
                         (buffer-local-value 'macher-agent--persistent-context orig-buf)))))
 
@@ -531,15 +551,18 @@ and transforms prompt."
                  inline-preset-used prompt-start inline-skills))
 
                (state (macher-agent--compile-transmission-payload
-                       orig-buf buffer-presets transmission-skills redirected-skill context)))
+                       orig-buf buffer-presets transmission-skills redirected-skill context))
+               (payload (list :model (macher-agent-transmission-state-model state)
+                              :backend (with-current-buffer orig-buf (bound-and-true-p gptel-backend))
+                              :temperature (macher-agent-transmission-state-temperature state)
+                              :max-tokens (macher-agent-transmission-state-max-tokens state)
+                              :tools (macher-agent-transmission-state-tools state)
+                              :ptc-primitives (macher-agent-transmission-state-ptc-primitives state))))
 
-          (macher-agent--apply-payload-locally
-           (list :model (macher-agent-transmission-state-model state)
-                 :backend (with-current-buffer orig-buf (bound-and-true-p gptel-backend))
-                 :temperature (macher-agent-transmission-state-temperature state)
-                 :max-tokens (macher-agent-transmission-state-max-tokens state)
-                 :tools (macher-agent-transmission-state-tools state)
-                 :ptc-primitives (macher-agent-transmission-state-ptc-primitives state)))
+          (with-current-buffer orig-buf
+            (macher-agent--apply-payload-locally payload))
+
+          (macher-agent--apply-payload-locally payload)
 
           (when-let* ((compiled (macher-agent-transmission-state-compiled-prompt state)))
             (setq-local gptel-system-prompt compiled))
@@ -745,10 +768,15 @@ Side effects: Modifies `gptel-system-prompt', adds response hook, and
 calls `gptel-send'."
   (let* ((target-buffer (macher-agent-task-context-target-buffer task-context))
          (sys-msg (macher-agent-task-context-system-message task-context))
+         (ctx (when (and target-buffer (buffer-live-p target-buffer))
+                (buffer-local-value 'macher-agent--persistent-context target-buffer)))
          (success-cb (or (plist-get callbacks :on-success)
                          (plist-get callbacks :success-cb)))
          (error-cb (or (plist-get callbacks :on-error)
                        (plist-get callbacks :error-cb))))
+    (when (and ctx (macher-agent-valid-context-p ctx) sys-msg)
+      (unless (macher-agent-context-prompt ctx)
+        (setf (macher-agent-context-prompt ctx) sys-msg)))
     (with-current-buffer target-buffer
       (when sys-msg
         (setq-local gptel-system-prompt sys-msg))
@@ -767,14 +795,18 @@ Prevent recursive media injection loops during state transitions.")
 (defun macher-agent-gptel--fsm-target-buffer (fsm)
   "Extract target buffer from FSM safely."
   (when fsm
-    (let* ((info (ignore-errors (gptel-fsm-info fsm))))
+    (let* ((info (ignore-errors (macher-agent--extract-fsm-info fsm))))
       (when (macher-agent--plist-p info)
-        (plist-get info :buffer)))))
+        (or (plist-get info :origin-buffer)
+            (plist-get info :buffer))))))
 
-(defun macher-agent-gptel--fsm-context (&optional fsm target-buf)
-  "Extract context from FSM or fallback buffer.
-During active execution, resolve directly from FSM info plist :macher-agent-context.
-When idle or in resting state, resolve from `macher-agent--persistent-context'."
+(defun macher-agent-gptel-context-from-fsm (fsm &optional target-buf)
+  "Extract `macher-agent-context' strictly from FSM structures or fallback to buffer persistence.
+
+FSM is the finite-state machine instance or context structure.
+TARGET-BUF is an optional buffer used as a fallback.
+
+Return the resolved `macher-agent-context' struct, or nil."
   (cond
    ((null fsm)
     (let ((buf (or target-buf (current-buffer))))
@@ -793,6 +825,43 @@ When idle or in resting state, resolve from `macher-agent--persistent-context'."
        ((and buf (buffer-live-p buf))
         (let ((bctx (buffer-local-value 'macher-agent--persistent-context buf)))
           (when (macher-agent-valid-context-p bctx) bctx))))))))
+
+(defun macher-agent-gptel-spoof-tool-ui (target-buf tool-name)
+  "Manipulate mode line display for PTC tool call TOOL-NAME in TARGET-BUF within the gptel layer.
+
+TARGET-BUF is the target buffer for tool execution.
+TOOL-NAME is the symbol or string name of the executed tool.
+
+Return non-nil on success.
+Side effects: Updates gptel mode line status in TARGET-BUF."
+  (let* ((buf (cond ((bufferp target-buf) target-buf)
+                    ((stringp target-buf) (get-buffer target-buf))
+                    (t (current-buffer))))
+         (name-str (replace-regexp-in-string "_" "-" (if (symbolp tool-name) (symbol-name tool-name) (format "%s" tool-name)))))
+    (when (and buf (buffer-live-p buf))
+      (with-current-buffer buf
+        (let ((fsm (or (macher-agent-get-active-fsm)
+                       (bound-and-true-p macher-agent--active-fsm)
+                       (bound-and-true-p gptel--fsm-last))))
+          (if (and fsm (fboundp 'gptel-fsm-info) (fboundp 'gptel--update-tool-call))
+              (let* ((info (gptel-fsm-info fsm))
+                     (mock-info (copy-sequence info))
+                     (spoofed-calls (list (list :name (format "PTC: %s" name-str)))))
+                (setq mock-info (plist-put mock-info :tool-use spoofed-calls))
+                (setq mock-info (plist-put mock-info :buffer buf))
+
+                (unwind-protect
+                    (progn
+                      (macher-agent--set-fsm-info fsm mock-info)
+                      (gptel--update-tool-call fsm))
+                  (macher-agent--set-fsm-info fsm info)))
+            (when (fboundp 'gptel--update-status)
+              (gptel--update-status
+               (concat
+                (propertize " Calling tool (" 'face 'mode-line-emphasis)
+                (propertize (format "PTC: %s" name-str) 'face 'font-lock-keyword-face)
+                (propertize ")" 'face 'mode-line-emphasis))))))
+        t))))
 
 (defun macher-agent--perform-pending-media-injection (fsm)
   "Inject base64 media directly into FSM payload enforcing a strict string contract."
@@ -901,13 +970,34 @@ Return a block list if TOOL is out of scope, otherwise nil.
 Side effects: None."
   (let* ((canonical-name (macher-agent-canonical-tool-name tool))
          (fsm-obj (macher-agent-get-active-fsm fsm))
-         (info (when fsm-obj (gptel-fsm-info fsm-obj)))
-         (fsm-tools (when info (plist-get info :tools)))
+         (info (when fsm-obj (ignore-errors (gptel-fsm-info fsm-obj))))
+         (fsm-tools (or (when info (plist-get info :tools))
+                        (bound-and-true-p gptel-tools)))
          (authorised-names (mapcar #'macher-agent-canonical-tool-name fsm-tools)))
     (unless (and canonical-name (member canonical-name authorised-names))
       (list
        :block (format "ERROR: Tool '%s' is not accessible in this context or is no longer available. Please select another tool or approach."
                       (or canonical-name tool))))))
+
+(defun macher-agent--log-gptel-pre-tool (tool &optional fsm &rest args)
+  "Log GPTEL pre-tool call intent to context audit log.
+
+TOOL is the tool structure or property list.
+FSM is the optional state machine object.
+ARGS represents additional arguments passed to the tool call.
+
+Return nil.
+
+Side effects: Appends tool call entry to active context audit log."
+  (let ((context (or (when fsm (macher-agent-gptel-context-from-fsm fsm))
+                     (macher-agent-gptel-context-from-fsm (macher-agent-get-active-fsm))
+                     (bound-and-true-p macher-agent--persistent-context)))
+        (tool-name (macher-agent-canonical-tool-name tool))
+        (tool-args (if (and (macher-agent--plist-p tool) (plist-member tool :args))
+                       (plist-get tool :args)
+                     args)))
+    (when (and context (fboundp 'macher-agent-log-tool-intent))
+      (macher-agent-log-tool-intent context "gptel-tool" tool-name tool-args))))
 
 (defvar macher-agent--wrapped-tools-hash (make-hash-table :test 'eq)
   "Track wrapped `gptel-tool' instances in a hash table.
@@ -1004,7 +1094,7 @@ Side effects: Mutates function slot of TOOL and updates
                                          (ignore-errors (plist-get (gptel-fsm-info fsm) :buffer)))
                                        (current-buffer)))
                        (agent-ctx (or (when fsm
-                                        (macher-agent-gptel--fsm-context fsm target-buf))
+                                        (macher-agent-gptel-context-from-fsm fsm target-buf))
                                       (when (and target-buf (buffer-live-p target-buf))
                                         (buffer-local-value 'macher-agent--persistent-context target-buf)))))
 
@@ -1229,8 +1319,8 @@ Side effects: Creates new chat buffer and sets buffer-local agent variables."
         (setq-local macher-agent--active-skill-sym skill))
 
       (setq-local macher-agent-presets (with-current-buffer parent-buf macher-agent-presets))
-      (setq-local macher-agent--active-ptc-primitives
-                  (with-current-buffer parent-buf macher-agent--active-ptc-primitives))
+      (setq macher-agent--active-ptc-primitives
+            (with-current-buffer parent-buf macher-agent--active-ptc-primitives))
       (setq-local gptel-tools (with-current-buffer parent-buf gptel-tools))
 
       (switch-to-buffer (current-buffer)))))
@@ -1303,7 +1393,7 @@ Side effects: Mutates info property list of the active backend FSM if bound."
   (when (and fsm (fboundp 'gptel-fsm-state) (memq (gptel-fsm-state fsm) '(DONE ERRS ABRT)))
     (let* ((info (ignore-errors (gptel-fsm-info fsm)))
            (target-buf (when (macher-agent--plist-p info) (plist-get info :buffer)))
-           (agent-ctx (or (macher-agent-gptel--fsm-context fsm target-buf)
+           (agent-ctx (or (macher-agent-gptel-context-from-fsm fsm target-buf)
                           (when (and target-buf (buffer-live-p target-buf))
                             (buffer-local-value 'macher-agent--persistent-context target-buf)))))
       (when (and target-buf (buffer-live-p target-buf))
@@ -1312,6 +1402,91 @@ Side effects: Mutates info property list of the active backend FSM if bound."
           (setq-local macher-agent--pending-instructions-queue nil)))
       (when agent-ctx
         (macher-agent-run-task-flush-hook agent-ctx)))))
+
+(defun macher-agent-get-active-fsm (&optional current-fsm)
+  "Resolve the active finite-state machine.
+Use CURRENT-FSM or buffer-local active FSM."
+  (or (and current-fsm
+           (not (macher-agent-transit-payload-p current-fsm))
+           (not (macher-agent-context-p current-fsm))
+           (not (bufferp current-fsm))
+           (not (stringp current-fsm))
+           current-fsm)
+      (bound-and-true-p macher-agent--active-fsm)
+      (bound-and-true-p gptel--fsm)))
+
+(defun macher-agent--extract-fsm-info (fsm)
+  "Extract gptel info plist safely enforcing standard keys."
+  (cond
+   ((null fsm) nil)
+   ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm))
+    (gptel-fsm-info fsm))
+   ((and (recordp fsm) (fboundp 'gptel-fsm-info))
+    (ignore-errors (gptel-fsm-info fsm)))
+   ((macher-agent--plist-p fsm)
+    (let ((ctx (or (plist-get fsm :macher-agent-context) (plist-get fsm :context)))
+          (orig-buf (or (plist-get fsm :origin-buffer) (plist-get fsm :buffer)))
+          (buf (or (plist-get fsm :buffer) (plist-get fsm :origin-buffer))))
+      (when (or ctx orig-buf buf)
+        (list :macher-agent-context ctx :origin-buffer orig-buf :buffer buf))))
+   (t nil)))
+
+(defun macher-agent--set-fsm-info (fsm info)
+  "Safely update the info property list of finite-state machine FSM to INFO.
+
+FSM is the finite-state machine instance or structure.
+INFO is the new info property list value.
+
+Return INFO when FSM is non-nil, or nil when FSM is nil.
+Side effects: Modifies the info slot of FSM."
+  (when fsm
+    (cond
+     ((fboundp 'set-gptel-fsm-info)
+      (set-gptel-fsm-info fsm info))
+     ((or (recordp fsm) (vectorp fsm))
+      (when (> (length fsm) 4)
+        (aset fsm 4 info)))
+     ((fboundp '\(setf\ gptel-fsm-info\))
+      (\(setf\ gptel-fsm-info\) info fsm))
+     (t nil))
+    info))
+
+(defun macher-agent--set-fsm-handlers (fsm handlers)
+  "Safely update the handlers alist of finite-state machine FSM to HANDLERS.
+
+FSM is the finite-state machine instance or structure.
+HANDLERS is the new handlers alist.
+
+Return HANDLERS when FSM is non-nil, or nil when FSM is nil.
+Side effects: Modifies the handlers slot of FSM."
+  (when fsm
+    (cond
+     ((fboundp 'set-gptel-fsm-handlers)
+      (set-gptel-fsm-handlers fsm handlers))
+     ((or (recordp fsm) (vectorp fsm))
+      (when (> (length fsm) 3)
+        (aset fsm 3 handlers)))
+     ((fboundp '\(setf\ gptel-fsm-handlers\))
+      (\(setf\ gptel-fsm-handlers\) handlers fsm))
+     (t nil))
+    handlers))
+
+(defun macher-agent--transform-inject-context (async-fn fsm)
+  "Inject the originating buffer context into the FSM info list.
+This function executes in the detached *gptel-prompt* buffer. It retrieves
+the context from the originating buffer stored in the FSM."
+  (let* ((info (if (and (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm))
+                   (gptel-fsm-info fsm)
+                 (when (fboundp 'gptel-fsm-info) (gptel-fsm-info fsm))))
+         (target-buf (when (macher-agent--plist-p info) (plist-get info :buffer))))
+    (when (and target-buf (buffer-live-p target-buf))
+      (with-current-buffer target-buf
+        (setq macher-agent--active-fsm fsm))
+      (let ((ctx (buffer-local-value 'macher-agent--persistent-context target-buf)))
+        (when (and ctx (macher-agent-valid-context-p ctx))
+          (when (fboundp 'macher-agent--inject-context-into-fsm-info)
+            (funcall 'macher-agent--inject-context-into-fsm-info ctx fsm))))))
+  (funcall async-fn))
 
 (provide 'macher-agent-gptel)
 ;;; macher-agent-gptel.el ends here

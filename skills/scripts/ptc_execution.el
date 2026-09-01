@@ -15,8 +15,11 @@ and permitted tool primitives."))
   (lambda (payload context _root callback)
     (if-let*
         ((script (plist-get payload :script)))
-        (macher-agent-execute-ptc-script
-         script context
-         (lambda (res) (funcall callback res))
-         (lambda (err) (funcall callback err)))
+        (let ((target-buf (or (when (macher-agent-context-p context)
+                                (macher-agent-context-origin-buffer context))
+                              (current-buffer))))
+          (macher-agent-execute-ptc-script
+           script context target-buf
+           (lambda (res) (funcall callback res))
+           (lambda (err) (funcall callback err))))
       (error "No script provided for PTC execution"))))

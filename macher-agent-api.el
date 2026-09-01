@@ -155,7 +155,7 @@ TYPE is the invocation type string, such as gptel-tool or ptc.
 TARGET is the tool identifier name string or PTC primitive symbol.
 ARGS is the list of parameters passed to the tool.
 
-Return the updated audit log list.
+Return the updated audit log list, or nil if CONTEXT is invalid.
 
 Side effects: Mutates CONTEXT audit log property list."
   (when (and context (macher-agent-context-p context))
@@ -173,45 +173,24 @@ Side effects: Mutates CONTEXT audit log property list."
                     (preset . ,preset-str)
                     (type . ,type)
                     (target . ,target)
-                    (args . ,args))))
+                    (args . ,args)))
+           (updated-log (append log (list entry))))
       (setf (macher-agent-context-plugins context)
-            (plist-put (copy-sequence plugins) :audit-log (append log (list entry)))))))
-
-(defun macher-agent--log-gptel-pre-tool (tool &optional fsm &rest args)
-  "Log GPTEL pre-tool call intent to context audit log.
-
-TOOL is the tool structure or property list.
-FSM is the optional state machine object.
-ARGS represents additional arguments passed to the tool call.
-
-Return nil.
-
-Side effects: Appends tool call entry to active context audit log."
-  (let ((context (or (when fsm (or (macher-agent-gptel--fsm-context fsm)
-                                   (ignore-errors (macher-agent-resolve-context fsm))))
-                     (bound-and-true-p macher-agent--persistent-context)
-                     (ignore-errors (macher-agent-resolve-context (current-buffer)))
-                     (ignore-errors (macher-agent-resolve-context))))
-        (tool-name (macher-agent-canonical-tool-name tool))
-        (tool-args (if (and (macher-agent--plist-p tool) (plist-member tool :args))
-                       (plist-get tool :args)
-                     args)))
-    (when context
-      (macher-agent-log-tool-intent context "gptel-tool" tool-name tool-args))))
+            (plist-put (copy-sequence plugins) :audit-log updated-log))
+      updated-log)))
 
 (defun macher-agent-force-review (&optional context)
   "Trigger task flush hook for pending reviews.
 
 CONTEXT is the optional active context structure.  When nil, resolves
-the active context.
+the active context from `macher-agent--persistent-context'.
 
 Return nil.
 
 Side effects: Invokes task flush hooks."
   (interactive)
   (let ((ctx (or context
-                 (bound-and-true-p macher-agent--persistent-context)
-                 (ignore-errors (macher-agent-resolve-context)))))
+                 (bound-and-true-p macher-agent--persistent-context))))
     (macher-agent-run-task-flush-hook ctx)))
 
 
@@ -225,40 +204,53 @@ Side effects: Invokes task flush hooks."
   (declare (indent 1) (debug t))
   `(let ((root-buf (get-buffer-create ,buffer-name))
          (allowed-primitives ,primitives)
-         (active-presets ,presets))
+         (active-presets ,presets)
+         (caller-buf (current-buffer)))
      (with-current-buffer root-buf
        (unless (bound-and-true-p macher-agent--persistent-context)
-         (setq-local macher-agent--persistent-context
-                     (macher-agent--make-context :id "proxy-ctx" :project-root default-directory)))
-       (when (fboundp 'macher-agent-resolve-tools)
-         (macher-agent-resolve-tools macher-agent--persistent-context active-presets))
-       (let ((native-fsm (gptel-request nil :dry-run t))
-             (script-str (prin1-to-string ',(if (> (length script-body) 1)
+         (setq macher-agent--persistent-context
+               (or (macher-agent-context-from-buffer caller-buf)
+                   (macher-agent--make-context :id "proxy-ctx" :project-root default-directory))))
+
+       (if (fboundp 'markdown-mode)
+           (markdown-mode)
+         (text-mode))
+       (when (fboundp 'gptel-mode)
+         (gptel-mode 1))
+
+       (when (buffer-live-p caller-buf)
+         (setq-local gptel-model (buffer-local-value 'gptel-model caller-buf))
+         (setq-local gptel-backend (buffer-local-value 'gptel-backend caller-buf))
+         (setq-local gptel-temperature (buffer-local-value 'gptel-temperature caller-buf))
+         (setq-local gptel-max-tokens (buffer-local-value 'gptel-max-tokens caller-buf))
+         (setq-local gptel--known-presets (buffer-local-value 'gptel--known-presets caller-buf))
+         (setq-local gptel-directives (buffer-local-value 'gptel-directives caller-buf)))
+
+       (when (fboundp 'macher-agent-initialize-skills)
+         (macher-agent-initialize-skills macher-agent--persistent-context))
+       (when active-presets
+         (setq-local macher-agent-presets active-presets)
+         (macher-agent--apply-preset active-presets))
+
+       (setq macher-agent--active-ptc-primitives allowed-primitives)
+
+       (let ((script-str (prin1-to-string ',(if (> (length script-body) 1)
                                                 `(progn ,@script-body)
                                               (car script-body))))
              (success-cb (or ,on-success (lambda (res) (message "PTC Success: %s" res))))
              (error-cb (or ,on-error (lambda (err) (message "PTC Error: %s" err)))))
 
-         (cl-letf (((symbol-function 'macher-agent-get-active-fsm)
-                    (lambda (&rest _) native-fsm))
-                   ((symbol-function 'macher-agent--ptc-primitive-p)
-                    (lambda (sym &rest _)
-                      (or (memq sym allowed-primitives)
-                          (and (fboundp 'macher-agent-sandbox--primitives)
-                               (hash-table-p macher-agent-sandbox--primitives)
-                               (gethash sym macher-agent-sandbox--primitives))))))
-
-           (macher-agent-execute-ptc-script
-            script-str
-            macher-agent--persistent-context
-            (lambda (res)
-              (funcall success-cb res)
-              (when ,reap (kill-buffer root-buf)))
-            (lambda (err)
-              (funcall error-cb err)
-              (when ,reap (kill-buffer root-buf)))
-            nil
-            root-buf))))))
+         (macher-agent-execute-ptc-script
+          script-str
+          macher-agent--persistent-context
+          root-buf
+          (lambda (res)
+            (funcall success-cb res)
+            (when ,reap (kill-buffer root-buf)))
+          (lambda (err)
+            (funcall error-cb err)
+            (when ,reap (kill-buffer root-buf)))
+          nil)))))
 
 (provide 'macher-agent-api)
 ;;; macher-agent-api.el ends here

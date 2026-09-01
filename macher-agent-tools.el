@@ -131,7 +131,7 @@ Side effects: Signals error if missing required properties or invalid types."
     (when (and (consp reqs) (eq (car reqs) 'quote)) (setq reqs (cadr reqs)))
     (when (vectorp reqs) (setq reqs (append reqs nil)))
     (when props
-      (unless (and (listp props) (evenp (length props)))
+      (unless (and (listp props) (cl-evenp (length props)))
         (error "%s" (format
                      "Schema properties for '%s' must be a flat plist, got %S" name props)))
       (cl-loop
@@ -242,7 +242,7 @@ Side effects: None."
                       val)
               (setq result (plist-put result under-key val))
               (setq result (plist-put result hyphen-key val)))))
-        (when (and (listp raw-plist) (evenp (length raw-plist)))
+        (when (and (listp raw-plist) (cl-evenp (length raw-plist)))
           (cl-loop for (k v) on raw-plist by #'cddr
                    do (unless (plist-member result k)
                         (setq result (plist-put result k v)))))
@@ -388,29 +388,16 @@ Side effects: Sets `NAME-SYMBOL' variable to constructed gptel tool object."
                    ',name-symbol (macher-agent-tool-call-args tool-call) wrap-cb
                    (macher-agent--validate-payload (macher-agent-tool-call-args tool-call) ,args)
                    (let*
-                       ((fsm (macher-agent-get-active-fsm))
-                        (fsm-info (when fsm (macher-agent--extract-fsm-info fsm)))
-                        (origin-buf (when (macher-agent--plist-p fsm-info)
-                                      (or (plist-get fsm-info :origin-buffer)
-                                          (plist-get fsm-info :buffer))))
-                        (context
+                       ((context
                          (or incoming-ctx
-                             (when (macher-agent--plist-p fsm-info)
-                               (let ((f-ctx (plist-get fsm-info :macher-agent-context)))
-                                 (when (macher-agent-valid-context-p f-ctx)
-                                   f-ctx)))
-                             (when fsm
-                               (macher-agent-resolve-context fsm))
-                             (when (and origin-buf (buffer-live-p origin-buf))
-                               (let ((buf-ctx (buffer-local-value 'macher-agent--persistent-context origin-buf)))
-                                 (if (macher-agent-valid-context-p buf-ctx)
-                                     buf-ctx
-                                   (macher-agent-resolve-context origin-buf))))
+                             (macher-agent-gptel-context-from-fsm (macher-agent-get-active-fsm))
                              (when (bound-and-true-p macher-agent--persistent-context)
                                (when (macher-agent-valid-context-p macher-agent--persistent-context)
                                  macher-agent--persistent-context))
-                             (macher-agent-resolve-context (current-buffer))
-                             (macher-agent-resolve-context)))
+                             (when (buffer-live-p (current-buffer))
+                               (let ((buf-ctx (buffer-local-value 'macher-agent--persistent-context (current-buffer))))
+                                 (when (macher-agent-valid-context-p buf-ctx)
+                                   buf-ctx)))))
                         (root
                          (if context
                              (macher-agent-context-root context)

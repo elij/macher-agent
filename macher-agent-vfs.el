@@ -12,8 +12,6 @@
 (require 'macher-agent-core)
 (require 'macher-agent-macher)
 
-(declare-function gptel-fsm-info "gptel" (fsm))
-(declare-function gptel-fsm-p "gptel" (obj))
 (declare-function mailcap-file-name-to-mime-type "mailcap" (file-name))
 
 (defvar macher-agent--vfs-lock-table (make-hash-table :test 'equal)
@@ -927,8 +925,8 @@ Side effects: May update CTX dirty state and persist state if synced."
 (defmacro macher-agent-with-vfs-scope (context &rest body)
   "Execute BODY with Virtual File System awareness established from CONTEXT.
 
-CONTEXT is the context structure, state machine, buffer environment,
-or workspace to resolve.  When nil, attempts to resolve from the environment.
+CONTEXT is the context structure or buffer environment to resolve.
+When nil, attempts to resolve from the environment.
 BODY is the sequence of forms to evaluate within the established VFS scope.
 
 Fails fast by signaling an error if the context cannot be resolved.
@@ -944,9 +942,10 @@ Side effects: Binds `macher-agent--persistent-context' and adjusts `default-dire
             (,ctx-sym (cond
                        ((and ,raw-ctx-sym (macher-agent-valid-context-p ,raw-ctx-sym))
                         ,raw-ctx-sym)
-                       (,raw-ctx-sym
-                        (macher-agent-resolve-context ,raw-ctx-sym))
-                       (t (macher-agent-resolve-context)))))
+                       ((and (bound-and-true-p macher-agent--persistent-context)
+                             (macher-agent-valid-context-p macher-agent--persistent-context))
+                        macher-agent--persistent-context)
+                       (t nil))))
        (unless (and ,ctx-sym (macher-agent-valid-context-p ,ctx-sym))
          (error "macher-agent-with-vfs-scope: Unable to resolve a valid VFS context from %S" ,raw-ctx-sym))
        (let* ((macher-agent--persistent-context ,ctx-sym)
@@ -991,27 +990,20 @@ Side effects: None."
           (format "*macher-%s-patch[%s]*" category buf-name)
         (format "*macher-%s-patch*" category)))))
 
-(defun macher-agent--build-and-rename-patch (ctx fsm-obj patch-type)
-  "Build patch for CTX using FSM-OBJ, reusing and renaming buffers deterministically.
+(defun macher-agent--build-and-rename-patch (ctx patch-type &optional files)
+  "Build patch for CTX, reusing and renaming buffers deterministically.
 
-Construct a patch buffer for context CTX and finite-state machine FSM-OBJ if
-CTX contains changes and patch generation is not suppressed.  Renames the
-newly built patch buffer directly in place to the expressive patch buffer name
-so that the patch buffer remains live and retains its identity.
+Construct a patch buffer for context CTX if CTX contains changes and patch
+generation is not suppressed.  Renames the newly built patch buffer directly in
+place to the expressive patch buffer name so that the patch buffer remains live
+and retains its identity.
 
 Return the renamed patch buffer if generated, or nil.
 
 Side effects: Reuses, modifies, and renames patch buffers."
-  (let* ((target-buf (or (when (and fsm-obj (fboundp 'gptel-fsm-info) (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm-obj))
-                           (plist-get (gptel-fsm-info fsm-obj) :buffer))
-                         (when (and fsm-obj (macher-agent--plist-p fsm-obj))
-                           (plist-get fsm-obj :buffer))
-                         (when (macher-agent-valid-context-p ctx)
-                           (or (macher-agent-vfs--get-origin-buffer ctx)
-                               (macher-agent-context-origin-buffer ctx)))
-                         (when-let* ((active-fsm (macher-agent-get-active-fsm fsm-obj)))
-                           (when (and (fboundp 'gptel-fsm-info) (fboundp 'gptel-fsm-p) (gptel-fsm-p active-fsm))
-                             (plist-get (gptel-fsm-info active-fsm) :buffer)))))
+  (let* ((target-buf (when (macher-agent-valid-context-p ctx)
+                       (or (macher-agent-vfs--get-origin-buffer ctx)
+                           (macher-agent-context-origin-buffer ctx))))
          (suppress-patch (if (and (bufferp target-buf) (buffer-live-p target-buf))
                              (buffer-local-value 'macher-agent--suppress-patch target-buf)
                            (bound-and-true-p macher-agent--suppress-patch)))
@@ -1020,7 +1012,7 @@ Side effects: Reuses, modifies, and renames patch buffers."
     (when (and (not suppress-patch)
                (macher-agent--context-has-changes-p ctx))
       (let* ((expressive-name (macher-agent--expressive-patch-buffer-name patch-type ws target-buf))
-             (patch-buf (macher-agent-macher-build-patch ctx fsm-obj)))
+             (patch-buf (macher-agent-macher-build-patch ctx (or (macher-agent-context-prompt ctx) "") files)))
         (if (and patch-buf (buffer-live-p patch-buf))
             (if (equal (buffer-name patch-buf) expressive-name)
                 patch-buf
@@ -1095,17 +1087,14 @@ Return a cons cell of cloned contexts (FILE-CONTEXT . BUFFER-CONTEXT)."
     (when buf-ctx (macher-agent--set-context-contents buf-ctx buf-contents))
     (cons file-ctx buf-ctx)))
 
-(defun macher-agent--execute-split-patch (ctx fsm-obj)
-  "Execute the split patch generation for physical and virtual contexts."
+(defun macher-agent--execute-split-patch (ctx)
+  "Execute the split patch generation for physical and virtual contexts in CTX."
   (when (or (macher-agent--get-context-dirty-p ctx)
             (macher-agent--context-has-changes-p ctx))
     (let* ((payloads (macher-agent--split-context ctx))
            (p-ctx (car payloads))
            (v-ctx (cdr payloads))
-           (prompt (or (and (fboundp 'gptel-fsm-info) (fboundp 'gptel-fsm-p) fsm-obj (gptel-fsm-p fsm-obj) (plist-get (gptel-fsm-info fsm-obj) :prompt))
-                       (and (listp fsm-obj) (plist-get fsm-obj :prompt))
-                       (when (macher-agent-context-p ctx) (macher-agent-context-prompt ctx))
-                       ""))
+           (prompt (or (when (macher-agent-context-p ctx) (macher-agent-context-prompt ctx)) ""))
            (generated-buffers nil))
       (when prompt
         (when p-ctx
@@ -1118,42 +1107,41 @@ Return a cons cell of cloned contexts (FILE-CONTEXT . BUFFER-CONTEXT)."
             (setf (macher-agent-context-prompt v-ctx) prompt)
             (setf (macher-agent-context-plugins v-ctx)
                   (plist-put (copy-sequence (macher-agent-context-plugins v-ctx)) :prompt prompt)))))
-      (when-let* ((p-buf (macher-agent--build-and-rename-patch p-ctx fsm-obj "physical")))
+      (when-let* ((p-buf (macher-agent--build-and-rename-patch p-ctx "physical")))
         (push p-buf generated-buffers))
-      (when-let* ((v-buf (macher-agent--build-and-rename-patch v-ctx fsm-obj "virtual")))
+      (when-let* ((v-buf (macher-agent--build-and-rename-patch v-ctx "virtual")))
         (push v-buf generated-buffers))
       (when generated-buffers
         (macher-agent--display-patch-buffers generated-buffers)))
     (macher-agent--set-context-dirty-p ctx nil)))
 
 (defun macher-agent-vfs-build-patch-from-hook (ctx)
-  "Observe VFS flush events and build the visual macher interface."
+  "Observe VFS flush events and build the visual macher interface for CTX."
   (when (macher-agent-valid-context-p ctx)
-    (let* ((fsm-obj (macher-agent-get-active-fsm))
-           (prompt (or (and (fboundp 'gptel-fsm-info) (fboundp 'gptel-fsm-p) fsm-obj (gptel-fsm-p fsm-obj) (plist-get (gptel-fsm-info fsm-obj) :prompt))
-                       (and (listp fsm-obj) (plist-get fsm-obj :prompt))
-                       (when (macher-agent-context-p ctx) (macher-agent-context-prompt ctx))
-                       "")))
+    (let ((prompt (or (when (macher-agent-context-p ctx) (macher-agent-context-prompt ctx)) "")))
       (when prompt
         (when (macher-agent-context-p ctx)
           (setf (macher-agent-context-prompt ctx) prompt)
           (setf (macher-agent-context-plugins ctx)
                 (plist-put (copy-sequence (macher-agent-context-plugins ctx)) :prompt prompt))))
-      (macher-agent--execute-split-patch ctx fsm-obj))))
+      (macher-agent--execute-split-patch ctx))))
 
 (defun macher-agent-vfs-diff-review (&optional ctx)
   "Review pending diff patches for uncommitted VFS modifications in CTX.
 
-When CTX is nil, resolves context from the current environment or active buffer.
+When CTX is nil, resolves context from the active persistent context.
 Subscribes to or dispatches through `macher-agent-vfs-handle-flush'.
 
 Return nil.
 Side effects: Displays generated patch review buffers for pending edits."
   (interactive)
   (let ((context (or (when (macher-agent-valid-context-p ctx) ctx)
-                     (bound-and-true-p macher-agent--persistent-context)
-                     (ignore-errors (macher-agent-resolve-context (current-buffer)))
-                     (ignore-errors (macher-agent-resolve-context)))))
+                     (when (bound-and-true-p macher-agent--persistent-context)
+                       (and (macher-agent-valid-context-p macher-agent--persistent-context)
+                            macher-agent--persistent-context))
+                     (let ((buf-ctx (buffer-local-value 'macher-agent--persistent-context (current-buffer))))
+                       (when (macher-agent-valid-context-p buf-ctx)
+                         buf-ctx)))))
     (if (and context (macher-agent-valid-context-p context))
         (macher-agent-vfs-handle-flush context)
       (message "No active VFS context found."))))
@@ -1202,7 +1190,7 @@ Support polymorphic invocation:
 - (macher-agent-vfs--merge-payload payload)
 - (macher-agent-vfs--merge-payload target payload)
 
-TARGET can be `gptel-fsm', `macher-agent-context', or a buffer/FSM container.
+TARGET can be `macher-agent-context', a buffer, or a transit payload.
 PAYLOAD is the property list, struct, or list of diff entries containing merge artifacts.
 
 Exhaustively extracts target context from PAYLOAD keys (`macher-agent-transit-context-keys'),
@@ -1235,36 +1223,26 @@ Return updated PAYLOAD or context."
                 (cond
                  ((macher-agent-valid-context-p target)
                   target)
-                 ((and (fboundp 'gptel-fsm-p) (gptel-fsm-p target))
-                  (or (macher-agent-gptel--fsm-context target)
-                      (macher-agent--extract-fsm-context target)
-                      (let* ((info (macher-agent--extract-fsm-info target))
-                             (buf (when (macher-agent--plist-p info) (plist-get info :buffer))))
-                        (when buf (macher-agent-resolve-context buf)))))
-                 ((and (recordp target) (fboundp 'gptel-fsm-p) (gptel-fsm-p target))
-                  (or (macher-agent-gptel--fsm-context target)
-                      (macher-agent--extract-fsm-context target)))
-                 ((and (recordp target) (fboundp 'gptel-fsm-info))
-                  (or (macher-agent-gptel--fsm-context target)
-                      (macher-agent--extract-fsm-context target)))
                  ((or (bufferp target) (stringp target))
                   (let ((buf (if (bufferp target) target (get-buffer target))))
                     (when (and buf (buffer-live-p buf))
-                      (or (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
-                            (when (macher-agent-valid-context-p ctx) ctx))
-                          (macher-agent-resolve-context buf)))))
+                      (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
+                        (when (macher-agent-valid-context-p ctx) ctx)))))
                  ((macher-agent--plist-p target)
-                  (or (plist-get target :macher-agent-context)
-                      (plist-get target :target-context)
-                      (plist-get target :parent-context)
-                      (plist-get target :context)
+                  (or (let ((c (plist-get target :macher-agent-context)))
+                        (when (macher-agent-valid-context-p c) c))
+                      (let ((c (plist-get target :target-context)))
+                        (when (macher-agent-valid-context-p c) c))
+                      (let ((c (plist-get target :parent-context)))
+                        (when (macher-agent-valid-context-p c) c))
+                      (let ((c (plist-get target :context)))
+                        (when (macher-agent-valid-context-p c) c))
                       (macher-agent-storage--extract-context target)
                       (when-let* ((buf (or (plist-get target :buffer) (plist-get target :target-buffer))))
                         (let ((live-buf (if (bufferp buf) buf (and (stringp buf) (get-buffer buf)))))
                           (when (and live-buf (buffer-live-p live-buf))
-                            (or (let ((ctx (buffer-local-value 'macher-agent--persistent-context live-buf)))
-                                  (when (macher-agent-valid-context-p ctx) ctx))
-                                (macher-agent-resolve-context live-buf)))))))))
+                            (let ((ctx (buffer-local-value 'macher-agent--persistent-context live-buf)))
+                              (when (macher-agent-valid-context-p ctx) ctx)))))))))
               (when (macher-agent-valid-context-p payload) payload)
               (when p-struct
                 (or (when-let* ((c (macher-agent-transit-payload-target-context p-struct)))
@@ -1274,14 +1252,12 @@ Return updated PAYLOAD or context."
                     (when-let* ((b (macher-agent-transit-payload-target-buffer p-struct)))
                       (let ((buf (if (bufferp b) b (and (stringp b) (get-buffer b)))))
                         (when (and buf (buffer-live-p buf))
-                          (or (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
-                                (when (macher-agent-valid-context-p ctx) ctx))
-                              (macher-agent-resolve-context buf)))))))
+                          (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
+                            (when (macher-agent-valid-context-p ctx) ctx)))))))
               (macher-agent-storage--extract-context payload)
               (when (and (bound-and-true-p macher-agent--persistent-context)
                          (macher-agent-valid-context-p macher-agent--persistent-context))
-                macher-agent--persistent-context)
-              (macher-agent-resolve-context)))
+                macher-agent--persistent-context)))
          (child-ctx (cond
                      (p-struct (macher-agent-transit-payload-child-context p-struct))
                      ((and (macher-agent-valid-context-p payload) (not (eq payload parent-ctx)))
@@ -1332,10 +1308,6 @@ Return updated PAYLOAD or context."
 
       (when (boundp 'macher-agent--persistent-context)
         (setq macher-agent--persistent-context parent-ctx))
-
-      (when (and explicit-target (fboundp 'gptel-fsm-p) (gptel-fsm-p explicit-target))
-        (when (fboundp 'macher-agent--inject-context-into-fsm-info)
-          (macher-agent--inject-context-into-fsm-info parent-ctx explicit-target)))
 
       (let* ((buf-candidates
               (cond

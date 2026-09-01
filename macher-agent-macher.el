@@ -15,12 +15,10 @@
 (defvar macher-workspace-functions)
 (defvar macher--workspace)
 
-(declare-function gptel-fsm-info "gptel" (fsm))
-(declare-function gptel-fsm-p "gptel" (obj))
 (declare-function project-root "project" (project))
 (declare-function macher--workspace-hash "macher" (workspace &optional len))
 (declare-function macher--workspace-name "macher" (workspace))
-(declare-function macher--build-patch "macher" (context fsm))
+(declare-function macher--build-patch "macher" (context &optional fsm))
 (declare-function macher--make-context "macher" (&rest args))
 (declare-function make-macher-context "macher" (&rest args))
 (declare-function macher-context-p "macher" (obj))
@@ -137,63 +135,25 @@ Side effects: None."
               (error nil)))
           "workspace"))))
 
-(defun macher-agent-macher-build-patch (&optional arg1 arg2 arg3 &rest _rest)
-  "Bridge upstream `macher--build-patch' with flexible arities.
+(defun macher-agent-macher-build-patch (ctx prompt &optional files)
+  "Build patch for CTX using PROMPT and optional FILES via Macher core.
 
-Accepts:
-- (CTX FSM) where CTX is a `macher-agent-context` (or upstream context)
-- (PROJECT-ROOT FILES FSM)
-- (CTX FSM FILES)
+CTX is a `macher-agent-context` structure.
+PROMPT is the user prompt string.
+FILES is an optional list of `macher-agent-vfs-entry` objects.  If nil,
+extracted from CTX.
 
-Ephemerally instantiates upstream `macher-context` via
-`macher--make-context` with :workspace `(cons \\='agent PROJECT-ROOT)`
-and :contents FILES solely at the moment `macher--build-patch' is called.
+Ephemerally instantiates upstream `macher-context` via `macher--make-context`
+with :workspace `(cons \\='agent PROJECT-ROOT)` and :contents FILES solely at the
+moment `macher--build-patch' is called.
 
 Return the result of upstream patch generation.
 Side effects: Delegates patch building to Macher core."
-  (let* ((is-native-ctx (macher-agent-valid-context-p arg1))
-         (is-upstream-ctx (and (not is-native-ctx) (fboundp 'macher-context-p) (macher-context-p arg1)))
-         (project-root
-          (cond
-           (is-native-ctx
-            (or (macher-agent-context-project-root arg1)
-                (macher-agent-context-root arg1)))
-           (is-upstream-ctx
-            (when (fboundp 'macher-context-workspace)
-              (let ((ws (macher-context-workspace arg1)))
-                (if (consp ws) (cdr ws) ws))))
-           ((and (consp arg1) (memq (car arg1) '(agent project)))
-            (cdr arg1))
-           ((stringp arg1) arg1)
-           (t (macher-agent-workspace-project-root arg1))))
-         (vfs-files
-          (cond
-           ((and (not is-native-ctx) (not is-upstream-ctx) arg3) arg2)
-           (arg3 arg3)
-           (is-native-ctx (macher-agent--get-context-contents arg1))
-           (is-upstream-ctx (when (fboundp 'macher-context-contents)
-                              (macher-context-contents arg1)))
-           (t nil)))
-         (fsm
-          (cond
-           ((and (not is-native-ctx) (not is-upstream-ctx) arg3) arg3)
-           (t arg2)))
-         (prompt
-          (or (when is-native-ctx
-                (or (macher-agent-context-prompt arg1)
-                    (let ((plugins (macher-agent-context-plugins arg1)))
-                      (when (macher-agent--plist-p plugins)
-                        (plist-get plugins :prompt)))))
-              (when is-upstream-ctx
-                (when (fboundp 'macher-context-prompt)
-                  (macher-context-prompt arg1)))
-              (when (and fsm (fboundp 'gptel-fsm-info) (fboundp 'gptel-fsm-p) (gptel-fsm-p fsm))
-                (plist-get (gptel-fsm-info fsm) :prompt))
-              (when (and (listp fsm) (plist-member fsm :prompt))
-                (plist-get fsm :prompt))))
+  (let* ((project-root (or (macher-agent-context-project-root ctx)
+                           (macher-agent-context-root ctx)))
+         (vfs-files (or files (macher-agent--get-context-contents ctx)))
          (raw-root (if (consp project-root) (cdr project-root) project-root))
          (canonical-root (and raw-root (file-truename (expand-file-name raw-root))))
-
          (relative-vfs-files
           (mapcar (lambda (entry)
                     (let* ((path (macher-agent-vfs-entry-path entry))
@@ -205,30 +165,26 @@ Side effects: Delegates patch building to Macher core."
                                        path)))
                       (cons rel-path (cons orig curr))))
                   vfs-files)))
-
     (let ((default-directory (if canonical-root
                                  (file-name-as-directory canonical-root)
                                default-directory)))
-      (if is-upstream-ctx
-          (when (fboundp 'macher--build-patch)
-            (or (funcall 'macher--build-patch arg1 fsm)
-                (macher-agent-macher-patch-buffer arg1)))
-        (let ((ephemeral-ctx
-               (cond
-                ((fboundp 'macher--make-context)
-                 (funcall 'macher--make-context
-                          :workspace (cons 'agent (or canonical-root project-root))
-                          :contents relative-vfs-files
-                          :prompt prompt))
-                ((fboundp 'make-macher-context)
-                 (funcall 'make-macher-context
-                          :workspace (cons 'agent (or canonical-root project-root))
-                          :contents relative-vfs-files
-                          :prompt prompt))
-                (t nil))))
-          (when (fboundp 'macher--build-patch)
-            (or (funcall 'macher--build-patch ephemeral-ctx fsm)
-                (macher-agent-macher-patch-buffer (or ephemeral-ctx (cons 'agent (or canonical-root project-root)))))))))))
+      (let ((ephemeral-ctx
+             (cond
+              ((fboundp 'macher--make-context)
+               (funcall 'macher--make-context
+                        :workspace (cons 'agent (or canonical-root project-root))
+                        :contents relative-vfs-files
+                        :prompt prompt))
+              ((fboundp 'make-macher-context)
+               (funcall 'make-macher-context
+                        :workspace (cons 'agent (or canonical-root project-root))
+                        :contents relative-vfs-files
+                        :prompt prompt))
+              (t nil))))
+        (if (fboundp 'macher--build-patch)
+            (or (funcall 'macher--build-patch ephemeral-ctx nil)
+                (macher-agent-macher-patch-buffer (or ephemeral-ctx (cons 'agent (or canonical-root project-root)))))
+          (macher-agent-macher-patch-buffer (or ephemeral-ctx (cons 'agent (or canonical-root project-root)))))))))
 
 (defun macher-agent-macher-patch-buffer (&optional workspace)
   "Retrieve the active patch buffer for WORKSPACE from Macher core.
@@ -312,34 +268,6 @@ during construction."
               (plist-put (copy-sequence (macher-agent-context-plugins ctx)) :upstream-proxy proxy))))
     ctx))
 
-(defun macher-agent--get-fsm-latest ()
-  "Get the active finite-state machine (FSM) if bound.
-
-Delegates to `macher-agent-get-active-fsm' to locate and return the active
-finite-state machine instance.
-
-Return the active FSM structure, or nil if none is bound.
-
-Side effects: None."
-  (macher-agent-get-active-fsm))
-
-(defun macher-agent--inject-context-into-fsm-info (agent-ctx &optional fsm)
-  "Inject AGENT-CTX into FSM info property list safely.
-
-Store AGENT-CTX in the info plist of finite-state machine FSM
-under key `:macher-agent-context'.
-FSM defaults to active `gptel--fsm'.
-
-Return non-nil if injected successfully, or nil otherwise.
-
-Side effects: Mutates the info property list of FSM."
-  (when-let* ((fsm-obj (macher-agent-get-active-fsm fsm)))
-    (let* ((info (macher-agent--extract-fsm-info fsm-obj))
-           (new-info (if info (copy-sequence info) nil)))
-      (setq new-info (plist-put new-info :macher-agent-context agent-ctx))
-      (macher-agent--set-fsm-info fsm-obj new-info))
-    t))
-
 (defun macher-agent--get-active-workspace ()
   "Retrieve the globally active workspace.
 
@@ -371,7 +299,7 @@ Side effects: May initialise workspace state for current directory."
   (save-excursion
     (when-let* ((current-root (macher-agent-root default-directory)))
       (macher-agent--init-workspace-state current-root)
-      (macher-agent-resolve-context (current-buffer)))))
+      (macher-agent-context-from-buffer (current-buffer)))))
 
 (defun macher-agent--register-active-workspace-root (root context)
   "Register CONTEXT for ROOT in `macher-agent-active-workspaces` hash-table.
@@ -436,26 +364,6 @@ Side effects: None."
                                                   state)
                                               state))))
 
-(defun macher-agent-ctx-pipe--fsm (state)
-  "Context pipeline step 4: Resolve context from FSM input in STATE.
-
-If `:resolved' in STATE is nil and `:input' in STATE is a finite-state machine
-\(FSM), extract and set `:resolved' to its active context structure.
-
-STATE is the context resolution state plist (:input ... :resolved ...).
-
-Return the updated STATE plist.
-Side effects: None."
-  (macher-agent--with-unresolved-ctx-pipe state
-                                          (let ((input (when (macher-agent--plist-p state) (plist-get state :input))))
-                                            (if (and input (or (and (fboundp 'gptel-fsm-p) (gptel-fsm-p input))
-                                                               (and (recordp input) (fboundp 'gptel-fsm-info))
-                                                               (symbolp input)))
-                                                (if-let* ((ctx (macher-agent--extract-fsm-context input)))
-                                                    (plist-put state :resolved ctx)
-                                                  state)
-                                              state))))
-
 (defun macher-agent-ctx-pipe--lazy-init (state)
   "Context pipeline step: Resolve context via lazy initialisation in STATE.
 
@@ -485,7 +393,6 @@ Side effects: May initialise workspace state for current directory."
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--explicit 10)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--buffer 15)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-resolve-from-transit-payload 15)
-  (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--fsm 40)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--lazy-init 80))
 
 (cl-defun make-macher-agent-workspace (&key project-root &allow-other-keys)
@@ -519,24 +426,30 @@ Side effects: None."
    ((or (macher-agent-context-p ws-or-id) (macher-agent-valid-context-p ws-or-id))
     ws-or-id)
    ((bufferp ws-or-id)
-    (when (buffer-live-p ws-or-id)
-      (let ((ctx (buffer-local-value 'macher-agent--persistent-context ws-or-id)))
-        (when (or (macher-agent-context-p ctx) (macher-agent-valid-context-p ctx))
-          ctx))))
-   ((and (boundp 'macher-agent-active-workspaces)
-         (hash-table-p macher-agent-active-workspaces))
-    (or (when-let* ((ws-id (macher-agent-workspace-project-root ws-or-id)))
-          (let ((exp (expand-file-name ws-id))
-                (true-exp (file-truename (expand-file-name ws-id))))
+    (macher-agent-context-from-buffer ws-or-id))
+   ((stringp ws-or-id)
+    (or (macher-agent-context-from-buffer ws-or-id)
+        (when (and (boundp 'macher-agent-active-workspaces)
+                   (hash-table-p macher-agent-active-workspaces))
+          (let ((exp (expand-file-name ws-or-id))
+                (true-exp (file-truename (expand-file-name ws-or-id))))
             (or (gethash exp macher-agent-active-workspaces)
                 (gethash (file-name-as-directory exp) macher-agent-active-workspaces)
                 (gethash (directory-file-name exp) macher-agent-active-workspaces)
                 (gethash true-exp macher-agent-active-workspaces)
                 (gethash (file-name-as-directory true-exp) macher-agent-active-workspaces)
-                (gethash (directory-file-name true-exp) macher-agent-active-workspaces))))
-        (macher-agent-resolve-context ws-or-id)))
-   (t
-    (macher-agent-resolve-context ws-or-id))))
+                (gethash (directory-file-name true-exp) macher-agent-active-workspaces))))))
+   ((and (boundp 'macher-agent-active-workspaces)
+         (hash-table-p macher-agent-active-workspaces))
+    (when-let* ((ws-id (macher-agent-workspace-project-root ws-or-id)))
+      (let ((exp (expand-file-name ws-id))
+            (true-exp (file-truename (expand-file-name ws-id))))
+        (or (gethash exp macher-agent-active-workspaces)
+            (gethash (file-name-as-directory exp) macher-agent-active-workspaces)
+            (gethash (directory-file-name exp) macher-agent-active-workspaces)
+            (gethash true-exp macher-agent-active-workspaces)
+            (gethash (file-name-as-directory true-exp) macher-agent-active-workspaces)
+            (gethash (directory-file-name true-exp) macher-agent-active-workspaces)))))))
 
 (defun macher-agent--workspace-get-hash-table (ws-or-ctx key &optional default)
   "Retrieve or initialise hash-table under KEY for WS-OR-CTX deterministically.
@@ -545,8 +458,7 @@ WS-OR-CTX is a workspace object or context structure.
 KEY is the lookup key.
 DEFAULT is the default value if unresolved."
   (let ((ctx (or (when (macher-agent-valid-context-p ws-or-ctx) ws-or-ctx)
-                 (macher-agent-context-lookup ws-or-ctx)
-                 (macher-agent-resolve-context ws-or-ctx))))
+                 (macher-agent-context-lookup ws-or-ctx))))
     (if ctx
         (let ((plugins (macher-agent-context-plugins ctx)))
           (or (when (macher-agent--plist-p plugins)
@@ -582,7 +494,6 @@ WS-OR-CTX is a workspace object or context structure.
 
 Return a hash-table."
   (let ((ctx (or (when (macher-agent-valid-context-p ws-or-ctx) ws-or-ctx)
-                 (macher-agent-resolve-context ws-or-ctx)
                  (macher-agent-context-lookup ws-or-ctx))))
     (if ctx
         (let ((tools (macher-agent-context-tools ctx)))
@@ -604,7 +515,6 @@ WS-OR-CTX is a workspace object or context structure.
 
 Return an alist."
   (let ((ctx (or (when (macher-agent-valid-context-p ws-or-ctx) ws-or-ctx)
-                 (macher-agent-resolve-context ws-or-ctx)
                  (macher-agent-context-lookup ws-or-ctx))))
     (if ctx
         (or (macher-agent-context-skills ctx)
@@ -626,7 +536,6 @@ WS-OR-CTX is a workspace object or context structure.
 
 Return a list of subagent entries."
   (when-let* ((ctx (or (when (macher-agent-valid-context-p ws-or-ctx) ws-or-ctx)
-                       (macher-agent-resolve-context ws-or-ctx)
                        (macher-agent-context-lookup ws-or-ctx))))
     (or (macher-agent-context-subagents ctx)
         (let ((plugins (macher-agent-context-plugins ctx)))
@@ -643,7 +552,6 @@ Return VAL.
 Side effects: Modifies the skills alist for WS-OR-CTX if resolvable, or global
 if WS-OR-CTX is nil."
   (if-let* ((ctx (or (when (macher-agent-valid-context-p ws-or-ctx) ws-or-ctx)
-                     (macher-agent-resolve-context ws-or-ctx)
                      (macher-agent-context-lookup ws-or-ctx))))
       (setf (macher-agent-context-skills ctx) val)
     (when (null ws-or-ctx)
@@ -663,7 +571,6 @@ Return VAL.
 Side effects: Modifies tools registry for WS-OR-CTX if resolvable, or global
 if WS-OR-CTX is nil."
   (if-let* ((ctx (or (when (macher-agent-valid-context-p ws-or-ctx) ws-or-ctx)
-                     (macher-agent-resolve-context ws-or-ctx)
                      (macher-agent-context-lookup ws-or-ctx))))
       (setf (macher-agent-context-tools ctx) val)
     (when (null ws-or-ctx)
@@ -682,7 +589,6 @@ VAL is the list of active subagents to set.
 Return VAL.
 Side effects: Modifies the active subagents list for WS-OR-CTX."
   (when-let* ((ctx (or (when (macher-agent-valid-context-p ws-or-ctx) ws-or-ctx)
-                       (macher-agent-resolve-context ws-or-ctx)
                        (macher-agent-context-lookup ws-or-ctx))))
     (setf (macher-agent-context-subagents ctx) val))
   val)
@@ -768,9 +674,8 @@ Side effects: Invokes external process (`git` or `patch`) to apply patch."
   (interactive)
   (unless (derived-mode-p 'diff-mode) (user-error "Not in a patch/diff buffer"))
   (let* ((patch-content (buffer-substring-no-properties (point-min) (point-max)))
-         (ctx (or (bound-and-true-p macher-agent--persistent-context)
-                  (ignore-errors (macher-agent-resolve-context (current-buffer)))
-                  (ignore-errors (macher-agent-resolve-context))))
+         (ctx (or (macher-agent-context-from-buffer (current-buffer))
+                  (bound-and-true-p macher-agent--persistent-context)))
          (root (if ctx
                    (macher-agent-context-root ctx)
                  (or (locate-dominating-file default-directory ".git") default-directory)))

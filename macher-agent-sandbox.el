@@ -21,7 +21,6 @@
 (require 'macher-agent-tools)
 
 (declare-function cps-internal-yield "generator")
-(declare-function gptel-fsm-info "gptel" (fsm))
 (declare-function gptel-tool-p "gptel" (tool))
 (declare-function gptel-tool-name "gptel" (tool))
 (declare-function gptel-tool-description "gptel" (tool))
@@ -68,15 +67,8 @@ Return t if SYM is an active primitive, otherwise nil.
 Side effects: None."
   (let* ((sym-name (symbol-name sym))
          (norm-sym (replace-regexp-in-string "_" "-" sym-name))
-
-         (fsm-obj (macher-agent-get-active-fsm))
-         (info (when fsm-obj (macher-agent--extract-fsm-info fsm-obj)))
-
-         (active (or (when (macher-agent--plist-p info) (plist-get info :ptc-primitives))
-                     (bound-and-true-p macher-agent--active-ptc-primitives)))
-         (tools (or (when (macher-agent--plist-p info) (plist-get info :tools))
-                    (bound-and-true-p gptel-tools))))
-
+         (active (bound-and-true-p macher-agent--active-ptc-primitives))
+         (tools (bound-and-true-p gptel-tools)))
     (and (or (memq sym active)
              (cl-some (lambda (prim)
                         (let* ((prim-name (if (symbolp prim) (symbol-name prim) prim))
@@ -182,12 +174,12 @@ Including a number of hardcoded defaults."
 (iter-defun macher-agent-sandbox--funcall-iter (func eval-args)
             "Execute function FUNC with EVAL-ARGS in the sandbox."
             (cond
-             ((and (consp func) (eq (car func) 'closure))
-              (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))
              ((and (consp func) (eq (car func) 'lambda))
               (iter-yield-from
                (macher-agent-sandbox--apply-closure-iter
                 (list 'closure (cadr func) (cddr func) nil) eval-args)))
+             ((and (consp func) (eq (car func) 'closure))
+              (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))
              ((symbolp func)
               (iter-yield-from (macher-agent-sandbox--funcall-symbol-iter func eval-args)))
              (t (error "Invalid function target: %s" func))))
@@ -807,26 +799,21 @@ Side effects: None."
           (macher-agent--coerce-plist-args args schema)
         (macher-agent--coerce-positional-args args schema)))))
 
-(defun macher-agent--display-ptc-tool-execution (tool-sym args context)
+(defun macher-agent--display-ptc-tool-execution (tool-sym args context target-buf)
   "Display mode-line status and run pre-execution hooks for PTC tool.
 
 TOOL-SYM is the symbol name of the target PTC tool.
 ARGS is the list of arguments supplied to the tool call.
 CONTEXT is the active agent context structure.
+TARGET-BUF is the target buffer for tool execution.
 
 Return cons cell of (ORIGINAL-NAME-STRING . RESOLVED-TOOL).
 Side effects: Updates mode-line status and executes pre-tool-call hooks."
   (let* ((target-lisp-name (symbol-name tool-sym))
          (original-name-str (replace-regexp-in-string "-" "_" target-lisp-name))
-         (fsm (macher-agent-get-active-fsm))
-         (fsm-info (when fsm (macher-agent--extract-fsm-info fsm)))
-         (fsm-ctx (when (macher-agent--plist-p fsm-info)
-                    (plist-get fsm-info :macher-agent-context)))
-         (ctx (or (when (macher-agent-valid-context-p context) context)
-                  fsm-ctx
-                  (bound-and-true-p macher-agent--persistent-context)))
+         (tool-name original-name-str)
          (resolved-tool (if (fboundp 'macher-agent-resolve-tool)
-                            (macher-agent-resolve-tool original-name-str nil nil ctx)
+                            (macher-agent-resolve-tool original-name-str nil nil context)
                           (when (and (boundp 'macher-agent-tools-registry)
                                      (hash-table-p macher-agent-tools-registry))
                             (gethash original-name-str macher-agent-tools-registry))))
@@ -841,7 +828,8 @@ Side effects: Updates mode-line status and executes pre-tool-call hooks."
        (lambda (f)
          (let ((res (ignore-errors
                       (funcall f (list :name original-name-str :args args
-                                       :buffer (buffer-name) :model (bound-and-true-p gptel-model))))))
+                                       :buffer (buffer-name (if (bufferp target-buf) target-buf (current-buffer)))
+                                       :model (bound-and-true-p gptel-model))))))
            (when (and res (listp res) (plist-get res :block))
              (setq block-reason (plist-get res :block))
              t)))))
@@ -849,20 +837,8 @@ Side effects: Updates mode-line status and executes pre-tool-call hooks."
     (if block-reason
         (error "%s" block-reason)
       (message "PTC Executing: %s" (or desc original-name-str))
-
-      (when-let* (((fboundp 'gptel--update-tool-call))
-                  (fsm-obj (macher-agent-get-active-fsm))
-                  (info (macher-agent--extract-fsm-info fsm-obj))
-                  (mock-info (plist-put (copy-sequence info)
-                                        :tool-use
-                                        (list (list :name (format "PTC: %s" tool-sym))))))
-
-        (unwind-protect
-            (progn
-              (macher-agent--set-fsm-info fsm-obj mock-info)
-              (gptel--update-tool-call fsm-obj))
-          (macher-agent--set-fsm-info fsm-obj info)))
-
+      (when (fboundp 'macher-agent-gptel-spoof-tool-ui)
+        (macher-agent-gptel-spoof-tool-ui target-buf tool-name))
       (cons original-name-str resolved-tool))))
 
 (defun macher-agent--format-ptc-result-block (truncated-call call-str str-res)
@@ -923,7 +899,7 @@ Side effects: Inserts formatted result block text into buffer at buffer max."
           (macher-agent--cycle-ptc-result-block))))))
 
 (defun macher-agent--dispatch-ptc-primitive
-    (tool-lisp-sym args resolved-tool original-name-str ptc-callback on-error stop-iter-fn)
+    (tool-lisp-sym args resolved-tool original-name-str ptc-callback on-error stop-iter-fn &optional target-buf context)
   "Dispatch TOOL-LISP-SYM with ARGS or RESOLVED-TOOL for ORIGINAL-NAME-STR.
 
 TOOL-LISP-SYM is the symbol of the tool function.
@@ -933,47 +909,62 @@ ORIGINAL-NAME-STR is the string name of the original tool.
 PTC-CALLBACK is the callback function upon successful execution.
 ON-ERROR is the callback function invoked upon error.
 STOP-ITER-FN is the function to halt the iterator.
+TARGET-BUF is the target buffer for tool execution.
+CONTEXT is the active agent context structure.
 
 Return result of dispatching tool execution.
 Side effects: Invokes tool function and callbacks."
-  (cond
-   ((and (macher-tool-valid-p resolved-tool)
-         (gptel-tool-function resolved-tool))
-    (let ((coerced-args (macher-agent--coerce-ptc-args args resolved-tool)))
-      (if (gptel-tool-async resolved-tool)
-          (let ((called nil))
-            (apply (gptel-tool-function resolved-tool)
-                   (lambda (res &optional err)
-                     (unless called
-                       (setq called t)
-                       (if err
-                           (funcall stop-iter-fn err)
-                         (funcall ptc-callback res))))
-                   coerced-args))
-        (let ((sync-result (apply (gptel-tool-function resolved-tool) coerced-args)))
-          (funcall ptc-callback sync-result)))))
-   ((and (symbolp tool-lisp-sym)
-         (fboundp tool-lisp-sym)
-         (or (macher-agent--ptc-primitive-p tool-lisp-sym)
-             (and (boundp 'macher-agent-sandbox--primitives)
-                  (hash-table-p macher-agent-sandbox--primitives)
-                  (gethash tool-lisp-sym macher-agent-sandbox--primitives))
-             (and (boundp 'macher-agent-allowed-tools)
-                  (listp macher-agent-allowed-tools)
-                  (memq tool-lisp-sym macher-agent-allowed-tools))))
-    (let ((lisp-res (apply tool-lisp-sym args)))
-      (funcall ptc-callback lisp-res)))
-   (t
-    (when stop-iter-fn (funcall stop-iter-fn "Tool not accessible"))
-    (funcall on-error
-             (list :status 'error
-                   :error (format "ERROR: Tool '%s' is not accessible." original-name-str))))))
+  (let ((run-in-target
+         (lambda (fn)
+           (if (and target-buf (buffer-live-p target-buf))
+               (with-current-buffer target-buf
+                 (when (and context (macher-agent-valid-context-p context))
+                   (setq macher-agent--persistent-context context))
+                 (funcall fn))
+             (funcall fn)))))
+    (cond
+     ((and (macher-tool-valid-p resolved-tool)
+           (gptel-tool-function resolved-tool))
+      (let ((coerced-args (macher-agent--coerce-ptc-args args resolved-tool)))
+        (funcall run-in-target
+                 (lambda ()
+                   (if (gptel-tool-async resolved-tool)
+                       (let ((called nil))
+                         (apply (gptel-tool-function resolved-tool)
+                                (lambda (res &optional err)
+                                  (unless called
+                                    (setq called t)
+                                    (if err
+                                        (funcall stop-iter-fn err)
+                                      (funcall ptc-callback res))))
+                                coerced-args))
+                     (let ((sync-result (apply (gptel-tool-function resolved-tool) coerced-args)))
+                       (funcall ptc-callback sync-result)))))))
+     ((and (symbolp tool-lisp-sym)
+           (fboundp tool-lisp-sym)
+           (or (macher-agent--ptc-primitive-p tool-lisp-sym)
+               (and (boundp 'macher-agent-sandbox--primitives)
+                    (hash-table-p macher-agent-sandbox--primitives)
+                    (gethash tool-lisp-sym macher-agent-sandbox--primitives))
+               (and (boundp 'macher-agent-allowed-tools)
+                    (listp macher-agent-allowed-tools)
+                    (memq tool-lisp-sym macher-agent-allowed-tools))))
+      (funcall run-in-target
+               (lambda ()
+                 (let ((lisp-res (apply tool-lisp-sym args)))
+                   (funcall ptc-callback lisp-res)))))
+     (t
+      (when stop-iter-fn (funcall stop-iter-fn "Tool not accessible"))
+      (funcall on-error
+               (list :status 'error
+                     :error (format "ERROR: Tool '%s' is not accessible." original-name-str)))))))
 
-(defun macher-agent--ptc-handle-yielded-value (yielded-val context ptc-resume-loop on-error stop-iter-fn)
+(defun macher-agent--ptc-handle-yielded-value (yielded-val context target-buf ptc-resume-loop on-error stop-iter-fn)
   "Handle YIELDED-VAL returned during PTC execution.
 
 YIELDED-VAL is the value yielded from sandbox evaluation iterator.
 CONTEXT is the active agent context structure.
+TARGET-BUF is the target buffer for tool execution.
 PTC-RESUME-LOOP is the loop continuation callback function.
 ON-ERROR is the error callback function on failure.
 STOP-ITER-FN is the callback function halting iterator.
@@ -983,14 +974,7 @@ Side effects: Triggers tool execution and schedules loop resumption."
   (if (and (macher-agent-tool-call-p yielded-val) (macher-agent-tool-call-name yielded-val))
       (let* ((tool-lisp-sym (macher-agent-tool-call-name yielded-val))
              (args (macher-agent-tool-call-args yielded-val))
-             (fsm (macher-agent-get-active-fsm))
-             (fsm-info (when fsm (macher-agent--extract-fsm-info fsm)))
-             (fsm-ctx (when (macher-agent--plist-p fsm-info)
-                        (plist-get fsm-info :macher-agent-context)))
-             (ctx (or (when (macher-agent-valid-context-p context) context)
-                      fsm-ctx
-                      (bound-and-true-p macher-agent--persistent-context)))
-             (tool-info (macher-agent--display-ptc-tool-execution tool-lisp-sym args ctx))
+             (tool-info (macher-agent--display-ptc-tool-execution tool-lisp-sym args context target-buf))
              (original-name-str (car tool-info))
              (resolved-tool (cdr tool-info))
              (ptc-callback (lambda (res-data)
@@ -998,114 +982,79 @@ Side effects: Triggers tool execution and schedules loop resumption."
                              (funcall ptc-resume-loop res-data))))
         (macher-agent--dispatch-ptc-primitive
          tool-lisp-sym args resolved-tool original-name-str
-         ptc-callback on-error stop-iter-fn))
+         ptc-callback on-error stop-iter-fn target-buf context))
     (let ((reason (format "Unexpected yield from PTC sandbox: %S" yielded-val)))
       (when stop-iter-fn (funcall stop-iter-fn reason))
       (funcall on-error (list :status 'error :error reason)))))
 
 (defun macher-agent-execute-ptc-script
-    (script-string context on-success on-error &optional extra-primitives target-buf)
-  "Execute Programmatic Tool Calling SCRIPT-STRING using CONTEXT.
+    (script-string context target-buf on-success on-error &optional extra-primitives)
+  "Execute Programmatic Tool Calling SCRIPT-STRING using CONTEXT in TARGET-BUF.
 
 SCRIPT-STRING is the string containing Lisp code to evaluate.
-CONTEXT is the active VFS context structure.
+CONTEXT is the active context structure.
+TARGET-BUF is the target buffer for execution.
 ON-SUCCESS is the callback function invoked with success result.
 ON-ERROR is the callback function invoked with error result.
-EXTRA-PRIMITIVES is an optional list of allowed primitive functions.
-TARGET-BUF is an optional target buffer for execution.
+EXTRA-PRIMITIVES is an optional list of allowed primitive host functions.
 
 Return nil.
 Side effects: Evaluates Lisp code in a sandboxed environment."
-  (let* ((prims (or extra-primitives
-                    '(nreverse sort delete delq nconc plist-put aset puthash remhash error signal message random emacs-version)))
-         (buf (or target-buf (current-buffer)))
-         (active-fsm (macher-agent-get-active-fsm))
-         (fsm-info (when active-fsm (macher-agent--extract-fsm-info active-fsm)))
-         (fsm-ctx (when (macher-agent--plist-p fsm-info)
-                    (plist-get fsm-info :macher-agent-context)))
-         (resolved-ctx (or (when (macher-agent-valid-context-p context) context)
-                           fsm-ctx
-                           (when (and buf (buffer-live-p buf))
-                             (let ((bctx (buffer-local-value 'macher-agent--persistent-context buf)))
-                               (when (macher-agent-valid-context-p bctx) bctx)))
-                           (when (and (bound-and-true-p macher-agent--persistent-context)
-                                      (macher-agent-valid-context-p macher-agent--persistent-context))
-                             macher-agent--persistent-context)
-                           (when context
-                             (macher-agent-resolve-context context))
-                           (macher-agent-resolve-context))))
-    (let ((macher-agent--active-ptc-execution t))
-      (condition-case err
-          (progn
-            (with-current-buffer buf
-              (when resolved-ctx
-                (setq-local macher-agent--persistent-context resolved-ctx))
-              (when (and active-fsm resolved-ctx (fboundp 'macher-agent--inject-context-into-fsm-info))
-                (macher-agent--inject-context-into-fsm-info resolved-ctx active-fsm))
-              (when (boundp 'macher-agent-sandbox--globals)
-                (setq macher-agent-sandbox--globals (make-hash-table :test 'eq)))
-              (when (boundp 'macher-agent-sandbox--primitives)
-                (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)))
-              (when (boundp 'macher-agent-sandbox--functions)
-                (setq macher-agent-sandbox--functions (make-hash-table :test 'eq)))
-              (macher-agent-sandbox--init prims))
-            (let* ((ast (macroexpand-all (let ((read-eval nil))
-                                           (read (format "(progn\n%s\n)" script-string)))))
-                   (iterator (with-current-buffer buf
-                               (macher-agent-sandbox--eval-iter ast nil)))
-                   (stop-iter-fn (lambda (reason)
-                                   (funcall on-error (list :status 'error :error reason)))))
-              (letrec
-                  ((ptc-resume-loop
-                    (lambda (input)
-                      (condition-case iter-err
-                          (let ((step (with-current-buffer buf (iter-next iterator input))))
-                            (if (macher-agent-tool-call-p step)
-                                (macher-agent--ptc-handle-yielded-value
-                                 step resolved-ctx ptc-resume-loop on-error stop-iter-fn)
-                              (funcall ptc-resume-loop step)))
-                        (iter-end-of-sequence
-                         (funcall on-success (cdr iter-err)))
-                        (error
-                         (funcall on-error (list :status 'error :error (error-message-string iter-err))))))))
-                (funcall ptc-resume-loop nil))))
-        (error
-         (funcall on-error (list :status 'error :error (error-message-string err))))))))
+  (let* ((prims (append
+                 '(nreverse sort delete delq nconc plist-put aset puthash remhash error signal message random emacs-version)
+                 extra-primitives))
+         (macher-agent--active-ptc-execution t))
+    (condition-case err
+        (progn
+          (with-current-buffer target-buf
+            (setq macher-agent--persistent-context context)
+            (when (boundp 'macher-agent-sandbox--globals)
+              (setq macher-agent-sandbox--globals (make-hash-table :test 'eq)))
+            (when (boundp 'macher-agent-sandbox--primitives)
+              (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)))
+            (when (boundp 'macher-agent-sandbox--functions)
+              (setq macher-agent-sandbox--functions (make-hash-table :test 'eq)))
+            (macher-agent-sandbox--init prims))
+          (let* ((ast (macroexpand-all (let ((read-eval nil))
+                                         (read (format "(progn\n%s\n)" script-string)))))
+                 (iterator (with-current-buffer target-buf
+                             (macher-agent-sandbox--eval-iter ast nil)))
+                 (stop-iter-fn (lambda (reason)
+                                 (funcall on-error (list :status 'error :error reason)))))
+            (letrec
+                ((ptc-resume-loop
+                  (lambda (input)
+                    (condition-case iter-err
+                        (let ((step (with-current-buffer target-buf (iter-next iterator input))))
+                          (if (macher-agent-tool-call-p step)
+                              (macher-agent--ptc-handle-yielded-value
+                               step context target-buf ptc-resume-loop on-error stop-iter-fn)
+                            (funcall ptc-resume-loop step)))
+                      (iter-end-of-sequence
+                       (funcall on-success (cdr iter-err)))
+                      (error
+                       (funcall on-error (list :status 'error :error (error-message-string iter-err))))))))
+              (funcall ptc-resume-loop nil))))
+      (error
+       (funcall on-error (list :status 'error :error (error-message-string err)))))))
 
-(defun macher-agent-sandbox-run (expression extra-operations &optional context)
+(defun macher-agent-sandbox-run (expression extra-operations context target-buf)
   "Execute Lisp EXPRESSION in a sandboxed environment with EXTRA-OPERATIONS.
 
 EXPRESSION is the Lisp expression form to evaluate inside sandbox.
 EXTRA-OPERATIONS is a list of host function symbols allowed in sandbox.
-CONTEXT is an optional context structure to use for logging tool intent.
+CONTEXT is the active agent context structure to use for logging tool intent.
+TARGET-BUF is the target buffer of the execution.
 
 Return the result of evaluating EXPRESSION.
 
 Side effects: Evaluates sandboxed Lisp expression."
-  (declare (ftype (function (t list &optional t) t)))
+  (declare (ftype (function (t list t t) t)))
   (let ((macher-agent-sandbox--primitives (make-hash-table :test 'eq))
         (macher-agent-sandbox--functions (make-hash-table :test 'eq))
         (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
-    (when (fboundp 'macher-agent-sandbox--init)
-      (macher-agent-sandbox--init extra-operations))
-    (let* ((active-fsm (macher-agent-get-active-fsm))
-           (fsm-info (when active-fsm (macher-agent--extract-fsm-info active-fsm)))
-           (fsm-ctx (when (macher-agent--plist-p fsm-info)
-                      (plist-get fsm-info :macher-agent-context)))
-           (ctx (or (when (macher-agent-valid-context-p context) context)
-                    fsm-ctx
-                    (when (and (bound-and-true-p macher-agent--persistent-context)
-                               (macher-agent-valid-context-p macher-agent--persistent-context))
-                      macher-agent--persistent-context)
-                    (when (buffer-live-p (current-buffer))
-                      (let ((bctx (buffer-local-value 'macher-agent--persistent-context (current-buffer))))
-                        (when (macher-agent-valid-context-p bctx) bctx)))))
-           (ctx (or ctx
-                    (when context
-                      (macher-agent-resolve-context context))
-                    (macher-agent-resolve-context)))
-           (iterator (when (fboundp 'macher-agent-sandbox--eval-iter)
-                       (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil)))
+    (macher-agent-sandbox--init extra-operations)
+    (let* ((iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
            (yield-val nil)
            (next-yield nil))
       (if (null iterator)
@@ -1125,9 +1074,9 @@ Side effects: Evaluates sandboxed Lisp expression."
                 (when (and tc (macher-agent-tool-call-name tc))
                   (let ((target (macher-agent-tool-call-name tc))
                         (args (macher-agent-tool-call-args tc)))
-                    (when (and ctx target)
+                    (when (and context target)
                       (when (fboundp 'macher-agent-log-tool-intent)
-                        (macher-agent-log-tool-intent ctx "ptc" target args))))))
+                        (macher-agent-log-tool-intent context "ptc" target args))))))
               (setq yield-val next-yield))
           (iter-end-of-sequence (cdr err)))))))
 
@@ -1157,36 +1106,13 @@ Side effects: Evaluates sandboxed Lisp expression."
 (defun macher-agent-sandbox-install ()
   "Install Programmatic Tool Calling hooks, tools, and pipeline steps."
   (macher-agent-register-pipeline-step 'preset-composition #'macher-agent-ptc--inject-tool 50)
-  (macher-agent-register-pipeline-step 'transmission #'macher-agent-sandbox-append-ptc-directive 80)
-  (unless (and (bound-and-true-p macher-agent-ptc-execution-tool)
-               (macher-tool-valid-p macher-agent-ptc-execution-tool))
-    (macher-agent-make-tool
-     macher-agent-ptc-execution-tool
-     "Execute an Emacs Lisp orchestration script. Use this to orchestrate multiple tools, spawn sub-agents, and handle complex asynchronous workflows in a single step."
-     :category "execution"
-     :include nil
-     :args
-     '((:name "script"
-              :type string
-              :description "The Emacs Lisp script to execute. Use standard let*, mapcar, dolist, and permitted tool primitives."))
-     :command-fn
-     (lambda (payload context _root callback)
-       (if-let* ((script (plist-get payload :script)))
-           (macher-agent-execute-ptc-script
-            script context
-            (lambda (res) (funcall callback res))
-            (lambda (err) (funcall callback err)))
-         (error "No script provided for PTC execution"))))))
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-sandbox-append-ptc-directive 80))
 
 (defun macher-agent-sandbox-uninstall ()
   "Uninstall Programmatic Tool Calling hooks, tools, and pipeline steps."
   (macher-agent-unregister-pipeline-step 'preset-composition #'macher-agent-ptc--inject-tool)
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-sandbox-append-ptc-directive)
-  (setq macher-agent-ptc-execution-tool nil)
-  (when (boundp 'gptel--known-tools)
-    (when-let* ((exec-alist (alist-get "execution" gptel--known-tools nil nil #'equal)))
-      (setf (alist-get "execution" gptel--known-tools nil nil #'equal)
-            (assoc-delete-all "ptc_execution" exec-alist #'equal)))))
+  (setq macher-agent-ptc-execution-tool nil))
 
 (provide 'macher-agent-sandbox)
 ;;; macher-agent-sandbox.el ends here
