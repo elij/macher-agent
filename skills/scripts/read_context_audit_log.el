@@ -1,54 +1,37 @@
-;;; read_context_audit_log.el --- Read context audit log -*- lexical-binding: t; -*-
+;;; read_context_audit_log.el --- Read context audit log tool -*- lexical-binding: t; -*-
 
-(macher-agent-make-tool
-    macher-agent-read-context-audit-log-tool
-    "Read the ephemeral tool-intent log from the current task context to evaluate past subagent behaviour. Analyses parameters to determine why previous tasks failed."
-  :category "perception"
-  :args
-  '((:name "preset"
-           :type string
-           :description "Filter by specific preset name (for example, 'PandasDataFilter')."
-           :optional t)
-    (:name "limit"
-           :type integer
-           :description "Max records to return. Defaults to 5."
-           :optional t))
-  :command-fn
-  (lambda (payload context _root)
-    (require 'json)
-    (let* ((preset (plist-get payload :preset))
-           (preset-str (when-let* ((p preset)
-                                   ((not (eq p :json-false)))
-                                   ((stringp p))
-                                   ((not (string-empty-p p))))
-                         p))
-           (raw-limit (plist-get payload :limit))
-           (limit (if (and (numberp raw-limit) (> raw-limit 0))
-                      (round raw-limit)
-                    5))
-           (raw-log (cond
-                     ((and context (fboundp 'macher-agent-context-p) (macher-agent-context-p context))
-                      (let ((plugins (macher-agent-context-plugins context)))
-                        (when (macher-agent--plist-p plugins)
-                          (plist-get plugins :audit-log))))
-                     ((and context (fboundp 'macher-agent--plist-p) (macher-agent--plist-p context))
-                      (plist-get context :audit-log))))
-           (filtered-log
-            (if preset-str
-                (cl-remove-if-not
-                 (lambda (entry)
-                   (when-let* ((val (cdr (or (assoc 'preset entry)
-                                             (assoc :preset entry)
-                                             (assoc "preset" entry)))))
-                     (let* ((str-val (format "%s" val))
-                            (clean-val (if (string-prefix-p ":" str-val)
-                                           (substring str-val 1)
-                                         str-val)))
-                       (string-equal clean-val preset-str))))
-                 raw-log)
-              raw-log))
-           (recent-entries (last filtered-log limit)))
-      (json-encode (vconcat recent-entries))))
-  :success-fn
-  (lambda (res _payload)
-    (format "SUCCESS: Audit log retrieved.\n%s" res)))
+(setq macher-agent-read-context-audit-log-tool
+      (gptel-make-tool
+       :name "read_context_audit_log"
+       :description "Read the ephemeral tool-intent log from the current task context to evaluate past subagent behaviour. Analyses parameters to determine why previous tasks failed."
+       :category "perception"
+       :args '((:name "preset" :type "string" :description "Filter by specific preset name (for example, 'PandasDataFilter')." :optional t)
+               (:name "limit" :type "integer" :description "Max records to return. Defaults to 5." :optional t))
+       :async t
+       :function (macher-agent-with-presentation-context (preset limit)
+                   (let* ((native-fn (get 'macher-agent-read-context-audit-log-tool 'ptc-function))
+                          (res (funcall native-fn preset limit context)))
+                     (format "SUCCESS: Audit log retrieved.\n%s" res)))))
+
+(put 'macher-agent-read-context-audit-log-tool 'ptc-function
+     (lambda (&optional preset limit context)
+       (let* ((preset-str (when (and (stringp preset) (not (string-empty-p preset)))
+                            preset))
+              (parsed-limit (if (and (numberp limit) (> limit 0))
+                                (round limit)
+                              5))
+              (raw-log (when (macher-agent-valid-context-p context)
+                         (plist-get (macher-agent-context-plugins context) :audit-log)))
+              (filtered-log
+               (if preset-str
+                   (cl-remove-if-not
+                    (lambda (entry)
+                      (when-let* ((val (cdr (or (assoc 'preset entry)
+                                                (assoc :preset entry)
+                                                (assoc "preset" entry)))))
+                        (string-equal (replace-regexp-in-string "^:" "" (format "%s" val))
+                                      preset-str)))
+                    raw-log)
+                 raw-log))
+              (recent-entries (last filtered-log parsed-limit)))
+         (json-encode (vconcat recent-entries)))))

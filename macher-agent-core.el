@@ -32,8 +32,6 @@
   (subagents nil :type list)
   (plugins nil :type list))
 
-(defalias 'make-macher-agent-context #'macher-agent--make-context)
-
 (cl-defstruct (macher-agent-vfs-entry
                (:constructor make-macher-agent-vfs-entry)
                (:copier copy-macher-agent-vfs-entry))
@@ -57,6 +55,34 @@
   shared-state
   payload
   metadata)
+
+(cl-defun macher-agent-make-a2a-payload (&key (schema-version macher-agent-a2a-schema-version)
+                                              (transit-type :root-to-subagent)
+                                              type
+                                              task-id
+                                              target
+                                              target-buffer
+                                              target-context
+                                              parent-context
+                                              child-context
+                                              shared-state
+                                              payload
+                                              metadata)
+  "Construct a validated `macher-agent-transit-payload' struct."
+  (cl-assert (memq transit-type macher-agent-a2a-transit-types)
+             nil "Invalid transit-type: %S (expected one of %S)" transit-type macher-agent-a2a-transit-types)
+  (make-macher-agent-transit-payload
+   :schema-version schema-version
+   :transit-type transit-type
+   :type type
+   :task-id task-id
+   :target-buffer (or target-buffer target)
+   :target-context target-context
+   :parent-context parent-context
+   :child-context child-context
+   :shared-state shared-state
+   :payload payload
+   :metadata metadata))
 
 (cl-defstruct (macher-agent-tool-call
                (:constructor make-macher-agent-tool-call)
@@ -90,6 +116,12 @@ SYSTEM-MESSAGE is the system prompt message string."
   system-message)
 
 ;; Universal constants and global state
+
+(defconst macher-agent--file-scan-regex "^[^.]"
+  "Regular expression matching non-hidden file and directory names.")
+
+(defvar directory-files-no-dot-files-re macher-agent--file-scan-regex
+  "Safe compatibility alias for non-dot file directory searches.")
 
 (defvar macher-agent--active-ptc-execution nil
   "Indicate whether a Programmatic Tool Calling Lisp script is active.
@@ -283,6 +315,15 @@ Return list of active preset or skill symbols, or nil.
 
 Side effects: Buffer-local variable.")
 
+(defvar-local macher-agent--cached-presets nil
+  "Store cached presets for current buffer prior to skill switching.
+
+Holds original `macher-agent-presets' list before `use_skill' was invoked.
+
+Return list of cached presets or nil.
+
+Side effects: Buffer-local variable.")
+
 (defvar-local macher-agent--suppress-patch nil
   "Flag to suppress interactive UI patch buffer generation.
 
@@ -316,6 +357,7 @@ Side effects: Buffer-local variable.")
 (put 'macher-agent-task-finished 'permanent-local t)
 (put 'macher-agent--task-result 'permanent-local t)
 (put 'macher-agent-presets 'permanent-local t)
+(put 'macher-agent--cached-presets 'permanent-local t)
 (put 'macher-agent--routing-stack 'permanent-local t)
 (put 'macher-agent--active-ptc-primitives 'permanent-local t)
 (put 'macher-agent--suppress-patch 'permanent-local t)
@@ -348,6 +390,30 @@ Side effects: None."
 
 ;;
 
+(defun macher-agent-get-cached-presets (&optional buffer)
+  "Return cached presets for BUFFER, defaulting to `current-buffer'.
+
+BUFFER is the buffer to inspect, defaulting to `current-buffer'.
+
+Return list of cached preset symbols, or nil.
+Side effects: None."
+  (let ((buf (or buffer (current-buffer))))
+    (when (buffer-live-p buf)
+      (buffer-local-value 'macher-agent--cached-presets buf))))
+
+(defun macher-agent-clear-cached-presets (&optional buffer)
+  "Clear cached presets in BUFFER, defaulting to `current-buffer'.
+
+BUFFER is the buffer to clear, defaulting to `current-buffer'.
+
+Return nil.
+Side effects: Deletes `macher-agent--cached-presets' buffer-local binding."
+  (let ((buf (or buffer (current-buffer))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (kill-local-variable 'macher-agent--cached-presets))))
+  nil)
+
 (defun macher-agent-ready-to-reap-p (&optional buffer)
   "Check whether BUFFER is ready to be reaped.
 
@@ -359,55 +425,35 @@ Side effects: None."
   (with-current-buffer (or buffer (current-buffer))
     (bound-and-true-p macher-agent--ready-to-reap)))
 
-(defun macher-agent--remove-active-subagent-registries (child-name child-buf)
-  "Remove CHILD-NAME and CHILD-BUF from subagent registries.
-Also remove CHILD-NAME from all parent ownership lists in
-`macher-agent--a2a-ownership'.
+(defun macher-agent--remove-active-subagent-registries (child-buf &optional _ignored)
+  "Clear registries strictly tied to CHILD-BUF object."
+  (let ((buf (if (bufferp child-buf) child-buf (if (bufferp _ignored) _ignored (get-buffer child-buf)))))
+    (cl-check-type buf buffer)
+    (let ((child-name (buffer-name buf)))
+      (when (boundp 'macher-agent-active-subagents)
+        (setq macher-agent-active-subagents
+              (cl-delete-if (lambda (entry) (equal (if (consp entry) (car entry) entry) child-name))
+                            macher-agent-active-subagents)))
+      (when (and (boundp 'macher-agent--a2a-ownership)
+                 (hash-table-p macher-agent--a2a-ownership))
+        (maphash
+         (lambda (key val)
+           (when (listp val)
+             (let ((new-val (cl-delete-if (lambda (entry)
+                                            (let ((k (if (consp entry) (car entry) entry)))
+                                              (equal k child-name)))
+                                          val)))
+               (if new-val
+                   (puthash key new-val macher-agent--a2a-ownership)
+                 (remhash key macher-agent--a2a-ownership)))))
+         macher-agent--a2a-ownership))
+      (when-let* ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
+        (when (fboundp 'macher-agent-workspace-active-subagents)
+          (let ((subs (macher-agent-workspace-active-subagents ctx)))
+            (macher-agent--set-workspace-active-subagents
+             ctx (cl-delete-if (lambda (entry) (equal (if (consp entry) (car entry) entry) child-name)) subs))))))))
 
-Return nil.
-Side effects: Updates `macher-agent-active-subagents', workspace
-active subagents, and `macher-agent--a2a-ownership'."
-  (when (boundp 'macher-agent-active-subagents)
-    (setq macher-agent-active-subagents
-          (cl-delete-if (lambda (entry)
-                          (let ((k (if (consp entry) (car entry) entry)))
-                            (or (and child-name (equal k child-name))
-                                (and child-buf (equal k child-buf))
-                                (and child-buf (buffer-live-p child-buf) (equal k (buffer-name child-buf))))))
-                        macher-agent-active-subagents)))
-  (when (and (boundp 'macher-agent--a2a-ownership)
-             (hash-table-p macher-agent--a2a-ownership))
-    (maphash
-     (lambda (key val)
-       (when (listp val)
-         (let ((new-val (cl-delete-if (lambda (entry)
-                                        (let ((k (if (consp entry) (car entry) entry)))
-                                          (or (and child-name (equal k child-name))
-                                              (and child-buf (equal k child-buf))
-                                              (and child-buf (buffer-live-p child-buf) (equal k (buffer-name child-buf))))))
-                                      val)))
-           (if new-val
-               (puthash key new-val macher-agent--a2a-ownership)
-             (remhash key macher-agent--a2a-ownership)))))
-     macher-agent--a2a-ownership))
-  (let* ((ctx (when (and child-buf (buffer-live-p child-buf))
-                (buffer-local-value 'macher-agent--persistent-context child-buf)))
-         (ws (when ctx
-               (macher-agent-context-workspace ctx))))
-    (when ws
-      (let ((subs (when (fboundp 'macher-agent-workspace-active-subagents)
-                    (funcall 'macher-agent-workspace-active-subagents ws))))
-        (when (and subs (fboundp 'macher-agent--set-workspace-active-subagents))
-          (funcall 'macher-agent--set-workspace-active-subagents
-                   ws
-                   (cl-delete-if (lambda (entry)
-                                   (let ((k (if (consp entry) (car entry) entry)))
-                                     (or (and child-name (equal k child-name))
-                                         (and child-buf (equal k child-buf))
-                                         (and child-buf (buffer-live-p child-buf) (equal k (buffer-name child-buf))))))
-                                 subs)))))))
-
-(defun macher-agent-ui-show (&optional buf)
+(defun macher-agent-ui-show (buf)
   "Display the user interface for buffer BUF.
 
 BUF is the optional buffer to display, defaulting to current buffer.
@@ -416,35 +462,54 @@ Return nil.
 
 Side effects: Opens or focuses user interface window, invoking
 `macher-agent-display-subagent-fn' when non-nil."
-  (let ((target-buf (or buf (current-buffer))))
-    (when macher-agent-display-subagent-fn
-      (funcall macher-agent-display-subagent-fn target-buf))))
+  (when macher-agent-display-subagent-fn
+    (funcall macher-agent-display-subagent-fn buf)))
+
+(defun macher-agent--push-routing (task-id originator-name &optional suppress-patch)
+  "Push a routing context frame onto `macher-agent--routing-stack'.
+
+TASK-ID is the task identifier string.
+ORIGINATOR-NAME is the buffer name string of the originating agent.
+SUPPRESS-PATCH is the optional patch suppression flag.
+
+Return the pushed frame plist.
+
+Side effects: Modifies buffer-local `macher-agent--routing-stack'."
+  (let ((frame (list :task-id task-id
+                     :originator-name originator-name
+                     :suppress-patch suppress-patch)))
+    (unless (boundp 'macher-agent--routing-stack)
+      (setq-local macher-agent--routing-stack nil))
+    (push frame macher-agent--routing-stack)
+    (setq-local macher-agent--current-task-id task-id)
+    (setq-local macher-agent--suppress-patch suppress-patch)
+    frame))
+
+(defun macher-agent--pop-routing ()
+  "Pop a routing context frame from `macher-agent--routing-stack'.
+Restores the previous routing frame's task-id and suppress-patch, or clears them.
+
+Return the popped frame plist, or nil if stack was empty.
+
+Side effects: Modifies buffer-local `macher-agent--routing-stack',
+`macher-agent--current-task-id', and `macher-agent--suppress-patch'."
+  (when (bound-and-true-p macher-agent--routing-stack)
+    (let ((frame (pop macher-agent--routing-stack)))
+      (if-let* ((prev (and (bound-and-true-p macher-agent--routing-stack)
+                           (car macher-agent--routing-stack))))
+          (progn
+            (setq-local macher-agent--current-task-id (plist-get prev :task-id))
+            (setq-local macher-agent--suppress-patch (plist-get prev :suppress-patch)))
+        (setq-local macher-agent--current-task-id nil)
+        (setq-local macher-agent--suppress-patch nil))
+      frame)))
 
 (defun macher-agent--plist-p (object)
-  "Return non-nil if OBJECT is a valid property list.
-
-OBJECT is the value to test.
-
-Return non-nil if OBJECT is a valid plist, otherwise nil."
-  (if (fboundp 'plistp)
-      (plistp object)
-    (and (listp object)
-         (let ((lst object)
-               (valid t))
-           (while (and valid (consp lst))
-             (if (not (consp (cdr lst)))
-                 (setq valid nil)
-               (setq lst (cddr lst))))
-           (and valid (null lst))))))
+  "Return t if OBJECT is a strictly formatted property list."
+  (and (listp object) (plistp object)))
 
 (defun macher-agent-valid-context-p (context)
-  "Determine whether CONTEXT is a valid persistent context structure.
-
-CONTEXT is the context object to validate.
-
-Return non-nil if CONTEXT is a `macher-agent-context', or nil otherwise.
-
-Side effects: None."
+  "Return t if CONTEXT is a strictly valid context structure."
   (macher-agent-context-p context))
 
 (defun set-macher-agent-context-prompt (ctx val)
@@ -460,39 +525,26 @@ Side effects: Sets the prompt slot on CTX."
   val)
 
 (defun macher-agent-context-workspace (ctx)
-  "Retrieve the tagged workspace structure from context CTX.
+  "Extract the workspace struct from CTX."
+  (cl-check-type ctx macher-agent-context)
+  (plist-get (macher-agent-context-plugins ctx) :workspace))
 
-CTX is the active `macher-agent-context' structure.
-
-Return cons cell `(project . path)', or nil.
-Side effects: None."
-  (when (macher-agent-context-p ctx)
-    (or (let ((plugins (macher-agent-context-plugins ctx)))
-          (when (macher-agent--plist-p plugins)
-            (let ((vfs (plist-get plugins :vfs)))
-              (or (when (macher-agent--plist-p vfs)
-                    (plist-get vfs :workspace))
-                  (plist-get plugins :workspace)))))
-        (when-let* ((root (macher-agent-context-project-root ctx)))
-          (cons 'project (expand-file-name (if (consp root) (cdr root) root)))))))
+(defun macher-agent-context-workspace-root (context)
+  "Extract canonical workspace root directory string from CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (let ((root (or (macher-agent-context-project-root context)
+                  (let ((ws (macher-agent-context-workspace context)))
+                    (cond
+                     ((consp ws) (if (stringp (cdr ws)) (cdr ws) (plist-get ws :project-root)))
+                     ((stringp ws) ws)
+                     (t nil))))))
+    (when (and root (stringp root))
+      (file-truename (expand-file-name root)))))
 
 (defun macher-agent-extract-workspace-id (input)
-  "Extract workspace identifier or project root from INPUT enforcing strict keys."
-  (cond
-   ((stringp input) input)
-   ((and (consp input) (eq (car input) 'project)) input)
-   ((and (consp input) (eq (car input) 'agent)) input)
-   ((and (recordp input) (fboundp 'macher-agent-workspace-p) (funcall 'macher-agent-workspace-p input)) input)
-   ((macher-agent--plist-p input)
-    (let* ((shared (plist-get input :shared-state))
-           (ws-id (plist-get input :workspace-id))
-           (ws (plist-get input :workspace))
-           (t-ws (plist-get input :target-workspace))
-           (proj (plist-get input :project))
-           (s-ws-id (when (macher-agent--plist-p shared) (plist-get shared :workspace-id)))
-           (s-ws (when (macher-agent--plist-p shared) (plist-get shared :workspace))))
-      (or ws-id ws t-ws proj s-ws-id s-ws)))
-   (t nil)))
+  "Extract the unique workspace ID from a pre-normalized INPUT list."
+  (cl-check-type input list)
+  (plist-get input :workspace-id))
 
 (defvar macher-agent-task-flush-hook nil
   "Hook run when an agent task flushes or completes its execution cycle.
@@ -500,16 +552,13 @@ Side effects: None."
 Functions in this hook are invoked to commit interaction memory, synchronise
 storage, and flush pending artifacts.")
 
-(defun macher-agent-run-task-flush-hook (&optional context)
-  "Safely invoke the flush hook, handling legacy 0-arg and new 1-arg functions."
-  (let ((ctx (when (macher-agent-valid-context-p context) context)))
-    (dolist (hook-fn (if (consp macher-agent-task-flush-hook)
-                         macher-agent-task-flush-hook
-                       (list macher-agent-task-flush-hook)))
-      (when (functionp hook-fn)
-        (condition-case nil
-            (if ctx (funcall hook-fn ctx) (funcall hook-fn nil))
-          (wrong-number-of-arguments (funcall hook-fn)))))))
+(defun macher-agent-run-task-flush-hook (context)
+  "Invoke the flush hook."
+  (dolist (hook-fn (if (consp macher-agent-task-flush-hook)
+                       macher-agent-task-flush-hook
+                     (list macher-agent-task-flush-hook)))
+    (when (functionp hook-fn)
+      (funcall hook-fn context))))
 
 (defvar macher-agent-pipeline-registry (make-hash-table :test 'equal)
   "Registry storing pipeline definitions and ordered steps.
@@ -517,56 +566,36 @@ storage, and flush pending artifacts.")
 Maps pipeline identifier symbols to a list of step specifications
 ordered strictly by ascending priority depth.")
 
-(defun macher-agent-register-pipeline-step (pipeline step priority)
-  "Register STEP function in PIPELINE at the specified PRIORITY depth.
-
-PIPELINE is the symbol or string identifying the target pipeline.
-STEP is the step function symbol or lambda to execute.
-PRIORITY is an integer defining the execution priority depth, where
-lower integer values indicate earlier execution in the pipeline sequence.
-
-Return the ordered list of registered step entries for PIPELINE.
-
-Side effects: Updates `macher-agent-pipeline-registry`."
-  (let* ((sym-key (if (symbolp pipeline) pipeline (intern (format "%s" pipeline))))
-         (current-entries (gethash sym-key macher-agent-pipeline-registry))
+(defun macher-agent-register-pipeline-step (pipeline-sym step-fn priority)
+  "Register STEP-FN in PIPELINE-SYM queue."
+  (cl-check-type pipeline-sym symbol)
+  (let* ((current-entries (gethash pipeline-sym macher-agent-pipeline-registry))
          (filtered (cl-remove-if (lambda (entry)
-                                   (equal (plist-get entry :step) step))
+                                   (or (equal (plist-get entry :step) step-fn)
+                                       (equal (plist-get entry :fn) step-fn)))
                                  current-entries))
-         (new-entry (list :step step :priority priority))
+         (new-entry (list :step step-fn :fn step-fn :priority priority))
          (updated (sort (cons new-entry filtered)
                         (lambda (a b)
                           (< (plist-get a :priority) (plist-get b :priority))))))
-    (puthash sym-key updated macher-agent-pipeline-registry)
+    (puthash pipeline-sym updated macher-agent-pipeline-registry)
     updated))
 
-(defun macher-agent-unregister-pipeline-step (pipeline step)
-  "Unregister STEP function from PIPELINE.
-
-PIPELINE is the symbol or string identifying the target pipeline.
-STEP is the step function symbol or lambda to remove.
-
-Return the updated list of registered step entries for PIPELINE.
-
-Side effects: Updates `macher-agent-pipeline-registry`."
-  (let* ((sym-key (if (symbolp pipeline) pipeline (intern (format "%s" pipeline))))
-         (current-entries (gethash sym-key macher-agent-pipeline-registry))
+(defun macher-agent-unregister-pipeline-step (pipeline-sym step-fn)
+  "Unregister STEP-FN from PIPELINE-SYM queue."
+  (cl-check-type pipeline-sym symbol)
+  (let* ((current-entries (gethash pipeline-sym macher-agent-pipeline-registry))
          (filtered (cl-remove-if (lambda (entry)
-                                   (equal (plist-get entry :step) step))
+                                   (or (equal (plist-get entry :step) step-fn)
+                                       (equal (plist-get entry :fn) step-fn)))
                                  current-entries)))
-    (puthash sym-key filtered macher-agent-pipeline-registry)
+    (puthash pipeline-sym filtered macher-agent-pipeline-registry)
     filtered))
 
-(defun macher-agent-get-pipeline-steps (pipeline)
-  "Retrieve the ordered list of step functions for PIPELINE.
-
-PIPELINE is the symbol or string identifying the pipeline.
-
-Return a list of step functions ordered strictly by priority depth.
-
-Side effects: None."
-  (let* ((sym-key (if (symbolp pipeline) pipeline (intern (format "%s" pipeline))))
-         (entries (gethash sym-key macher-agent-pipeline-registry)))
+(defun macher-agent-get-pipeline-steps (pipeline-sym)
+  "Retrieve sequence of functions for PIPELINE-SYM."
+  (cl-check-type pipeline-sym symbol)
+  (let ((entries (gethash pipeline-sym macher-agent-pipeline-registry)))
     (mapcar (lambda (entry) (plist-get entry :step)) entries)))
 
 (defun macher-agent-run-pipeline (pipeline-name initial-state)
@@ -588,132 +617,33 @@ Side effects: None."
   '(:root-to-subagent :subagent-to-parent :peer-to-peer :state-sync)
   "Authoritative list of allowed transit types in A2A messages.")
 
-(cl-defun macher-agent-make-a2a-payload (&key (schema-version macher-agent-a2a-schema-version)
-                                              (transit-type :root-to-subagent)
-                                              type
-                                              task-id
-                                              target
-                                              target-buffer
-                                              target-context
-                                              parent-context
-                                              child-context
-                                              shared-state
-                                              payload
-                                              message
-                                              metadata)
-  "Construct a validated `macher-agent-transit-payload' struct.
-
-SCHEMA-VERSION defaults to `:a2a-v1'.
-TRANSIT-TYPE must be one of `macher-agent-a2a-transit-types'.
-TARGET-CONTEXT, PARENT-CONTEXT, and CHILD-CONTEXT hold context structures.
-SHARED-STATE holds shared task metadata.
-PAYLOAD holds the message body or data.
-
-Return the constructed and validated `macher-agent-transit-payload' struct."
-  (cl-assert (memq transit-type macher-agent-a2a-transit-types)
-             nil "Invalid transit-type: %S (expected one of %S)" transit-type macher-agent-a2a-transit-types)
-  (make-macher-agent-transit-payload
-   :schema-version schema-version
-   :transit-type transit-type
-   :type type
-   :task-id task-id
-   :target-buffer (or target-buffer target)
-   :target-context target-context
-   :parent-context parent-context
-   :child-context child-context
-   :shared-state shared-state
-   :payload (or payload message)
-   :metadata metadata))
-
-(defun macher-agent-context-from-buffer (buffer)
-  "Extract the persistent `macher-agent-context' from BUFFER.
-
-BUFFER is the buffer object or buffer name string to inspect.
-
-Return the `macher-agent-context' structure stored in BUFFER's
-`macher-agent--persistent-context', or nil if BUFFER is invalid,
-not live, or context is unset.
-
-Side effects: None."
-  (let ((buf (if (bufferp buffer) buffer (and (stringp buffer) (get-buffer buffer)))))
+(defun macher-agent-context-from-buffer (buffer-or-name)
+  "Extract the context object strictly from a live buffer or string name."
+  (let ((buf (if (bufferp buffer-or-name) buffer-or-name (get-buffer buffer-or-name))))
     (when (and buf (buffer-live-p buf))
-      (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
-        (when (macher-agent-valid-context-p ctx)
-          ctx)))))
+      (buffer-local-value 'macher-agent--persistent-context buf))))
 
 (defun macher-agent-context-from-payload (payload)
-  "Extract the active `macher-agent-context' from PAYLOAD.
+  "Extract the active `macher-agent-context' from a transit PAYLOAD struct."
+  (cl-check-type payload macher-agent-transit-payload)
+  (or (macher-agent-transit-payload-target-context payload)
+      (macher-agent-transit-payload-parent-context payload)
+      (macher-agent-transit-payload-child-context payload)
+      (let ((shared (macher-agent-transit-payload-shared-state payload)))
+        (and (listp shared)
+             (or (plist-get shared :target-context)
+                 (plist-get shared :parent-context)
+                 (plist-get shared :child-context)
+                 (plist-get shared :context))))))
 
-PAYLOAD is a `macher-agent-transit-payload' structure or a `macher-agent-context' structure.
-
-Return the resolved `macher-agent-context' structure.
-Signals an error if PAYLOAD is invalid or no context can be resolved.
-
-Side effects: None."
-  (cond
-   ((macher-agent-valid-context-p payload)
-    payload)
-
-   ((macher-agent-transit-payload-p payload)
-    (or (let ((c (macher-agent-transit-payload-target-context payload)))
-          (when (macher-agent-valid-context-p c) c))
-        (let ((c (macher-agent-transit-payload-parent-context payload)))
-          (when (macher-agent-valid-context-p c) c))
-        (let ((c (macher-agent-transit-payload-child-context payload)))
-          (when (macher-agent-valid-context-p c) c))
-        (let ((shared (macher-agent-transit-payload-shared-state payload)))
-          (when (macher-agent--plist-p shared)
-            (or (let ((c (plist-get shared :target-context)))
-                  (when (macher-agent-valid-context-p c) c))
-                (let ((c (plist-get shared :parent-context)))
-                  (when (macher-agent-valid-context-p c) c))
-                (let ((c (plist-get shared :child-context)))
-                  (when (macher-agent-valid-context-p c) c))
-                (let ((c (plist-get shared :context)))
-                  (when (macher-agent-valid-context-p c) c)))))
-        (let* ((b-raw (macher-agent-transit-payload-target-buffer payload))
-               (buf (when b-raw (if (bufferp b-raw) b-raw (and (stringp b-raw) (get-buffer b-raw))))))
-          (when (and buf (buffer-live-p buf))
-            (let ((bctx (buffer-local-value 'macher-agent--persistent-context buf)))
-              (when (macher-agent-valid-context-p bctx) bctx))))
-        (error "Cannot resolve context from transit payload: %S" payload)))
-
-   (t
-    (error "Invalid transit payload: expected context or transit payload struct, got %S" payload))))
-
-(defun macher-agent-resolve-from-transit-payload (payload-or-state)
-  "Extract context from PAYLOAD-OR-STATE using transit keys.
-Reject invalid payloads with an error signal rather than falling
-back to nil silently."
-  (cond
-   ((and (macher-agent--plist-p payload-or-state)
-         (plist-member payload-or-state :resolved)
-         (plist-member payload-or-state :input))
-    (if (plist-get payload-or-state :resolved)
-        payload-or-state
-      (let* ((input (plist-get payload-or-state :input))
-             (ctx (when input
-                    (condition-case nil
-                        (macher-agent-context-from-payload input)
-                      (error nil)))))
-        (if (and ctx (macher-agent-valid-context-p ctx))
-            (plist-put payload-or-state :resolved ctx)
-          payload-or-state))))
-   (t
-    (macher-agent-context-from-payload payload-or-state))))
-
-(defun macher-agent-root (&optional path)
-  "Resolve absolute project root path from PATH.
-
-PATH is a directory or file path, defaulting to `default-directory`.
-
-Return the absolute project root path string."
-  (let* ((dir (if (stringp path) path default-directory))
-         (proj (and (fboundp 'project-current) (project-current nil dir))))
+(defun macher-agent-root (path)
+  "Return the canonical project root for a specific string PATH."
+  (cl-check-type path string)
+  (let ((proj (and (fboundp 'project-current) (project-current nil path))))
     (expand-file-name
      (or (and proj (if (fboundp 'project-root) (project-root proj) (cdr proj)))
-         (and (fboundp 'vc-root-dir) (let ((default-directory dir)) (vc-root-dir)))
-         dir))))
+         (and (fboundp 'vc-root-dir) (let ((default-directory path)) (vc-root-dir)))
+         path))))
 
 (defun macher-tool-valid-p (tool)
   "Validate whether TOOL is a valid gptel tool structure.
@@ -727,12 +657,7 @@ Side effects: None."
 
 (defun macher-agent--extract-raw-tool-name (tool)
   "Extract raw name representation from TOOL structure or list.
-
-TOOL is a string, symbol, plist, or gptel tool structure.
-
-Return the raw tool name representation or TOOL unchanged if unrecognised.
-
-Side effects: None."
+This acts as the boundary normaliser for raw YAML tool specifications."
   (cond
    ((stringp tool) tool)
    ((and (fboundp 'gptel-tool-p) (gptel-tool-p tool))
@@ -811,28 +736,9 @@ Return the buffer object, or nil if not found."
    (t nil)))
 
 (defun macher-agent--get-context-root (context)
-  "Retrieve the project root directory string from CONTEXT.
-
-CONTEXT is the active context structure or workspace.
-
-Return the project root path string."
-  (or (cond
-       ((null context) nil)
-       ((stringp context) (file-truename (expand-file-name context)))
-       ((and (consp context) (memq (car context) '(project agent directory)))
-        (let ((path (cdr context)))
-          (when (stringp path) (file-truename (expand-file-name path)))))
-       ((macher-agent-context-p context)
-        (or (let ((r (macher-agent-context-project-root context)))
-              (when (and r (stringp r))
-                (file-truename (expand-file-name r))))
-            (when-let* ((ws (macher-agent-context-workspace context)))
-              (let ((proj-root (macher-agent-workspace-project-root ws)))
-                (when (stringp proj-root) (file-truename (expand-file-name proj-root)))))))
-       ((consp context)
-        (let ((proj-root (macher-agent-workspace-project-root context)))
-          (when (stringp proj-root) (file-truename (expand-file-name proj-root))))))
-      (file-truename default-directory)))
+  "Extract root explicitly from a CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (macher-agent-context-root context))
 
 (defun macher-agent--get-name (workspace)
   "Get a display name for WORKSPACE.
@@ -843,7 +749,10 @@ This satisfies the upstream `macher-workspace-types-alist' interface."
                  (macher-agent-context-project-root workspace))
                 ((macher-agent-context-p workspace)
                  (macher-agent-context-root workspace))
-                (t (macher-agent-workspace-project-root workspace))))
+                (t (when (fboundp 'macher-agent-workspace-project-root)
+                     (condition-case nil
+                         (macher-agent-workspace-project-root workspace)
+                       (error nil))))))
          (name (when (and root (stringp root) (not (string-empty-p root)))
                  (file-name-nondirectory (directory-file-name root)))))
     (if (and name (not (string-empty-p name)))
@@ -851,84 +760,28 @@ This satisfies the upstream `macher-workspace-types-alist' interface."
       "Agent: Workspace")))
 
 (defun macher-agent-workspace-project-root (ws)
-  "Retrieve the project root directory string from workspace WS."
-  (cond
-   ((null ws) nil)
-   ((stringp ws) (file-truename (expand-file-name ws)))
-   ((macher-agent-context-p ws)
-    (or (let ((r (macher-agent-context-project-root ws)))
-          (when (and r (stringp r))
-            (file-truename (expand-file-name r))))
-        (when-let* ((inner-ws (macher-agent-context-workspace ws)))
-          (macher-agent-workspace-project-root inner-ws))))
-   ((and (consp ws) (memq (car ws) '(project agent directory)))
-    (let ((path (cdr ws)))
-      (cond
-       ((stringp path) (file-truename (expand-file-name path)))
-       ((null path) nil)
-       ((and (fboundp 'project-root) (consp path))
-        (or (condition-case nil
-                (let ((r (project-root path)))
-                  (and r (file-truename (expand-file-name r))))
-              (error nil))
-            (macher-agent-workspace-project-root path)))
-       (t (macher-agent-workspace-project-root path)))))
-   ((and (consp ws) (consp (car ws)) (memq (caar ws) '(project agent directory)))
-    (let ((path (cdar ws)))
-      (cond
-       ((stringp path) (file-truename (expand-file-name path)))
-       ((null path) nil)
-       ((and (fboundp 'project-root) (consp path))
-        (or (condition-case nil
-                (let ((r (project-root path)))
-                  (and r (file-truename (expand-file-name r))))
-              (error nil))
-            (macher-agent-workspace-project-root path)))
-       (t (macher-agent-workspace-project-root path)))))
-   ((and (fboundp 'project-root) (not (and (consp ws) (memq (car ws) '(project agent directory)))))
-    (or (condition-case nil
-            (let ((r (project-root ws)))
-              (and r (file-truename (expand-file-name r))))
-          (error nil))
-        (condition-case nil
-            (and (consp ws)
-                 (let ((r (project-root (car ws))))
-                   (and r (file-truename (expand-file-name r)))))
-          (error nil))
-        (condition-case nil
-            (and (consp ws) (fboundp 'project-current)
-                 (let ((p (project-current nil (car ws))))
-                   (and p (let ((r (project-root p)))
-                            (and r (file-truename (expand-file-name r)))))))
-          (error nil))
-        (when (consp ws)
-          (or (macher-agent-workspace-project-root (car ws))
-              (let ((path (cdr ws)))
-                (if (stringp path)
-                    (file-truename (expand-file-name path))
-                  (macher-agent-workspace-project-root path)))))))
-   (t (when (consp ws)
-        (or (when (and (fboundp 'project-current) (fboundp 'project-root) (car ws))
-              (condition-case nil
-                  (let ((p (project-current nil (car ws))))
-                    (and p (let ((r (project-root p)))
-                             (and r (file-truename (expand-file-name r))))))
-                (error nil)))
-            (macher-agent-workspace-project-root (car ws))
-            (let ((path (cdr ws)))
-              (if (stringp path)
-                  (file-truename (expand-file-name path))
-                (macher-agent-workspace-project-root path))))))))
+  "Extract the absolute project root from WS struct."
+  (cl-check-type ws macher-agent-context)
+  (macher-agent-context-project-root ws))
+
+(defun macher-agent--set-workspace-project-root (workspace path)
+  "Update the absolute project root in WORKSPACE struct."
+  (cl-check-type workspace macher-agent-context)
+  (setf (macher-agent-context-project-root workspace) path))
+
+(gv-define-setter macher-agent-workspace-project-root (val ws)
+  `(macher-agent--set-workspace-project-root ,ws ,val))
 
 (defun macher-agent-context-root (context)
-  "Safely resolve the project root for CONTEXT across diverse context types."
-  (or (when-let* ((ws (when (macher-agent-context-p context)
-                        (macher-agent-context-workspace context))))
-        (macher-agent-workspace-project-root ws))
-      (macher-agent--get-context-root context)))
+  "Extract root explicitly from CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (macher-agent-context-project-root context))
 
-(defun macher-agent-search-glob (query orig-buf &optional ctx-lines)
-  "Search for QUERY in ORIG-BUF matching CTX-LINES."
+(defun macher-agent-search-glob (orig-buf query &optional ctx-lines)
+  "Execute search QUERY against live ORIG-BUF."
+  (when (and (bufferp query) (stringp orig-buf))
+    (cl-rotatef orig-buf query))
+  (cl-check-type orig-buf buffer)
   (let ((ctx-lines (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
         (results nil)
         (invalid-re nil))
@@ -975,100 +828,31 @@ This satisfies the upstream `macher-workspace-types-alist' interface."
         "Error: Cannot locate original conversation buffer."
       (if macher-agent-search-backend-function
           (funcall macher-agent-search-backend-function query buf context-lines)
-        (macher-agent-search-glob query buf context-lines)))))
+        (macher-agent-search-glob buf query context-lines)))))
 
 (defun macher-agent--get-context-contents (ctx)
-  "Safely retrieve contents list from CTX, delegating to VFS plugin if active."
-  (when (macher-agent-context-p ctx)
-    (if (fboundp 'macher-agent-vfs--get-state)
-        (let ((state (macher-agent-vfs--get-state ctx)))
-          (if state
-              (plist-get state :contents)
-            (let ((plugins (macher-agent-context-plugins ctx)))
-              (when (macher-agent--plist-p plugins)
-                (plist-get plugins :contents)))))
-      (let ((plugins (macher-agent-context-plugins ctx)))
-        (when (macher-agent--plist-p plugins)
-          (plist-get plugins :contents))))))
+  "Extract file contents strictly from CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (plist-get (macher-agent-vfs--get-state ctx) :contents))
 
 (defun macher-agent--set-context-contents (ctx val)
-  "Safely set contents list on CTX to VAL, delegating to VFS plugin if active.
-Automatically coerces raw strings, property lists, and legacy formats
-into strictly typed structs with relativised paths."
-  (when (macher-agent-context-p ctx)
-    (let* ((root (or (macher-agent-context-root ctx)
-                     default-directory))
-           (coerced-val
-            (when (listp val)
-              (mapcar
-               (lambda (item)
-                 (cond
-                  ((macher-agent-vfs-entry-p item) item)
-                  ((stringp item)
-                   (make-macher-agent-vfs-entry
-                    :path (if (fboundp 'macher-agent-to-relative-path)
-                              (macher-agent-to-relative-path item root)
-                            item)
-                    :orig nil :curr nil))
-                  ((and (listp item) (keywordp (car item)))
-                   (let* ((raw-path (or (plist-get item :path) (plist-get item :file)))
-                          (path (if (and (stringp raw-path) (fboundp 'macher-agent-to-relative-path))
-                                    (macher-agent-to-relative-path raw-path root)
-                                  raw-path))
-                          (orig (plist-get item :orig))
-                          (curr (or (plist-get item :curr) (plist-get item :content) (plist-get item :contents))))
-                     (make-macher-agent-vfs-entry :path path :orig orig :curr curr)))
-                  ((and (consp item) (consp (car item)))
-                   (let* ((raw-path (or (cdr (assq 'path item)) (cdr (assq 'file item))))
-                          (path (if (and (stringp raw-path) (fboundp 'macher-agent-to-relative-path))
-                                    (macher-agent-to-relative-path raw-path root)
-                                  raw-path))
-                          (orig (cdr (assq 'orig item)))
-                          (curr (or (cdr (assq 'curr item)) (cdr (assq 'content item)) (cdr (assq 'contents item)))))
-                     (make-macher-agent-vfs-entry :path path :orig orig :curr curr)))
-                  ((consp item)
-                   (let* ((raw-path (car item))
-                          (path (if (and (stringp raw-path) (fboundp 'macher-agent-to-relative-path))
-                                    (macher-agent-to-relative-path raw-path root)
-                                  raw-path))
-                          (rest (cdr item)))
-                     (if (consp rest)
-                         (make-macher-agent-vfs-entry :path path :orig (car rest) :curr (cdr rest))
-                       (make-macher-agent-vfs-entry :path path :orig nil :curr rest))))
-                  (t item)))
-               val))))
-      (if (fboundp 'macher-agent-vfs--get-state)
-          (let ((state (or (macher-agent-vfs--get-state ctx) (list :contents nil :dirty-p nil))))
-            (macher-agent-vfs--set-state ctx (plist-put state :contents coerced-val)))
-        (let* ((plugins (macher-agent-context-plugins ctx))
-               (updated (plist-put (copy-sequence plugins) :contents coerced-val)))
-          (setf (macher-agent-context-plugins ctx) updated)))
-      coerced-val)))
+  "Set file contents strictly on CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (cl-check-type val list)
+  (let ((state (macher-agent-vfs--get-state ctx)))
+    (macher-agent-vfs--set-state ctx (plist-put state :contents val))))
 
 (defun macher-agent--get-context-dirty-p (ctx)
-  "Safely retrieve dirty flag from CTX, delegating to VFS plugin if active."
-  (when (macher-agent-context-p ctx)
-    (if (fboundp 'macher-agent-vfs--get-state)
-        (let ((state (macher-agent-vfs--get-state ctx)))
-          (if state
-              (plist-get state :dirty-p)
-            (let ((plugins (macher-agent-context-plugins ctx)))
-              (when (macher-agent--plist-p plugins)
-                (plist-get plugins :dirty-p)))))
-      (let ((plugins (macher-agent-context-plugins ctx)))
-        (when (macher-agent--plist-p plugins)
-          (plist-get plugins :dirty-p))))))
+  "Check dirty flag strictly on CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (or (plist-get (macher-agent-vfs--get-state ctx) :dirty)
+      (plist-get (macher-agent-vfs--get-state ctx) :dirty-p)))
 
-(defun macher-agent--set-context-dirty-p (ctx val)
-  "Safely set dirty flag on CTX to VAL, delegating to VFS plugin if active."
-  (when (macher-agent-context-p ctx)
-    (if (fboundp 'macher-agent-vfs--get-state)
-        (let ((state (or (macher-agent-vfs--get-state ctx) (list :contents nil :dirty-p nil))))
-          (macher-agent-vfs--set-state ctx (plist-put state :dirty-p val)))
-      (let* ((plugins (macher-agent-context-plugins ctx))
-             (updated (plist-put (copy-sequence plugins) :dirty-p val)))
-        (setf (macher-agent-context-plugins ctx) updated)))
-    val))
+(defun macher-agent--set-context-dirty-p (ctx is-dirty)
+  "Set dirty flag strictly on CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (let ((state (macher-agent-vfs--get-state ctx)))
+    (macher-agent-vfs--set-state ctx (plist-put (plist-put state :dirty is-dirty) :dirty-p is-dirty))))
 
 (provide 'macher-agent-core)
 ;;; macher-agent-core.el ends here

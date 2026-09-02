@@ -4,7 +4,7 @@ https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 
 The `macher-agent` package provides an Emacs-native artificial intelligence agent harness. It integrates deeply with `gptel` and `macher` to enable autonomous, multi-agent workflows directly within Emacs buffers.
 
-The architecture operates entirely inside native Emacs buffers rather than external terminal interfaces. Tools and subagents operate as sentinels within dedicated buffers. Subagents coordinate through direct Emacs Lisp callbacks for point-to-point communication. Programmatic tool calling runs within a secure Emacs Lisp sandbox, allowing agents to chain operations and transform data in a single turn. The `macher-agent-make-tool` constructor returns structured data first and presentation second, using Emacs as an extensible multiplexing environment.
+The architecture operates entirely inside native Emacs buffers rather than external terminal interfaces. Tools and subagents operate as sentinels within dedicated buffers. Subagents coordinate through direct Emacs Lisp callbacks for point-to-point communication. Programmatic tool calling runs within a secure Emacs Lisp sandbox, allowing agents to chain operations and transform data in a single turn. Tools use `gptel-make-tool` and `macher-agent-with-presentation-context`, returning structured data first and presentation second, using Emacs as an extensible multiplexing environment.
 
 ## Subagent approach
 
@@ -23,11 +23,11 @@ The package integrates with `gptel` across several core boundaries:
 
 The package extends `macher` to provide workspace-level isolation and Virtual File System capabilities:
 
--  `macher` context perstets until invalidated (clear, merge or fail-fast out of band modeification)
+- `macher` context persists until invalidated (clear, merge, or fail-fast out-of-band modification).
 - `macher` tools are wrapped to inject a persistent context. This prevents tool calls from executing against unhydrated contexts and ensures disk-based operations operate on in-memory buffers.
 - File modifications and buffer edits stage directly in the Virtual File System context. Diffs are generated separately for buffer changes and file modifications, presenting unified diffs for user review before committing changes.
 - Active workspaces and persistent contexts register in `macher-agent-active-workspaces` by project root. Subagents receive isolated child contexts that merge back into the orchestrator context upon task submission.
--The tool `search_in_workspace` uses direct file system traversal to ensure consistent performance and avoid garbage collection bottlenecks on large workspaces.
+- The tool `search_in_workspace` uses direct file system traversal to ensure consistent performance and avoid garbage collection bottlenecks on large workspaces.
 
 ## Plug-in model and pipeline registry
 
@@ -82,40 +82,27 @@ Use `macher-agent-register-pipeline-step` to attach custom logic to a pipeline. 
 
 ### Lifecycle hooks
 
-The framework provides event hooks to monitor, gate, and audit tool execution and workspace changes:
+The framework provides event hooks to monitor task flushes and workspace changes:
 
-- `macher-agent-pre-tool-use-hook`: Runs immediately before any tool executes, receiving the tool symbol and argument property list.
-- `macher-agent-permission-request-hook`: Evaluates tool execution permissions. Hook functions receive the tool symbol and argument property list, returning `t` to permit execution or `nil` to deny.
-- `macher-agent-post-tool-use-hook`: Runs after successful tool execution, receiving the tool symbol, arguments, and the result string.
-- `macher-agent-post-tool-use-failure-hook`: Runs when tool execution fails, receiving the tool symbol, arguments, and error data.
 - `macher-agent-task-flush-hook`: Runs when a task completes and flushes context data.
 - `macher-agent-vfs-flush-hook`: Runs after the Virtual File System processes file and buffer modifications.
 - `macher-agent-context-mutated-hook`: Runs whenever the Virtual File System context is modified.
 
 ```elisp
-;; Example: Interactive permission gate for destructive tools
-(defun my-permission-gate (tool-name payload)
-  "Prompt the user before executing destructive workspace operations."
-  (if (memq tool-name '(write_file_in_workspace delete_file_in_workspace))
-      (let ((path (plist-get payload :path)))
-        (y-or-n-p (format "Permit agent to execute '%s' on '%s'? " tool-name path)))
-    t))
+;; Example: Hook into task flushes to log completed interactions
+(defun my-task-flush-logger (context)
+  "Log task flush events for CONTEXT."
+  (let ((root (and context (macher-agent-context-project-root context))))
+    (message "Task completed for workspace: %s" root)))
 
-(add-hook 'macher-agent-permission-request-hook #'my-permission-gate)
+(add-hook 'macher-agent-task-flush-hook #'my-task-flush-logger)
 
-;; Example: Audit logging for completed tool executions
-(defun my-tool-audit-logger (tool-name payload output)
-  "Log tool execution details to an audit buffer."
-  (let ((log-buffer (get-buffer-create "*macher-agent-audit*")))
-    (with-current-buffer log-buffer
-      (goto-char (point-max))
-      (insert (format "[%s] TOOL: %s | ARGS: %S | RESULT SIZE: %d chars\n"
-                      (format-time-string "%Y-%m-%d %H:%M:%S")
-                      tool-name
-                      payload
-                      (length output))))))
+;; Example: Listen for Virtual File System mutations
+(defun my-vfs-mutation-listener (path)
+  "React to changes staged at PATH."
+  (message "Workspace path modified in VFS: %s" path))
 
-(add-hook 'macher-agent-post-tool-use-hook #'my-tool-audit-logger)
+(add-hook 'macher-agent-context-mutated-hook #'my-vfs-mutation-listener)
 ```
 
 ## Agent-to-agent communication
@@ -126,15 +113,15 @@ Agents interact through point-to-point Agent-to-Agent (A2A) payloads and callbac
 | --- | --- | --- | --- |
 | `delegate_tasks_to_subagents` | Dispatches tasks synchronously to worker agents and aggregates responses | Direct message dispatch | Merges child diffs upon task submission |
 | `execute_subagents` | Dispatches fire-and-forget background tasks in parallel | Asynchronous dispatch | Staged in child context |
-| `submit_task_result` | Submits completed task output back to the originating caller | Artifact update | Merges Virtual File System diffs |
+| `submit_task_result` | Submits completed task output back to the originating caller | Artefact update | Merges Virtual File System diffs |
 | `spawn_subagent` | Creates a named subagent buffer configured with specific skill presets | Lifecycle initialisation | Clones parent context |
 | `send_message` | Sends an asynchronous message to a resident specialist bot buffer | Direct point-to-point message | Transmits instructions directly |
 | `wait_for_message` | Suspends a resident specialist bot until an incoming message arrives | Event suspension | Merges VFS from sender |
-| `wait_for_vfs_semaphore` | Blocks execution until a Virtual File System resource lock is acquired | Point-to-point lock | Synchronises targeted resource path |
+| `wait_for_vfs_semaphore` | Suspends execution until a Virtual File System resource is created or modified | Change notification listener | Synchronises targeted resource path |
 
 ## Examples
 
-### Macher Agent Zero-Mem benchmarks (100,000 tokens)
+### Zero-Mem benchmarks (100,000 tokens)
 
 Memory recall beyond the `macher-agent-max-context-chars` boundary operates through the `search_conversation_history` tool, to provide a continuous memory. Subagents are also able to access the memory of the originating context using `search_parent_conversation_history`.
 
@@ -204,7 +191,7 @@ Each subagent operates on a discrete Virtual File System context within the work
 
 Ensure the following utilities and packages are available:
 
-- Emacs 29.1 or higher
+- Emacs 30.1 or higher
 - `gptel` and `macher`
 - Git
 - Rsync
@@ -218,12 +205,12 @@ Install and configure `macher-agent` using `use-package`:
   :vc (:url "https://github.com/elij/macher-agent/")
   :ensure t
   :after (gptel macher)
+  :hook (gptel-mode . macher-agent-mode)
   :config
   (require 'macher-agent-vfs)      ;; Enable Virtual File System
   (require 'macher-agent-sandbox)  ;; Enable Programmatic Tool Calling
   (require 'macher-agent-zero-mem) ;; Enable dual-ledger conversation memory
-  (macher-agent-install)
-  (add-hook 'gptel-mode-hook #'macher-agent-mode))
+  (macher-agent-install))
 ```
 
 ## Getting started

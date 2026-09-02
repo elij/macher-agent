@@ -34,69 +34,47 @@ Functions in this hook receive the active `macher-agent-context' struct.")
 ;;; VFS Envelope State Accessors
 
 (defun macher-agent-vfs--get-state (ctx)
-  "Retrieve VFS state plist from CTX."
-  (when (macher-agent-context-p ctx)
-    (let ((plugins (macher-agent-context-plugins ctx)))
-      (when (macher-agent--plist-p plugins)
-        (plist-get plugins :vfs)))))
+  "Extract current VFS hierarchy state strictly from CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (plist-get (macher-agent-context-plugins ctx) :vfs))
 
 (defun macher-agent-vfs--set-state (ctx state)
-  "Set VFS STATE plist on CTX."
-  (when (macher-agent-context-p ctx)
-    (let ((plugins (macher-agent-context-plugins ctx)))
-      (setf (macher-agent-context-plugins ctx)
-            (plist-put (copy-sequence plugins) :vfs state))
-      state)))
+  "Update VFS hierarchy STATE strictly within CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (setf (macher-agent-context-plugins ctx)
+        (plist-put (copy-sequence (macher-agent-context-plugins ctx)) :vfs state)))
 
 (defun macher-agent-context-shadow-buffers (ctx)
-  "Safely retrieve shadow buffers list from CTX natively."
-  (when (macher-agent-context-p ctx)
-    (let ((state (macher-agent-vfs--get-state ctx))
-          (plugins (macher-agent-context-plugins ctx)))
-      (cond
-       ((and state (plist-member state :shadow-buffers))
-        (plist-get state :shadow-buffers))
-       ((and (macher-agent--plist-p plugins) (plist-member plugins :shadow-buffers))
-        (plist-get plugins :shadow-buffers))
-       (t nil)))))
+  "Retrieve active shadow mapping strictly from CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (or (plist-get (macher-agent-vfs--get-state ctx) :shadows)
+      (plist-get (macher-agent-vfs--get-state ctx) :shadow-buffers)))
 
-(defun macher-agent--set-context-shadow-buffers (ctx val)
-  "Safely set shadow buffers list on CTX to VAL natively."
-  (when (macher-agent-context-p ctx)
-    (let ((state (macher-agent-vfs--get-state ctx)))
-      (macher-agent-vfs--set-state ctx (plist-put state :shadow-buffers val))
-      val)))
+(defun macher-agent--set-context-shadow-buffers (ctx shadows)
+  "Bind SHADOWS map strictly to CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (let ((state (macher-agent-vfs--get-state ctx)))
+    (macher-agent-vfs--set-state ctx (plist-put (plist-put state :shadows shadows) :shadow-buffers shadows))))
 
 (defun macher-agent-vfs--get-origin-buffer (ctx)
-  "Retrieve origin buffer from CTX."
-  (when (macher-agent-context-p ctx)
-    (let ((state (macher-agent-vfs--get-state ctx))
-          (plugins (macher-agent-context-plugins ctx)))
-      (or (when state (plist-get state :origin-buffer))
-          (macher-agent-context-origin-buffer ctx)
-          (when (macher-agent--plist-p plugins)
-            (or (plist-get plugins :origin-buffer)
-                (plist-get plugins :buffer)))))))
+  "Retrieve root orchestrator buffer exclusively from CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (or (plist-get (macher-agent-context-plugins ctx) :origin-buffer)
+      (plist-get (macher-agent-vfs--get-state ctx) :origin-buffer)))
 
 ;;; Concurrency Locks
 
-(defun macher-agent-vfs-release-lock (path &optional task-id)
-  "Release VFS lock on PATH held by TASK-ID.
-If there are waiting requesters in the queue, transfer the lock to the next
-requester and notify their callback.
-
-PATH is the locked resource path string.
-TASK-ID is the optional identifier of the task holding the lock.
-
-Return non-nil if lock was released or transferred, otherwise nil."
-  (cl-assert (stringp path) nil "PATH must be a string, got: %S" path)
-  (let* ((lock-state (gethash path macher-agent--vfs-lock-table))
-         (current-owner (car-safe lock-state))
+(defun macher-agent-vfs-release-lock (path &optional lock-state-or-task-id current-owner)
+  "Relinquish VFS lock bound explicitly to PATH string."
+  (cl-check-type path string)
+  (let* ((task-id (or current-owner lock-state-or-task-id))
+         (lock-state (if (consp lock-state-or-task-id) lock-state-or-task-id (gethash path macher-agent--vfs-lock-table)))
+         (actual-owner (or (car-safe lock-state) task-id))
          (ref-count (or (cdr-safe lock-state) 0)))
-    (when (and lock-state (equal current-owner task-id))
+    (when (and lock-state (or (null task-id) (equal actual-owner task-id)))
       (if (> ref-count 1)
           (progn
-            (puthash path (cons current-owner (1- ref-count)) macher-agent--vfs-lock-table)
+            (puthash path (cons actual-owner (1- ref-count)) macher-agent--vfs-lock-table)
             t)
         (let ((queue (gethash path macher-agent--vfs-lock-queues nil)))
           (if (and queue (consp queue))
@@ -120,9 +98,15 @@ Return non-nil if lock was released or transferred, otherwise nil."
     (cond
      ((eq type 'ACQUIRE_LOCK)
       (let* ((meta (plist-get payload :metadata))
-             (path (or (plist-get meta :resource_path) (plist-get payload :resource-path)))
+             (path (or (when meta (or (plist-get meta :resource_path)
+                                      (plist-get meta :resource-path)
+                                      (plist-get meta :path)))
+                       (plist-get payload :resource_path)
+                       (plist-get payload :resource-path)
+                       (plist-get payload :path)))
              (task-id (or (plist-get payload :task-id) (macher-agent--generate-uuid)))
-             (cb (or (plist-get payload :callback)
+             (explicit-cb (plist-get payload :callback))
+             (cb (or explicit-cb
                      (when path (gethash path macher-agent--pending-callbacks)))))
         (when path
           (let* ((lock-state (gethash path macher-agent--vfs-lock-table))
@@ -131,45 +115,49 @@ Return non-nil if lock was released or transferred, otherwise nil."
             (if (or (null lock-state) (equal current-owner task-id))
                 (progn
                   (puthash path (cons task-id (1+ ref-count)) macher-agent--vfs-lock-table)
-                  (when cb
-                    (remhash path macher-agent--pending-callbacks)
+                  (when (and cb (not (eq cb #'ignore)))
+                    (unless explicit-cb
+                      (remhash path macher-agent--pending-callbacks))
                     (funcall cb "Resource lock acquired.")))
               (if cb
                   (progn
-                    (remhash path macher-agent--pending-callbacks)
+                    (unless explicit-cb
+                      (remhash path macher-agent--pending-callbacks))
                     (let ((queue (gethash path macher-agent--vfs-lock-queues nil)))
                       (puthash path (append queue (list (cons task-id cb))) macher-agent--vfs-lock-queues)))
                 (display-warning 'macher-agent (format "Resource '%s' is locked." path) :warning)))))))
      ((eq type 'RELEASE_LOCK)
       (let* ((meta (plist-get payload :metadata))
-             (path (or (plist-get meta :resource_path) (plist-get payload :resource-path)))
+             (path (or (when meta (or (plist-get meta :resource_path)
+                                      (plist-get meta :resource-path)
+                                      (plist-get meta :path)))
+                       (plist-get payload :resource_path)
+                       (plist-get payload :resource-path)
+                       (plist-get payload :path)))
              (task-id (plist-get payload :task-id)))
         (when path (macher-agent-vfs-release-lock path task-id)))))))
 
-(defun macher-agent-vfs-write (vfs-buffers-ht mtime-tracker-ht file-path content)
-  "Write CONTENT to FILE-PATH in VFS with safe concurrency checking."
-  (let* ((expanded-path (if (stringp file-path) (expand-file-name file-path) file-path))
-         (original-mtime (when (and mtime-tracker-ht (hash-table-p mtime-tracker-ht))
-                           (or (gethash file-path mtime-tracker-ht)
-                               (and (stringp file-path)
-                                    (gethash expanded-path mtime-tracker-ht)))))
-         (current-attrs (and (stringp file-path) (file-attributes expanded-path)))
+(defun macher-agent-vfs-write (file-path content mtime-tracker-ht &optional vfs-buffers-ht)
+  "Write CONTENT string explicitly to FILE-PATH and log to tracked tables."
+  (cl-check-type file-path string)
+  (cl-check-type content string)
+  (cl-check-type mtime-tracker-ht hash-table)
+  (when vfs-buffers-ht
+    (cl-check-type vfs-buffers-ht hash-table))
+  (let* ((expanded-path (expand-file-name file-path))
+         (original-mtime (or (gethash file-path mtime-tracker-ht)
+                             (gethash expanded-path mtime-tracker-ht)))
+         (current-attrs (file-attributes expanded-path))
          (current-mtime (when current-attrs (nth 5 current-attrs))))
-
     (when (and original-mtime current-mtime (not (time-equal-p original-mtime current-mtime)))
       (display-warning 'macher-agent
                        (format "Your previous edits to %s were discarded due to external file modifications.  Please re-read and re-apply"
                                (file-name-nondirectory file-path))
                        :warning))
-
-    (when (and mtime-tracker-ht (hash-table-p mtime-tracker-ht))
-      (puthash file-path current-mtime mtime-tracker-ht)
-      (when (stringp file-path)
-        (puthash expanded-path current-mtime mtime-tracker-ht)))
-
-    (when (and vfs-buffers-ht (hash-table-p vfs-buffers-ht))
+    (puthash file-path current-mtime mtime-tracker-ht)
+    (puthash expanded-path current-mtime mtime-tracker-ht)
+    (when vfs-buffers-ht
       (puthash file-path content vfs-buffers-ht))
-
     content))
 
 (defun macher-agent-vfs-make-entry (path orig curr)
@@ -193,79 +181,44 @@ Return non-nil if modified, otherwise nil."
     (not (equal orig curr))))
 
 (defun macher-agent-media-file-p (path)
-  "Return non-nil if PATH represents a media file.
+  "Identify if specific PATH string represents active media."
+  (cl-check-type path string)
+  (let ((mime (and (fboundp 'mailcap-file-name-to-mime-type)
+                   (mailcap-file-name-to-mime-type path))))
+    (or (and mime (or (string-prefix-p "image/" mime)
+                      (string-prefix-p "video/" mime)
+                      (string-prefix-p "audio/" mime)))
+        (string-match-p
+         "\\.\\(png\\|jpe?g\\|gif\\|webp\\|svg\\|pdf\\|mp4\\|mov\\|mp3\\|wav\\)$" path))))
 
-PATH is the file path string to check.
+(defun macher-agent-to-relative-path (path &optional root)
+  "Construct relative offset explicitly for PATH string."
+  (cl-check-type path string)
+  (let* ((ws-root (file-name-as-directory
+                   (file-truename (expand-file-name (or root default-directory)))))
+         (truename (file-truename (expand-file-name path ws-root))))
+    (file-relative-name truename ws-root)))
 
-Return non-nil if it is a media file, otherwise nil."
-  (and (stringp path)
-       (let ((mime (and (fboundp 'mailcap-file-name-to-mime-type)
-                        (mailcap-file-name-to-mime-type path))))
-         (or (and mime (or (string-prefix-p "image/" mime)
-                           (string-prefix-p "video/" mime)
-                           (string-prefix-p "audio/" mime)))
-             (string-match-p
-              "\\.\\(png\\|jpe?g\\|gif\\|webp\\|svg\\|pdf\\|mp4\\|mov\\|mp3\\|wav\\)$" path)))))
-
-(defun macher-agent-to-relative-path (path &optional workspace-root)
-  "Convert PATH to a relative path string within WORKSPACE-ROOT.
-Canonicalises symlinks so that paths like /private/tmp and /tmp align.
-Pure, non-file-backed buffers are identified via SSOT and returned untouched.
-
-PATH is the file path string.
-WORKSPACE-ROOT is the root directory string.
-
-Return the relative path string, or PATH if PATH is not a string."
-  (if-let* (((stringp path))
-            ((not (eq (macher-agent--classify-file-path path workspace-root) 'buffer)))
-            (root (file-name-as-directory
-                   (file-truename (expand-file-name (or workspace-root default-directory)))))
-            (truename (file-truename (expand-file-name path root))))
-      (if (or (string-prefix-p root truename)
-              (string-prefix-p root (file-name-as-directory truename)))
-          (file-relative-name truename root)
-        (if (file-name-absolute-p path)
-            (file-relative-name truename root)
-          path))
-    path))
-
-(defun macher-agent--resolve-safe-path (unsafe-path base-dir)
-  "Resolve UNSAFE-PATH strictly within BASE-DIR to prevent jailbreaks.
-
-UNSAFE-PATH is the raw string path to resolve.
-BASE-DIR is the absolute directory path string.
-
-Return the resolved absolute safe path string."
-  (when (file-name-absolute-p unsafe-path)
-    (error "SECURITY ERROR: Absolute paths are forbidden.  You must use relative paths \
-(for example, ./file).  Path attempted: %s" unsafe-path))
-
-  (when (string-prefix-p "~" unsafe-path)
-    (error "SECURITY ERROR: Home directory paths are forbidden: %s" unsafe-path))
-
-  (let* ((canonical-base (file-name-as-directory (file-truename (expand-file-name base-dir))))
+(defun macher-agent--resolve-safe-path (unsafe-path root)
+  "Generate normalized sandbox directory explicitly from UNSAFE-PATH."
+  (cl-check-type unsafe-path string)
+  (let* ((canonical-base (file-name-as-directory (file-truename (expand-file-name root))))
          (canonical-resolved (file-truename (expand-file-name unsafe-path canonical-base))))
     (if (or (and (file-directory-p canonical-base) (file-in-directory-p canonical-resolved canonical-base))
             (string-prefix-p canonical-base (file-name-as-directory canonical-resolved))
-            (string-prefix-p canonical-base canonical-resolved)
-            (string= canonical-resolved (directory-file-name canonical-base)))
+            (string= (directory-file-name canonical-base) (directory-file-name canonical-resolved)))
         canonical-resolved
       (error "SECURITY ERROR: Path traversal jailbreak detected: %s" unsafe-path))))
 
-(defun macher-agent--write-or-delete-vfs-entry (target-path content)
-  "Write CONTENT to TARGET-PATH if string, otherwise delete file if exists.
-
-TARGET-PATH is the target file path string.
-CONTENT is the content string to write, or nil to delete the file.
-
-Return nil.
-Side effects: Writes content to file or deletes the file at TARGET-PATH."
-  (if (stringp content)
-      (progn
-        (make-directory (file-name-directory target-path) t)
-        (write-region content nil target-path nil 'silent))
-    (when (file-exists-p target-path)
-      (delete-file target-path))))
+(defun macher-agent--write-or-delete-vfs-entry (content target-path)
+  "Process IO event using strict CONTENT string against TARGET-PATH."
+  (cl-check-type content string)
+  (cl-check-type target-path string)
+  (let ((dir (file-name-directory target-path)))
+    (when (and dir (not (file-directory-p dir)))
+      (make-directory dir t))
+    (with-temp-file target-path
+      (insert content))))
 
 (defun macher-agent--vfs-process-entries (entries sandbox-path entry-path-fn entry-content-fn)
   "Process VFS ENTRIES, inflating or deleting them within SANDBOX-PATH.
@@ -281,52 +234,47 @@ Side effects: Writes or deletes files within SANDBOX-PATH."
     (mapc (lambda (entry)
             (let* ((relative-path (funcall entry-path-fn entry))
                    (new-content (funcall entry-content-fn entry))
-                   (sandbox-target-path (macher-agent--resolve-safe-path relative-path sandbox-root)))
-              (macher-agent--write-or-delete-vfs-entry sandbox-target-path new-content)))
+                   (sandbox-target-path (macher-agent--resolve-safe-path (expand-file-name relative-path sandbox-root) sandbox-root)))
+              (when (stringp new-content)
+                (macher-agent--write-or-delete-vfs-entry new-content sandbox-target-path))))
           entries)))
 
-(defun macher-agent-vfs-scratch-inflate (sandbox-path vfs-buffers-ht ws-root contents)
-  "Inflate the VFS contents into its physical sandbox directory.
+(defun macher-agent-vfs-scratch-inflate (sandbox-path vfs-buffers-ht &optional ws-root contents)
+  "Hydrate VFS state directly targeting SANDBOX-PATH directory."
+  (cl-check-type sandbox-path string)
+  (cl-check-type vfs-buffers-ht hash-table)
+  (cl-assert (file-directory-p sandbox-path))
+  (let ((file-entries
+         (cl-remove-if
+          (lambda (entry)
+            (let ((path (if (macher-agent-vfs-entry-p entry)
+                            (macher-agent-vfs-entry-path entry)
+                          (car entry))))
+              (eq (macher-agent--classify-file-path path ws-root) 'buffer)))
+          contents)))
+    (macher-agent--vfs-process-entries
+     file-entries
+     sandbox-path
+     (lambda (entry)
+       (let ((p (macher-agent-vfs-entry-path entry)))
+         (macher-agent-to-relative-path (expand-file-name p ws-root) ws-root)))
+     (lambda (entry)
+       (macher-agent-vfs-entry-curr entry))))
 
-SANDBOX-PATH is the sandbox directory path string.
-VFS-BUFFERS-HT is the hash-table of current VFS buffer contents.
-WS-ROOT is the project root directory string.
-CONTENTS is the list of `macher-agent-vfs-entry` structs.
-
-Return nil.
-Side effects: Writes VFS contents to the sandbox directory."
-  (when (and sandbox-path (file-directory-p sandbox-path))
-    (let ((file-entries
+  (when (> (hash-table-count vfs-buffers-ht) 0)
+    (let ((physical-keys
            (cl-remove-if
-            (lambda (entry)
-              (let ((path (if (macher-agent-vfs-entry-p entry)
-                              (macher-agent-vfs-entry-path entry)
-                            (car entry))))
-                (eq (macher-agent--classify-file-path path ws-root) 'buffer)))
-            contents)))
+            (lambda (key)
+              (or (eq (macher-agent--classify-file-path key ws-root) 'buffer)
+                  (let ((b (and (stringp key) (get-buffer key))))
+                    (and b (buffer-live-p b) (not (buffer-file-name b))))))
+            (hash-table-keys vfs-buffers-ht))))
       (macher-agent--vfs-process-entries
-       file-entries
+       physical-keys
        sandbox-path
-       (lambda (entry)
-         (let ((p (macher-agent-vfs-entry-path entry)))
-           (macher-agent-to-relative-path p ws-root)))
-       (lambda (entry)
-         (macher-agent-vfs-entry-curr entry))))
-
-    (when (and (hash-table-p vfs-buffers-ht) (> (hash-table-count vfs-buffers-ht) 0))
-      (let ((physical-keys
-             (cl-remove-if
-              (lambda (key)
-                (or (eq (macher-agent--classify-file-path key ws-root) 'buffer)
-                    (let ((b (and (stringp key) (get-buffer key))))
-                      (and b (buffer-live-p b) (not (buffer-file-name b))))))
-              (hash-table-keys vfs-buffers-ht))))
-        (macher-agent--vfs-process-entries
-         physical-keys
-         sandbox-path
-         (lambda (key)
-           (macher-agent-to-relative-path key ws-root))
-         (lambda (key) (gethash key vfs-buffers-ht)))))))
+       (lambda (key)
+         (macher-agent-to-relative-path (expand-file-name key ws-root) ws-root))
+       (lambda (key) (gethash key vfs-buffers-ht))))))
 
 (defun macher-agent--vfs-verify-clean-merge (_workspace-root _contents)
   "Verify that the VFS _CONTENTS can merge cleanly into _WORKSPACE-ROOT.
@@ -358,7 +306,7 @@ Return the shell command string."
                            (call-process "git" nil nil nil "rev-parse" "--is-inside-work-tree")))))
       (if is-git
           (format "(cd %s && { git -c core.quotePath=false ls-files -z -c --recurse-submodules; git \
--c core.quotePath=false ls-files -z -o --exclude-standard; }) | rsync -aC --delete --from0 \
+-c core.quotePath=false ls-files -z -o --exclude-standard; }) | rsync -a --delete --from0 \
 --files-from=- %s %s"
                   (shell-quote-argument src-dir)
                   (shell-quote-argument src-dir)
@@ -378,19 +326,39 @@ Side effects: Runs an rsync process to copy files."
   (let ((sync-cmd (macher-agent--build-rsync-cmd workspace-root sandbox-dir)))
     (call-process shell-file-name nil nil nil shell-command-switch sync-cmd)))
 
-(defun macher-agent--edit-string-fast (content old-text new-text replace-all)
-  "Replace OLD-TEXT with NEW-TEXT in CONTENT.
+(defun macher-agent--read-string (offset limit &optional text show-line-numbers)
+  "Extract bounded string fragment relying on strictly typed OFFSET and LIMIT."
+  (cl-check-type offset integer)
+  (cl-check-type limit integer)
+  (when text
+    (cl-check-type text string))
+  (let* ((lines (split-string (or text "") "\n"))
+         (total-lines (length lines))
+         (start-line (if (> offset 0)
+                         (1- offset)
+                       (if (< offset 0)
+                           (max 0 (+ total-lines offset))
+                         0)))
+         (num-lines (if (> limit 0)
+                        limit
+                      (if (< limit 0)
+                          (max 0 (+ total-lines limit))
+                        (- total-lines start-line))))
+         (selected-lines (seq-take (seq-drop lines start-line) num-lines)))
+    (if show-line-numbers
+        (string-join
+         (cl-loop for l in selected-lines
+                  for idx from (1+ start-line)
+                  collect (format "%6d\t%s" idx l))
+         "\n")
+      (string-join selected-lines "\n"))))
 
-If REPLACE-ALL is nil, signal an error if OLD-TEXT occurs more than once.
-
-CONTENT is the original string block.
-OLD-TEXT is the target substring to match.
-NEW-TEXT is the replacement string.
-REPLACE-ALL is a boolean flag to replace all occurrences.
-
-Return the modified string."
-  (when (string-empty-p old-text)
-    (error "Cannot replace an empty string.  Provide exact text to match"))
+(defun macher-agent--edit-string-fast (old-text new-text &optional content replace-all)
+  "Perform fast substitution validating OLD-TEXT is fully formed."
+  (cl-check-type old-text string)
+  (cl-check-type new-text string)
+  (cl-check-type content string)
+  (cl-assert (not (string-empty-p old-text)))
   (let ((count 0)
         (start 0))
     (while (string-match (regexp-quote old-text) content start)
@@ -406,29 +374,26 @@ Return the modified string."
       (replace-regexp-in-string (regexp-quote old-text) new-text content t t)))))
 
 (defun macher-agent--read-content-from-disk-or-buffer (path)
-  "Read the contents of PATH from an active buffer or disk.
-
-PATH is the relative or absolute path string.
-
-Return the content string, or nil."
-  (when (and (stringp path) (not (string-empty-p path)))
-    (let* ((buf (or (get-file-buffer path) (get-buffer path)))
-           (is-media (and (file-exists-p path)
-                          (macher-agent-media-file-p path)))
-           (file-exists (file-exists-p path))
-           (trust-buffer (and buf
-                              (buffer-live-p buf)
-                              (or (buffer-modified-p buf)
-                                  (not (buffer-file-name buf))
-                                  (verify-visited-file-modtime buf)))))
-      (cond
-       (trust-buffer
-        (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))
-       (file-exists
-        (with-temp-buffer
-          (if is-media (insert-file-contents-literally path) (insert-file-contents path))
-          (buffer-string)))
-       (t nil)))))
+  "Extract content string guaranteed by PATH string structure."
+  (cl-check-type path string)
+  (cl-assert (not (string-empty-p path)))
+  (let* ((buf (or (get-file-buffer path) (get-buffer path)))
+         (is-media (and (file-exists-p path)
+                        (macher-agent-media-file-p path)))
+         (file-exists (file-exists-p path))
+         (trust-buffer (and buf
+                            (buffer-live-p buf)
+                            (or (buffer-modified-p buf)
+                                (not (buffer-file-name buf))
+                                (verify-visited-file-modtime buf)))))
+    (cond
+     (trust-buffer
+      (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))
+     (file-exists
+      (with-temp-buffer
+        (if is-media (insert-file-contents-literally path) (insert-file-contents path))
+        (buffer-string)))
+     (t nil))))
 
 (defun macher-agent--partition-vfs-entries (contents &optional root-dir)
   "Split raw VFS CONTENTS into pure virtual and physical lists.
@@ -448,23 +413,13 @@ Return a cons cell (VIRTUAL-ENTRIES . PHYSICAL-ENTRIES)."
     (cons (nreverse virtual-contents) (nreverse physical-contents))))
 
 (defun macher-agent--classify-file-path (path &optional root-dir)
-  "Classify PATH with ROOT-DIR into `buffer', `media', `file', or `external'.
-Pure, non-file-backed buffers are determined purely by runtime buffer state.
-
-PATH is the file path string or buffer to classify.
-ROOT-DIR is the optional project root directory path string.
-
-Return a symbol: `buffer', `media', `file', or `external'."
-  (let* ((buf (cond
-               ((bufferp path) (when (buffer-live-p path) path))
-               ((stringp path) (get-buffer path))))
+  "Categorize string PATH into standard VFS archetypes."
+  (cl-check-type path string)
+  (let* ((buf (get-buffer path))
          (file-path (and buf (buffer-file-name buf))))
     (if (and buf (null file-path))
         'buffer
-      (let* ((target-path (cond
-                           (file-path file-path)
-                           ((bufferp path) (buffer-name path))
-                           (t (format "%s" path))))
+      (let* ((target-path (or file-path path))
              (canonical-root (and root-dir (file-name-as-directory (expand-file-name root-dir))))
              (expanded (expand-file-name target-path (or root-dir default-directory))))
         (if (and canonical-root
@@ -494,7 +449,8 @@ Return a list of file path strings."
               (string= expanded-dir "/"))
       (error "SECURITY HALT: Workspace resolved to root or home directory")))
   (if-let* ((proj (project-current nil expanded-dir)))
-      (project-files proj)
+      (let ((project-vc-include-untracked t))
+        (project-files proj))
     (directory-files-recursively
      expanded-dir "^[^.]" nil
      (lambda (d)
@@ -518,88 +474,167 @@ Side effects: Modifies ENTRY in place."
   (setf (macher-agent-vfs-entry-curr entry) new-curr)
   entry)
 
-(defun macher-agent--sync-context-entry (entry &optional mtime-tracker-ht root)
-  "Synchronise a single VFS ENTRY with the physical disk.
+(defun macher-agent--changes-towards-p (orig new current-state)
+  "Return non-nil if CURRENT-STATE represents a progression from ORIG towards NEW.
 
-ENTRY is the VFS entry structure.
+ORIG is the baseline content string.
+NEW is the target content string containing modifications.
+CURRENT-STATE is the live buffer or disk content."
+  (let ((orig-str (or orig ""))
+        (new-str (or new ""))
+        (curr-str (or current-state "")))
+    (cond
+     ((equal curr-str new-str) t)
+     ((equal curr-str orig-str) nil)
+     (t
+      (let ((orig-lines (split-string orig-str "\n"))
+            (new-lines (split-string new-str "\n"))
+            (curr-lines (split-string curr-str "\n")))
+        (and (cl-every (lambda (line)
+                         (or (member line orig-lines)
+                             (member line new-lines)))
+                       curr-lines)
+             (or (cl-some (lambda (line)
+                            (and (member line curr-lines)
+                                 (member line new-lines)
+                                 (not (member line orig-lines))))
+                          curr-lines)
+                 (cl-some (lambda (line)
+                            (and (member line orig-lines)
+                                 (not (member line curr-lines))
+                                 (not (member line new-lines))))
+                          orig-lines))))))))
+
+(defun macher-agent--sync-context-entry (entry root &optional mtime-tracker-ht)
+  "Process synchronization strictly on isolated ROOT string.
+
+ENTRY is the `macher-agent-vfs-entry' struct.
+ROOT is the workspace root directory string.
 MTIME-TRACKER-HT is an optional hash table tracking file modification times.
-ROOT is an optional root directory string for resolving relative paths.
 
-Return non-nil if synchronisation modified the entry, otherwise nil.
-Side effects: Updates entry cells if disk state changed and updates
-stored mtime tracker."
+Return non-nil if synchronisation modified the entry, otherwise nil."
+  (cl-check-type entry macher-agent-vfs-entry)
+  (cl-check-type root string)
+  (when mtime-tracker-ht
+    (cl-check-type mtime-tracker-ht hash-table))
   (let* ((path (macher-agent-vfs-entry-path entry))
-         (abs-path (if (and root (stringp root) (stringp path) (not (file-name-absolute-p path)))
+         (abs-path (if (not (file-name-absolute-p path))
                        (expand-file-name path root)
                      path))
          (orig (macher-agent-vfs-entry-orig entry))
          (new (macher-agent-vfs-entry-curr entry))
-         (stored-mtime (when mtime-tracker-ht (gethash path mtime-tracker-ht)))
-         (attrs (and abs-path (stringp abs-path) (file-attributes abs-path)))
+         (stored-mtime (when mtime-tracker-ht
+                         (or (gethash path mtime-tracker-ht)
+                             (gethash abs-path mtime-tracker-ht))))
+         (attrs (file-attributes abs-path))
          (current-mtime (when attrs (nth 5 attrs)))
          (disk-newer
           (and stored-mtime current-mtime (time-less-p stored-mtime current-mtime)))
-         (buf (when (and path (stringp path))
-                (or (get-file-buffer path) (get-file-buffer abs-path) (get-buffer path))))
+         (buf (or (get-file-buffer path) (get-file-buffer abs-path) (get-buffer path)))
          (live-buf (and buf (buffer-live-p buf)))
          (buf-content (when live-buf
                         (with-current-buffer buf
                           (buffer-substring-no-properties (point-min) (point-max)))))
+         (disk-exists (file-exists-p abs-path))
+         (disk-content (when disk-exists
+                         (ignore-errors
+                           (with-temp-buffer
+                             (insert-file-contents abs-path)
+                             (buffer-string)))))
          (current-state nil))
 
     (when (and mtime-tracker-ht current-mtime (null stored-mtime))
-      (puthash path current-mtime mtime-tracker-ht))
+      (puthash path current-mtime mtime-tracker-ht)
+      (puthash abs-path current-mtime mtime-tracker-ht))
 
     (cond
-     ((and live-buf (equal buf-content orig))
+     ;; 1. Live buffer has changes: equals new, progressed towards new, or buffer-modified-p
+     ((and live-buf
+           (or (equal buf-content new)
+               (macher-agent--changes-towards-p orig new buf-content)
+               (and (buffer-modified-p buf) (not disk-newer))))
       (setq current-state buf-content))
 
-     ((and live-buf (equal buf-content new))
-      (setq current-state buf-content))
-
+     ;; 2. Disk was modified out-of-band / disk is newer
      ((or disk-newer
           (and live-buf (buffer-file-name buf) (not (verify-visited-file-modtime buf))))
-      (setq current-state
-            (macher-agent--read-content-from-disk-or-buffer (or abs-path path))))
+      (setq current-state (or disk-content
+                              (macher-agent--read-content-from-disk-or-buffer abs-path)))
+      (when (and mtime-tracker-ht current-mtime)
+        (puthash path current-mtime mtime-tracker-ht)
+        (puthash abs-path current-mtime mtime-tracker-ht)))
 
-     ((and live-buf (buffer-modified-p buf))
+     ;; 3. Disk content matches new or progressed towards new
+     ((and disk-content
+           (or (equal disk-content new)
+               (macher-agent--changes-towards-p orig new disk-content)))
+      (setq current-state disk-content)
+      (when (and mtime-tracker-ht current-mtime)
+        (puthash path current-mtime mtime-tracker-ht)
+        (puthash abs-path current-mtime mtime-tracker-ht)))
+
+     ;; 4. Live buffer content
+     (live-buf
       (setq current-state buf-content))
 
+     ;; 5. Disk content
+     (disk-content
+      (setq current-state disk-content))
+
      (t
-      (setq current-state
-            (macher-agent--read-content-from-disk-or-buffer (or abs-path path)))))
+      (setq current-state nil)))
 
-    (when (and mtime-tracker-ht current-mtime)
-      (puthash path current-mtime mtime-tracker-ht))
+    (if (and current-state (not (equal current-state orig)))
+        (cond
+         ;; Hunks fully applied: current-state equals new
+         ((equal current-state new)
+          (macher-agent--update-entry-content-cells entry current-state new)
+          (when (and mtime-tracker-ht current-mtime)
+            (puthash path current-mtime mtime-tracker-ht)
+            (puthash abs-path current-mtime mtime-tracker-ht))
+          t)
 
-    (when (not (equal (or orig "") (or current-state "")))
-      (cond
-       ((null current-state)
-        (if (equal (or orig "") (or new ""))
-            (macher-agent--update-entry-content-cells entry nil nil)
-          (macher-agent--update-entry-content-cells entry nil new)))
-       ((null new)
-        (macher-agent--update-entry-content-cells entry current-state nil))
-       ((equal (or orig "") (or new ""))
-        (macher-agent--update-entry-content-cells entry current-state current-state))
-       ((equal (or new "") (or current-state ""))
-        (macher-agent--update-entry-content-cells entry current-state new))
-       (t
-        (macher-agent--update-entry-content-cells entry current-state current-state)))
-      t)))
+         ;; Hunks partially applied towards new: update orig baseline
+         ((macher-agent--changes-towards-p orig new current-state)
+          (macher-agent--update-entry-content-cells entry current-state new)
+          (when (and mtime-tracker-ht current-mtime)
+            (puthash path current-mtime mtime-tracker-ht)
+            (puthash abs-path current-mtime mtime-tracker-ht))
+          t)
 
-(defun macher-agent--sync-and-check-dirty-entries (contents &optional mtime-tracker-ht root)
+         ;; Out-of-band modification: fail-fast sync/invalidation
+         (t
+          (if (equal (or orig "") (or new ""))
+              (macher-agent--update-entry-content-cells entry current-state current-state)
+            (display-warning
+             'macher-agent
+             (format "Your previous edits to %s were discarded due to external file modifications.  Please re-read and re-apply"
+                     (file-name-nondirectory path))
+             :warning)
+            (macher-agent--update-entry-content-cells entry current-state current-state))
+          (when (and mtime-tracker-ht current-mtime)
+            (puthash path current-mtime mtime-tracker-ht)
+            (puthash abs-path current-mtime mtime-tracker-ht))
+          t))
+      nil)))
+
+(defun macher-agent--sync-and-check-dirty-entries (contents &optional root mtime-tracker-ht)
   "Synchronise CONTENTS entries with disk or buffer and check dirty state.
 
 CONTENTS is the list of VFS entries.
-MTIME-TRACKER-HT is an optional hash table tracking file modification times.
 ROOT is an optional root directory string for resolving relative paths.
+MTIME-TRACKER-HT is an optional hash table tracking file modification times.
 
 Return a cons cell (SYNCED . IS-DIRTY)."
+  (cl-check-type contents list)
+  (when root
+    (cl-check-type root string))
+  (when mtime-tracker-ht
+    (cl-check-type mtime-tracker-ht hash-table))
   (let ((synced nil)
         (is-dirty nil))
     (dolist (entry contents)
-      (when (macher-agent--sync-context-entry entry mtime-tracker-ht root)
+      (when (macher-agent--sync-context-entry entry (or root default-directory) mtime-tracker-ht)
         (setq synced t))
       (let ((orig (macher-agent-vfs-entry-orig entry))
             (new (macher-agent-vfs-entry-curr entry)))
@@ -607,89 +642,59 @@ Return a cons cell (SYNCED . IS-DIRTY)."
           (setq is-dirty t))))
     (cons synced is-dirty)))
 
-(defun macher-agent--normalize-path-key (path &optional context)
-  "Normalise PATH to a canonical key for CONTEXT entries.
-
-PATH is the string path to normalise.
-CONTEXT is the optional context structure.
-
-Return the canonical key path string, or PATH if non-string."
-  (if-let* (((stringp path))
-            (ws-root (and context (macher-agent-context-root context))))
-      (if (eq (macher-agent--classify-file-path path ws-root) 'buffer)
-          path
-        (expand-file-name path ws-root))
-    path))
+(defun macher-agent--normalize-path-key (path root)
+  "Format canonical path key exclusively from string PATH."
+  (cl-check-type path string)
+  (let ((ws-root (if (stringp root)
+                     root
+                   (when (macher-agent-context-p root)
+                     (macher-agent-context-root root)))))
+    (if (and ws-root (eq (macher-agent--classify-file-path path ws-root) 'buffer))
+        path
+      (if ws-root (expand-file-name path ws-root) path))))
 
 (defun macher-agent--ensure-access (context path)
-  "Ensure PATH is within the explicitly scoped CONTEXT.
-
-CONTEXT is the active context structure.
-PATH is the string file path.
-
-Return nil or signals an error."
-  (cl-assert (macher-agent-valid-context-p context) nil "VFS Error: Context cannot be nil or invalid, got: %S" context)
-  (cl-assert (stringp path) nil "PATH must be a string, got: %S" path)
+  "Validate workspace boundary mapping PATH strictly against CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (cl-check-type path string)
   (let* ((contents (macher-agent--get-context-contents context))
          (actual-name (substring-no-properties path))
+         (canonical-path (file-truename (expand-file-name path)))
          (abs-path (expand-file-name path)))
     (unless (or (cl-find actual-name contents :key #'macher-agent-vfs-entry-path :test #'equal)
-                (cl-find abs-path contents :key #'macher-agent-vfs-entry-path :test #'equal)
-                (cl-find-if (lambda (e)
-                              (let ((e-path (macher-agent-vfs-entry-path e)))
-                                (and (stringp e-path)
-                                     (equal (file-name-nondirectory actual-name)
-                                            (file-name-nondirectory e-path)))))
-                            contents)
-                (get-buffer actual-name)
-                (and (not (string-prefix-p "~" actual-name))
-                     (or (file-exists-p actual-name)
-                         (file-exists-p abs-path))))
-      (error "SECURITY ERROR: You do not have permission to access '%s'.  \
-Use list_buffers_in_workspace to see your allowed scope" actual-name))))
+                (cl-find canonical-path contents :key (lambda (e) (file-truename (expand-file-name (macher-agent-vfs-entry-path e)))) :test #'equal)
+                (cl-find abs-path contents :key (lambda (e) (expand-file-name (macher-agent-vfs-entry-path e))) :test #'equal))
+      (let ((workspace (macher-agent-context-workspace context)))
+        (when (fboundp 'macher--validate-path-in-workspace)
+          (macher--validate-path-in-workspace path (or workspace (macher-agent-context-root context))))))))
 
 (defun macher-agent--persist-vfs-to-hidden-buffer (ctx)
-  "Persist virtual file system state of CTX to a hidden buffer for review.
-
-CTX is the active context structure.
-
-Return nil.
-Side effects: Creates or erases and populates the hidden VFS state buffer."
-  (let* ((root-dir (or (when (macher-agent-valid-context-p ctx)
-                         (macher-agent-context-root ctx))
-                       "default"))
+  "Commit VFS map into background tracking reliant on CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (let* ((root-dir (or (macher-agent-context-root ctx) "default"))
          (buf-name (format " *macher-agent-vfs-state-%s*" (md5 (expand-file-name (if (consp root-dir) (cdr root-dir) root-dir)))))
          (vfs-buf (get-buffer-create buf-name)))
     (with-current-buffer vfs-buf
       (erase-buffer)
       (insert ";;; Macher Agent Virtual File System State\n")
       (insert ";;; This buffer is native and handles large text blocks.\n\n")
-      (when ctx
-        (dolist (entry (macher-agent--get-context-contents ctx))
-          (let* ((path (macher-agent-vfs-entry-path entry))
-                 (new-content (macher-agent-vfs-entry-curr entry)))
-            (when new-content
-              (insert (format "=== VFS ENTRY: %s ===\n" path))
-              (insert new-content)
-              (unless (string-suffix-p "\n" new-content)
-                (insert "\n"))
-              (insert "=======================\n\n"))))))))
+      (dolist (entry (macher-agent--get-context-contents ctx))
+        (let* ((path (macher-agent-vfs-entry-path entry))
+               (new-content (macher-agent-vfs-entry-curr entry)))
+          (when new-content
+            (insert (format "=== VFS ENTRY: %s ===\n" path))
+            (insert new-content)
+            (unless (string-suffix-p "\n" new-content)
+              (insert "\n"))
+            (insert "=======================\n\n")))))))
 
-(defun macher-agent--update-context-file (context path new-content)
-  "Update PATH in CONTEXT with NEW-CONTENT.
-
-CONTEXT is the active context structure.
-PATH is the relative file path string.
-NEW-CONTENT is the modified content string.
-
-Return nil.
-Side effects: Updates CONTEXT entries, sets dirty flag, and persists state."
-  (cl-assert (macher-agent-valid-context-p context) nil "VFS Write Error: Context cannot be nil or invalid")
-  (cl-assert (stringp path) nil "PATH must be a string, got: %S" path)
+(defun macher-agent--update-context-file (context path content)
+  "Commit updated string CONTENT against PATH string linked to CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (cl-check-type path string)
   (let* ((norm-path (macher-agent--normalize-path-key path context))
          (contents (macher-agent--get-context-contents context))
-         (workspace-root (when (macher-agent-valid-context-p context)
-                           (macher-agent-context-root context)))
+         (workspace-root (macher-agent-context-root context))
          (vfs-ht (macher-agent-workspace-vfs-buffers context))
          (mtime-ht (macher-agent-workspace-mtime-tracker context))
          (entry
@@ -702,30 +707,30 @@ Side effects: Updates CONTEXT entries, sets dirty flag, and persists state."
                contents))))
     (if (and mtime-ht (hash-table-p mtime-ht))
         (progn
-          (macher-agent-vfs-write vfs-ht mtime-ht norm-path new-content)
+          (macher-agent-vfs-write norm-path content mtime-ht vfs-ht)
           (unless (equal path norm-path)
-            (macher-agent-vfs-write vfs-ht mtime-ht path new-content)))
+            (macher-agent-vfs-write path content mtime-ht vfs-ht)))
       (when (and vfs-ht (hash-table-p vfs-ht))
-        (puthash norm-path new-content vfs-ht)
+        (puthash norm-path content vfs-ht)
         (unless (equal path norm-path)
-          (puthash path new-content vfs-ht))))
+          (puthash path content vfs-ht))))
     (if entry
-        (setf (macher-agent-vfs-entry-curr entry) new-content)
+        (setf (macher-agent-vfs-entry-curr entry) content)
       (let* ((is-buffer (eq (macher-agent--classify-file-path norm-path workspace-root) 'buffer))
              (safe-path (if (or is-buffer (null workspace-root))
                             norm-path
                           (let ((rel-path (macher-agent-to-relative-path norm-path workspace-root)))
-                            (macher-agent--resolve-safe-path rel-path workspace-root))))
+                            (macher-agent--resolve-safe-path (expand-file-name rel-path workspace-root) workspace-root))))
              (orig (cond
                     (is-buffer
                      (let ((buf (or (get-buffer norm-path) (get-buffer path))))
                        (if (and buf (buffer-live-p buf))
                            (with-current-buffer buf
                              (buffer-substring-no-properties (point-min) (point-max)))
-                         new-content)))
+                         content)))
                     (t
                      (macher-agent--read-content-from-disk-or-buffer safe-path))))
-             (new-entry (make-macher-agent-vfs-entry :path norm-path :orig orig :curr new-content)))
+             (new-entry (make-macher-agent-vfs-entry :path norm-path :orig orig :curr content)))
         (macher-agent--set-context-contents
          context
          (cons new-entry contents))))
@@ -734,66 +739,47 @@ Side effects: Updates CONTEXT entries, sets dirty flag, and persists state."
     (run-hook-with-args 'macher-agent-context-mutated-hook norm-path)))
 
 (defun macher-agent--read-context-file (context path)
-  "Read PATH from CONTEXT.
-
-Prioritises VFS, then active buffers, then physical disk.
-Uniformly applies security and path normalisation checks.
-
-CONTEXT is the active context structure.
-PATH is the file path string or buffer name.
-
-Return the content string or nil."
-  (cl-assert (macher-agent-valid-context-p context) nil "VFS Read Error: Context cannot be nil or invalid")
-  (cl-assert (stringp path) nil "PATH must be a string, got: %S" path)
+  "Fetch VFS entry mapped explicitly to CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (cl-check-type path string)
   (let* ((norm-path (macher-agent--normalize-path-key path context))
          (contents (macher-agent--get-context-contents context))
-         (workspace-root (when (macher-agent-valid-context-p context)
-                           (macher-agent-context-root context)))
+         (workspace-root (macher-agent-context-root context))
          (vfs-ht (macher-agent-workspace-vfs-buffers context))
          (mtime-ht (macher-agent-workspace-mtime-tracker context))
          (is-buf (eq (macher-agent--classify-file-path path workspace-root) 'buffer)))
-    (macher-agent--ensure-access context path)
+
     (let ((target-path
            (if (and workspace-root (not is-buf))
                (let ((relative-path (macher-agent-to-relative-path path workspace-root)))
-                 (macher-agent--resolve-safe-path relative-path workspace-root))
+                 (macher-agent--resolve-safe-path (expand-file-name relative-path workspace-root) workspace-root))
              path)))
       (when (and mtime-ht (hash-table-p mtime-ht) (stringp target-path) (not is-buf))
         (let ((attrs (file-attributes target-path)))
-          (when attrs
-            (let ((mtime (nth 5 attrs)))
-              (unless (gethash norm-path mtime-ht)
-                (puthash norm-path mtime mtime-ht))
-              (unless (gethash path mtime-ht)
-                (puthash path mtime mtime-ht))
-              (unless (gethash target-path mtime-ht)
-                (puthash target-path mtime mtime-ht))))))
-      (let* ((entry (or (cl-find norm-path contents :key #'macher-agent-vfs-entry-path :test #'equal)
-                        (cl-find path contents :key #'macher-agent-vfs-entry-path :test #'equal)
+          (when (and attrs (nth 5 attrs))
+            (puthash target-path (nth 5 attrs) mtime-ht))))
+
+      (let* ((vfs-val (and vfs-ht (hash-table-p vfs-ht) (gethash target-path vfs-ht)))
+             (e-norm (cl-find norm-path contents :key #'macher-agent-vfs-entry-path :test #'equal))
+             (entry (or e-norm
                         (cl-find-if
                          (lambda (e)
-                           (let ((e-norm (macher-agent--normalize-path-key (macher-agent-vfs-entry-path e) context)))
-                             (and e-norm (equal e-norm norm-path))))
-                         contents)))
-             (vfs-val (when (and vfs-ht (hash-table-p vfs-ht))
-                        (let ((v1 (gethash norm-path vfs-ht 'macher-agent--unbound)))
-                          (if (not (eq v1 'macher-agent--unbound))
-                              v1
-                            (let ((v2 (gethash path vfs-ht 'macher-agent--unbound)))
-                              (if (not (eq v2 'macher-agent--unbound))
-                                  v2
-                                'macher-agent--unbound)))))))
+                           (let ((p (macher-agent-vfs-entry-path e)))
+                             (and (stringp p)
+                                  (or (equal path p)
+                                      (equal target-path p)
+                                      (equal target-path (expand-file-name p workspace-root))))))
+                         contents))))
         (when (and entry (macher-agent-vfs-entry-curr entry))
-          (macher-agent--sync-context-entry entry mtime-ht workspace-root))
+          (macher-agent--sync-context-entry entry (or workspace-root default-directory) mtime-ht))
         (cond
          (entry
           (macher-agent-vfs-entry-curr entry))
-         ((not (eq vfs-val 'macher-agent--unbound))
+         (vfs-val
           vfs-val)
          (t
           (or (macher-agent--read-content-from-disk-or-buffer target-path)
-              (when (and (not (equal path target-path))
-                         (file-name-absolute-p path))
+              (when (not (equal path target-path))
                 (macher-agent--read-content-from-disk-or-buffer path))
               (error "ERROR: File/Buffer '%s' does not exist" path))))))))
 
@@ -815,112 +801,100 @@ Side effects: Writes virtual overlay contents to SANDBOX-DIR."
    (lambda (entry)
      (macher-agent-vfs-entry-curr entry))))
 
-(defun macher-agent-call-with-strict-vfs-pipeline (context body-fn)
-  "Execute BODY-FN within a physical sandbox directory populated with CONTEXT.
+(defun macher-agent-vfs-active-p (context)
+  "Query VFS status relying entirely on formatted CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  t)
 
-CONTEXT is the active context structure.
-BODY-FN is the function containing pipeline logic.
+(defun macher-agent-vfs-flush (context)
+  "Execute complete write routine isolated to active CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (let* ((root (macher-agent-context-root context))
+         (contents (macher-agent--get-context-contents context)))
+    (dolist (buf (buffer-list))
+      (when (and (buffer-live-p buf)
+                 (buffer-modified-p buf)
+                 (buffer-file-name buf)
+                 (or (null root)
+                     (file-in-directory-p (buffer-file-name buf) root)))
+        (with-current-buffer buf
+          (save-buffer))))
+    (when contents
+      (macher-agent--auto-sync-context context))))
 
-Return the result of BODY-FN.
-Side effects: Creates and cleans up a temporary sandbox directory."
-  (let* ((ctx-root (when context (macher-agent-context-root context)))
-         (proj (project-current nil default-directory))
-         (proj-root (when proj (expand-file-name (project-root proj))))
-         (workspace-root (or ctx-root proj-root default-directory))
-         (sandbox-dir (make-temp-file "macher-sandbox-" t))
-         (contents (when context (macher-agent--get-context-contents context))))
-    (unwind-protect
-        (progn
-          (macher-agent--vfs-verify-clean-merge workspace-root contents)
-          (macher-agent--vfs-sync-baseline workspace-root sandbox-dir)
-          (when contents
-            (macher-agent--vfs-apply-overlay-stateless contents workspace-root sandbox-dir))
-          (let ((default-directory sandbox-dir))
-            (funcall body-fn)))
-      (when (and sandbox-dir (file-directory-p sandbox-dir))
-        (delete-directory sandbox-dir t)))))
+(defun macher-agent-vfs-restore (context)
+  "Revert dirty VFS mapping contained strictly within CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (macher-agent--auto-sync-context context))
+
+(defmacro macher-agent-with-strict-vfs (context &rest body)
+  "Execute BODY within a strict virtual file system boundary.
+Synchronises uncommitted buffer modifications to disk before execution
+and restores the virtual state upon completion."
+  (declare (indent 1))
+  `(let ((vfs-active (if (macher-agent-context-p ,context)
+                         (macher-agent-vfs-active-p ,context)
+                       (and (macher-agent-valid-context-p ,context) t))))
+     (unwind-protect
+         (progn
+           (when vfs-active
+             (macher-agent-vfs-flush ,context))
+           ,@body)
+       (when vfs-active
+         (macher-agent-vfs-restore ,context)))))
 
 (defun macher-agent--auto-sync-context (ctx &rest _args)
-  "Synchronise the active context with the physical disk, unless paused.
-
-CTX is the active context structure.
-_ARGS represents unused extra arguments.
-
-Return nil.
-Side effects: May update CTX dirty state and persist state if synced."
-  (when (and ctx (not macher-agent--pause-auto-sync))
+  "Automatically coordinate file states within active CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (unless macher-agent--pause-auto-sync
     (let* ((contents (macher-agent--get-context-contents ctx))
-           (root (or (when (macher-agent-valid-context-p ctx) (macher-agent-context-root ctx))
-                     default-directory))
-           (tracker (when ctx (macher-agent-workspace-mtime-tracker ctx)))
-           (res (macher-agent--sync-and-check-dirty-entries contents tracker root))
+           (root (or (macher-agent-context-root ctx) default-directory))
+           (tracker (macher-agent-workspace-mtime-tracker ctx))
+           (res (macher-agent--sync-and-check-dirty-entries contents root tracker))
            (synced (car res))
            (is-dirty (cdr res)))
-
       (unless is-dirty
         (macher-agent--set-context-dirty-p ctx nil))
-
       (when synced
         (macher-agent--persist-vfs-to-hidden-buffer ctx)
         (run-hooks 'macher-agent-context-mutated-hook)))))
 
 (defun macher-agent-storage--extract-context (payload)
-  "Extract the target context structure from PAYLOAD."
-  (when payload
-    (or (when (macher-agent-valid-context-p payload) payload)
-        (when (macher-agent-transit-payload-p payload)
-          (or (let ((c (macher-agent-transit-payload-target-context payload)))
+  "Retrieve valid context mapping solely from transit PAYLOAD struct."
+  (cl-check-type payload macher-agent-transit-payload)
+  (or (let ((c (macher-agent-transit-payload-target-context payload)))
+        (when (macher-agent-valid-context-p c) c))
+      (let ((c (macher-agent-transit-payload-parent-context payload)))
+        (when (macher-agent-valid-context-p c) c))
+      (let ((c (macher-agent-transit-payload-child-context payload)))
+        (when (macher-agent-valid-context-p c) c))
+      (let ((shared (macher-agent-transit-payload-shared-state payload)))
+        (when (macher-agent--plist-p shared)
+          (or (let ((c (plist-get shared :target-context)))
                 (when (macher-agent-valid-context-p c) c))
-              (let ((c (macher-agent-transit-payload-parent-context payload)))
+              (let ((c (plist-get shared :parent-context)))
                 (when (macher-agent-valid-context-p c) c))
-              (let ((c (macher-agent-transit-payload-child-context payload)))
+              (let ((c (plist-get shared :child-context)))
                 (when (macher-agent-valid-context-p c) c))
-              (let ((shared (macher-agent-transit-payload-shared-state payload)))
-                (when (macher-agent--plist-p shared)
-                  (or (let ((c (plist-get shared :target-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get shared :parent-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get shared :child-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get shared :context)))
-                        (when (macher-agent-valid-context-p c) c)))))))
-        (when (macher-agent--plist-p payload)
-          (or (let ((c (plist-get payload :target-context)))
-                (when (macher-agent-valid-context-p c) c))
-              (let ((c (plist-get payload :parent-context)))
-                (when (macher-agent-valid-context-p c) c))
-              (let ((c (plist-get payload :child-context)))
-                (when (macher-agent-valid-context-p c) c))
-              (let ((c (plist-get payload :context)))
-                (when (macher-agent-valid-context-p c) c))
-              (let ((shared (plist-get payload :shared-state)))
-                (when (macher-agent--plist-p shared)
-                  (or (let ((c (plist-get shared :target-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get shared :parent-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get shared :child-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get shared :context)))
-                        (when (macher-agent-valid-context-p c) c))))))))))
+              (let ((c (plist-get shared :context)))
+                (when (macher-agent-valid-context-p c) c)))))))
 
-(defun macher-agent-vfs-handle-flush (&optional ctx)
-  "Broadcast patch request via core hooks if not suppressed. Never write autonomously."
-  (let* ((c (when (macher-agent-valid-context-p ctx) ctx))
-         (suppress (or (bound-and-true-p macher-agent--suppress-patch)
-                       (and c (let ((plugins (macher-agent-context-plugins c)))
-                                (when (macher-agent--plist-p plugins)
-                                  (plist-get plugins :suppress-patch))))))
-         (contents (when c (macher-agent--get-context-contents c)))
-         (has-changes (and c (or (macher-agent--get-context-dirty-p c)
-                                 (cl-some #'macher-agent-vfs-entry-modified-p contents)))))
-    (when (and c has-changes)
-      (when-let* ((prompt (macher-agent-context-prompt c)))
-        (setf (macher-agent-context-prompt c) prompt))
-
+(defun macher-agent-vfs-handle-flush (ctx)
+  "Format response queue tied explicitly to CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (macher-agent--auto-sync-context ctx)
+  (let* ((suppress (or (bound-and-true-p macher-agent--suppress-patch)
+                       (let ((plugins (macher-agent-context-plugins ctx)))
+                         (when (macher-agent--plist-p plugins)
+                           (plist-get plugins :suppress-patch)))))
+         (contents (macher-agent--get-context-contents ctx))
+         (has-changes (or (macher-agent--get-context-dirty-p ctx)
+                          (cl-some #'macher-agent-vfs-entry-modified-p contents))))
+    (when has-changes
+      (when-let* ((prompt (macher-agent-context-prompt ctx)))
+        (setf (macher-agent-context-prompt ctx) prompt))
       (unless suppress
-        (run-hook-with-args 'macher-agent-vfs-flush-hook c)))))
+        (run-hook-with-args 'macher-agent-vfs-flush-hook ctx)))))
 
 (defmacro macher-agent-with-vfs-scope (context &rest body)
   "Execute BODY with Virtual File System awareness established from CONTEXT.
@@ -955,63 +929,45 @@ Side effects: Binds `macher-agent--persistent-context' and adjusts `default-dire
                                    default-directory)))
          ,@body))))
 
-(defun macher-agent--expressive-patch-buffer-name (patch-type ws &optional orig-buf)
-  "Compute deterministic expressive patch buffer name for PATCH-TYPE, WS, and ORIG-BUF.
-
-Follows the pattern `*macher-[CATEGORY]-patch:[WORKSPACE-TYPE]@[WORKSPACE-NAME]<[HASH]>[BUF-NAME]*'
-or fallback `*macher-[CATEGORY]-patch:[WORKSPACE-TYPE]@[WORKSPACE-NAME]<[HASH]>*' when
-ORIG-BUF is not provided or empty.
-
-Return the expressive buffer name string.
-
-Side effects: None."
-  (let* ((category (if (symbolp patch-type) (symbol-name patch-type) (or patch-type "diff")))
-         (buf-name (cond ((bufferp orig-buf)
-                          (if (buffer-live-p orig-buf)
-                              (buffer-name orig-buf)
-                            nil))
-                         ((stringp orig-buf)
-                          (if (string-empty-p orig-buf) nil orig-buf))
-                         (t nil)))
-         (unwrapped (if (fboundp 'macher-agent--unwrap-workspace)
-                        (macher-agent--unwrap-workspace ws)
-                      ws)))
-    (if unwrapped
-        (let* ((ws-type (cond ((consp ws) (car ws))
-                              ((consp unwrapped) (car unwrapped))
-                              ((recordp unwrapped) 'agent)
-                              (t 'project)))
-               (ws-name (macher-agent-macher-workspace-name ws))
-               (hash (macher-agent-macher-workspace-hash ws 4)))
-          (if buf-name
-              (format "*macher-%s-patch:%s@%s<%s>[%s]*" category ws-type ws-name hash buf-name)
-            (format "*macher-%s-patch:%s@%s<%s>*" category ws-type ws-name hash)))
-      (if buf-name
-          (format "*macher-%s-patch[%s]*" category buf-name)
-        (format "*macher-%s-patch*" category)))))
+(defun macher-agent--expressive-patch-buffer-name (context patch-type &optional orig-buf)
+  "Build expressive patch buffer name strictly from CONTEXT, PATCH-TYPE, and ORIG-BUF.
+CONTEXT is a `macher-agent-context' struct.
+PATCH-TYPE is a symbol or string (e.g. 'diff or 'buffer).
+ORIG-BUF is an optional buffer or buffer name string."
+  (cl-check-type context macher-agent-context)
+  (let* ((type-sym (if (symbolp patch-type) patch-type (intern (format "%s" patch-type))))
+         (category (symbol-name type-sym))
+         (target-buf (or orig-buf
+                         (macher-agent-context-origin-buffer context)
+                         (macher-agent-vfs--get-origin-buffer context)))
+         (buf-name (cond
+                    ((bufferp target-buf) (when (buffer-live-p target-buf) (buffer-name target-buf)))
+                    ((stringp target-buf) target-buf)
+                    (t nil)))
+         (ws (macher-agent-context-workspace context))
+         (ws-type (if (consp ws) (car ws) 'project))
+         (ws-name (macher-agent-macher-workspace-name context))
+         (hash (macher-agent-macher-safe-workspace-hash context 4)))
+    (if (and buf-name (not (string-empty-p buf-name)))
+        (format "*macher-%s-patch:%s@%s<%s>[%s]*" category ws-type ws-name hash buf-name)
+      (format "*macher-%s-patch:%s@%s<%s>*" category ws-type ws-name hash))))
 
 (defun macher-agent--build-and-rename-patch (ctx patch-type &optional files)
-  "Build patch for CTX, reusing and renaming buffers deterministically.
-
-Construct a patch buffer for context CTX if CTX contains changes and patch
-generation is not suppressed.  Renames the newly built patch buffer directly in
-place to the expressive patch buffer name so that the patch buffer remains live
-and retains its identity.
-
-Return the renamed patch buffer if generated, or nil.
-
-Side effects: Reuses, modifies, and renames patch buffers."
-  (let* ((target-buf (when (macher-agent-valid-context-p ctx)
-                       (or (macher-agent-vfs--get-origin-buffer ctx)
-                           (macher-agent-context-origin-buffer ctx))))
+  "Format active patch view bound explicitly to dirty CTX struct.
+CTX is a `macher-agent-context' struct.
+PATCH-TYPE is a symbol or string designating the patch type (e.g. 'diff or 'buffer).
+FILES is an optional list of `macher-agent-vfs-entry' objects."
+  (cl-check-type ctx macher-agent-context)
+  (let* ((type-sym (if (symbolp patch-type) patch-type (intern (format "%s" patch-type))))
+         (target-buf (or (macher-agent-context-origin-buffer ctx)
+                         (macher-agent-vfs--get-origin-buffer ctx)
+                         (current-buffer)))
          (suppress-patch (if (and (bufferp target-buf) (buffer-live-p target-buf))
                              (buffer-local-value 'macher-agent--suppress-patch target-buf)
-                           (bound-and-true-p macher-agent--suppress-patch)))
-         (ws (when (macher-agent-valid-context-p ctx)
-               (macher-agent-context-workspace ctx))))
+                           (bound-and-true-p macher-agent--suppress-patch))))
     (when (and (not suppress-patch)
                (macher-agent--context-has-changes-p ctx))
-      (let* ((expressive-name (macher-agent--expressive-patch-buffer-name patch-type ws target-buf))
+      (let* ((expressive-name (macher-agent--expressive-patch-buffer-name ctx type-sym target-buf))
              (patch-buf (macher-agent-macher-build-patch ctx (or (macher-agent-context-prompt ctx) "") files)))
         (if (and patch-buf (buffer-live-p patch-buf))
             (if (equal (buffer-name patch-buf) expressive-name)
@@ -1054,97 +1010,66 @@ Side effects: None."
                 (macher-agent--get-context-contents context))))
 
 (defun macher-agent--split-context (ctx)
-  "Split context CTX into virtual and physical context clones.
-
-CTX is the active context structure.
-
-Return a cons cell of cloned contexts (FILE-CONTEXT . BUFFER-CONTEXT)."
-  (let* ((file-ctx (if (macher-agent-context-p ctx)
-                       (let* ((cloned (macher-agent--copy-context ctx))
-                              (plugins (macher-agent-context-plugins ctx))
-                              (copied-plugins (macher-agent--copy-context-hash-tables plugins)))
-                         (setf (macher-agent-context-plugins cloned)
-                               (copy-tree copied-plugins))
-                         cloned)
-                     (when ctx (macher-agent--clone-context ctx))))
-         (buf-ctx (if (macher-agent-context-p ctx)
-                      (let* ((cloned (macher-agent--copy-context ctx))
-                             (plugins (macher-agent-context-plugins ctx))
-                             (copied-plugins (macher-agent--copy-context-hash-tables plugins)))
-                        (setf (macher-agent-context-plugins cloned)
-                              (copy-tree copied-plugins))
-                        cloned)
-                    (when ctx (macher-agent--clone-context ctx))))
-         (root (when (macher-agent-valid-context-p ctx)
-                 (macher-agent-context-root ctx)))
-         (contents (when ctx (macher-agent--get-context-contents ctx)))
+  "Distinguish mapped buffer state strictly bound by CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (let* ((file-ctx (let* ((cloned (macher-agent--copy-context ctx))
+                          (plugins (macher-agent-context-plugins ctx))
+                          (copied-plugins (macher-agent--copy-context-hash-tables plugins)))
+                     (setf (macher-agent-context-plugins cloned)
+                           (copy-tree copied-plugins))
+                     cloned))
+         (buf-ctx (let* ((cloned (macher-agent--copy-context ctx))
+                         (plugins (macher-agent-context-plugins ctx))
+                         (copied-plugins (macher-agent--copy-context-hash-tables plugins)))
+                    (setf (macher-agent-context-plugins cloned)
+                          (copy-tree copied-plugins))
+                    cloned))
+         (root (macher-agent-context-root ctx))
+         (contents (macher-agent--get-context-contents ctx))
          (modified-contents
           (cl-remove-if-not #'macher-agent-vfs-entry-modified-p contents))
          (partitioned (macher-agent--partition-vfs-entries modified-contents root))
          (buf-contents (car partitioned))
          (file-contents (cdr partitioned)))
-    (when file-ctx (macher-agent--set-context-contents file-ctx file-contents))
-    (when buf-ctx (macher-agent--set-context-contents buf-ctx buf-contents))
+    (macher-agent--set-context-contents file-ctx file-contents)
+    (macher-agent--set-context-contents buf-ctx buf-contents)
     (cons file-ctx buf-ctx)))
 
 (defun macher-agent--execute-split-patch (ctx)
-  "Execute the split patch generation for physical and virtual contexts in CTX."
+  "Generate diff payload dependent strictly on dirty CTX struct."
+  (cl-check-type ctx macher-agent-context)
   (when (or (macher-agent--get-context-dirty-p ctx)
             (macher-agent--context-has-changes-p ctx))
     (let* ((payloads (macher-agent--split-context ctx))
            (p-ctx (car payloads))
            (v-ctx (cdr payloads))
-           (prompt (or (when (macher-agent-context-p ctx) (macher-agent-context-prompt ctx)) ""))
-           (generated-buffers nil))
-      (when prompt
-        (when p-ctx
-          (when (macher-agent-context-p p-ctx)
-            (setf (macher-agent-context-prompt p-ctx) prompt)
-            (setf (macher-agent-context-plugins p-ctx)
-                  (plist-put (copy-sequence (macher-agent-context-plugins p-ctx)) :prompt prompt))))
-        (when v-ctx
-          (when (macher-agent-context-p v-ctx)
-            (setf (macher-agent-context-prompt v-ctx) prompt)
-            (setf (macher-agent-context-plugins v-ctx)
-                  (plist-put (copy-sequence (macher-agent-context-plugins v-ctx)) :prompt prompt)))))
-      (when-let* ((p-buf (macher-agent--build-and-rename-patch p-ctx "physical")))
-        (push p-buf generated-buffers))
-      (when-let* ((v-buf (macher-agent--build-and-rename-patch v-ctx "virtual")))
-        (push v-buf generated-buffers))
-      (when generated-buffers
-        (macher-agent--display-patch-buffers generated-buffers)))
-    (macher-agent--set-context-dirty-p ctx nil)))
+           (p-contents (macher-agent--get-context-contents p-ctx))
+           (v-contents (macher-agent--get-context-contents v-ctx))
+           (generated nil))
+      (when (and p-contents (> (length p-contents) 0))
+        (let ((p-buf (macher-agent--build-and-rename-patch p-ctx 'diff p-contents)))
+          (when p-buf (push p-buf generated))))
+      (when (and v-contents (> (length v-contents) 0))
+        (let ((v-buf (macher-agent--build-and-rename-patch v-ctx 'buffer v-contents)))
+          (when v-buf (push v-buf generated))))
+      (macher-agent--display-patch-buffers (nreverse generated)))))
 
 (defun macher-agent-vfs-build-patch-from-hook (ctx)
-  "Observe VFS flush events and build the visual macher interface for CTX."
-  (when (macher-agent-valid-context-p ctx)
-    (let ((prompt (or (when (macher-agent-context-p ctx) (macher-agent-context-prompt ctx)) "")))
-      (when prompt
-        (when (macher-agent-context-p ctx)
-          (setf (macher-agent-context-prompt ctx) prompt)
-          (setf (macher-agent-context-plugins ctx)
-                (plist-put (copy-sequence (macher-agent-context-plugins ctx)) :prompt prompt))))
-      (macher-agent--execute-split-patch ctx))))
+  "Format background UI changes via target CTX struct."
+  (cl-check-type ctx macher-agent-context)
+  (let ((prompt (or (when (macher-agent-context-p ctx) (macher-agent-context-prompt ctx)) "")))
+    (when prompt
+      (setf (macher-agent-context-prompt ctx) prompt)
+      (setf (macher-agent-context-plugins ctx)
+            (plist-put (copy-sequence (macher-agent-context-plugins ctx)) :prompt prompt)))
+    (macher-agent--execute-split-patch ctx)))
 
-(defun macher-agent-vfs-diff-review (&optional ctx)
-  "Review pending diff patches for uncommitted VFS modifications in CTX.
-
-When CTX is nil, resolves context from the active persistent context.
-Subscribes to or dispatches through `macher-agent-vfs-handle-flush'.
-
-Return nil.
-Side effects: Displays generated patch review buffers for pending edits."
-  (interactive)
-  (let ((context (or (when (macher-agent-valid-context-p ctx) ctx)
-                     (when (bound-and-true-p macher-agent--persistent-context)
-                       (and (macher-agent-valid-context-p macher-agent--persistent-context)
-                            macher-agent--persistent-context))
-                     (let ((buf-ctx (buffer-local-value 'macher-agent--persistent-context (current-buffer))))
-                       (when (macher-agent-valid-context-p buf-ctx)
-                         buf-ctx)))))
-    (if (and context (macher-agent-valid-context-p context))
-        (macher-agent-vfs-handle-flush context)
-      (message "No active VFS context found."))))
+(defun macher-agent-vfs-diff-review (ctx)
+  "Format interactive diff utilizing active CTX struct."
+  (interactive (list (or (bound-and-true-p macher-agent--persistent-context)
+                         (buffer-local-value 'macher-agent--persistent-context (current-buffer)))))
+  (cl-check-type ctx macher-agent-context)
+  (macher-agent-vfs-handle-flush ctx))
 
 (defun macher-agent-vfs-install ()
   "Install VFS storage hooks, patch interfaces, and pipeline steps."
@@ -1155,10 +1080,10 @@ Side effects: Displays generated patch review buffers for pending edits."
     (macher-agent-macher-install)))
 
 (defun macher-agent--merge-contexts (parent-ctx child-ctx)
-  "Merge the VFS contents of CHILD-CTX into PARENT-CTX respecting existing parent edits."
-  (cl-assert (macher-agent-valid-context-p parent-ctx) nil "PARENT-CTX must be a valid context, got: %S" parent-ctx)
-  (cl-assert (macher-agent-valid-context-p child-ctx) nil "CHILD-CTX must be a valid context, got: %S" child-ctx)
-  (when (and parent-ctx child-ctx (not (eq parent-ctx child-ctx)))
+  "Sync differential data relying on explicitly defined PARENT-CTX and CHILD-CTX structs."
+  (cl-check-type parent-ctx macher-agent-context)
+  (cl-check-type child-ctx macher-agent-context)
+  (unless (eq parent-ctx child-ctx)
     (let ((child-contents (macher-agent--get-context-contents child-ctx))
           (parent-contents (macher-agent--get-context-contents parent-ctx))
           (any-merged nil))
@@ -1183,81 +1108,49 @@ Side effects: Displays generated patch review buffers for pending edits."
         (macher-agent--set-context-dirty-p parent-ctx t))))
   parent-ctx)
 
-(defun macher-agent-vfs--merge-payload (target-or-payload &optional payload-arg)
+(defun macher-agent-vfs--merge-payload (payload)
   "Merge Virtual File System PAYLOAD into the target parent context directly.
 
-Support polymorphic invocation:
-- (macher-agent-vfs--merge-payload payload)
-- (macher-agent-vfs--merge-payload target payload)
-
-TARGET can be `macher-agent-context', a buffer, or a transit payload.
-PAYLOAD is the property list, struct, or list of diff entries containing merge artifacts.
-
-Exhaustively extracts target context from PAYLOAD keys (`macher-agent-transit-context-keys'),
-`macher-agent-storage--extract-context', workspace-id, shared-state, and buffer local persistent context.
+PAYLOAD is a `macher-agent-transit-payload' struct, a property list,
+or a `macher-agent-context' struct.
 Applies file diffs and child-context modifications to the resolved parent context,
 handling deletions when diff items have nil content.
 Synchronises `macher-agent--persistent-context' across relevant buffers and
 updates `:target-context' on the returned payload structure.
 
 Return updated PAYLOAD or context."
-  (let* ((has-two-args (and payload-arg t))
-         (explicit-target (if has-two-args target-or-payload nil))
-         (payload (if has-two-args payload-arg target-or-payload))
-         (p-struct (when (macher-agent-transit-payload-p payload) payload))
-         (target
-          (or explicit-target
-              (when p-struct
-                (or (macher-agent-transit-payload-target-context p-struct)
-                    (macher-agent-transit-payload-parent-context p-struct)
-                    (macher-agent-transit-payload-target-buffer p-struct)))
-              (when (macher-agent--plist-p payload)
-                (or (plist-get payload :target-context)
-                    (plist-get payload :parent-context)
-                    (plist-get payload :macher-agent-context)
-                    (plist-get payload :target-buffer)
-                    (plist-get payload :buffer)
-                    (plist-get payload :target)))))
-         (parent-ctx
-          (or (when target
-                (cond
-                 ((macher-agent-valid-context-p target)
-                  target)
-                 ((or (bufferp target) (stringp target))
-                  (let ((buf (if (bufferp target) target (get-buffer target))))
+  (let* ((p-struct (when (macher-agent-transit-payload-p payload) payload))
+         (raw-target
+          (cond
+           ((macher-agent-context-p payload)
+            payload)
+           (p-struct
+            (or (macher-agent-transit-payload-target-context p-struct)
+                (macher-agent-transit-payload-parent-context p-struct)
+                (when-let* ((b (macher-agent-transit-payload-target-buffer p-struct)))
+                  (let ((buf (if (bufferp b) b (get-buffer b))))
                     (when (and buf (buffer-live-p buf))
-                      (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
-                        (when (macher-agent-valid-context-p ctx) ctx)))))
-                 ((macher-agent--plist-p target)
-                  (or (let ((c (plist-get target :macher-agent-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get target :target-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get target :parent-context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (let ((c (plist-get target :context)))
-                        (when (macher-agent-valid-context-p c) c))
-                      (macher-agent-storage--extract-context target)
-                      (when-let* ((buf (or (plist-get target :buffer) (plist-get target :target-buffer))))
-                        (let ((live-buf (if (bufferp buf) buf (and (stringp buf) (get-buffer buf)))))
-                          (when (and live-buf (buffer-live-p live-buf))
-                            (let ((ctx (buffer-local-value 'macher-agent--persistent-context live-buf)))
-                              (when (macher-agent-valid-context-p ctx) ctx)))))))))
-              (when (macher-agent-valid-context-p payload) payload)
-              (when p-struct
-                (or (when-let* ((c (macher-agent-transit-payload-target-context p-struct)))
-                      (when (macher-agent-valid-context-p c) c))
-                    (when-let* ((c (macher-agent-transit-payload-parent-context p-struct)))
-                      (when (macher-agent-valid-context-p c) c))
-                    (when-let* ((b (macher-agent-transit-payload-target-buffer p-struct)))
-                      (let ((buf (if (bufferp b) b (and (stringp b) (get-buffer b)))))
-                        (when (and buf (buffer-live-p buf))
-                          (let ((ctx (buffer-local-value 'macher-agent--persistent-context buf)))
-                            (when (macher-agent-valid-context-p ctx) ctx)))))))
-              (macher-agent-storage--extract-context payload)
-              (when (and (bound-and-true-p macher-agent--persistent-context)
-                         (macher-agent-valid-context-p macher-agent--persistent-context))
-                macher-agent--persistent-context)))
+                      (buffer-local-value 'macher-agent--persistent-context buf))))
+                (macher-agent-storage--extract-context p-struct)))
+           ((macher-agent--plist-p payload)
+            (or (plist-get payload :target-context)
+                (plist-get payload :parent-context)
+                (plist-get payload :macher-agent-context)
+                (plist-get payload :context)
+                (when-let* ((b (or (plist-get payload :target-buffer) (plist-get payload :buffer))))
+                  (let ((buf (if (bufferp b) b (and (stringp b) (get-buffer b)))))
+                    (when (and buf (buffer-live-p buf))
+                      (buffer-local-value 'macher-agent--persistent-context buf))))))
+           ((bufferp payload)
+            (when (buffer-live-p payload)
+              (buffer-local-value 'macher-agent--persistent-context payload)))
+           (t payload)))
+         (ctx (or raw-target
+                  (when (and (bound-and-true-p macher-agent--persistent-context)
+                             (macher-agent-context-p macher-agent--persistent-context))
+                    macher-agent--persistent-context)))
+         (_ (cl-check-type ctx macher-agent-context))
+         (parent-ctx ctx)
          (child-ctx (cond
                      (p-struct (macher-agent-transit-payload-child-context p-struct))
                      ((and (macher-agent-valid-context-p payload) (not (eq payload parent-ctx)))
@@ -1285,6 +1178,7 @@ Return updated PAYLOAD or context."
 
     (when parent-ctx
       (when (and child-ctx (not (eq child-ctx parent-ctx)))
+        (cl-check-type child-ctx macher-agent-context)
         (macher-agent--merge-contexts parent-ctx child-ctx))
 
       (when diff
@@ -1329,24 +1223,17 @@ Return updated PAYLOAD or context."
       (if (macher-agent-transit-payload-p payload)
           (setf (macher-agent-transit-payload-target-context payload) parent-ctx)
         (when (macher-agent--plist-p payload)
-          (setq payload (plist-put (copy-sequence payload) :target-context parent-ctx)))))
-    (or payload parent-ctx)))
+          (setq payload (plist-put (copy-sequence payload) :target-context parent-ctx))))
+      (or payload parent-ctx))))
 
 (defun macher-agent--apply-single-virtual-buffer (entry)
-  "Apply a single virtual edit ENTRY to a live Emacs buffer.
-
-ENTRY is a `macher-agent-vfs-entry` structure.
-
-Return non-nil if applied to a live buffer, otherwise nil.
-
-Side effects: Modifies the target live buffer contents."
-  (when-let* (((macher-agent-vfs-entry-p entry))
-              (path (macher-agent-vfs-entry-path entry))
-              ((and (stringp path) (not (string-empty-p path))))
-              (content (macher-agent-vfs-entry-curr entry))
-              (curr (string-trim-right (or content "")))
-              (buf-name (macher-agent--resolve-buffer-name path))
-              (buf (when buf-name (get-buffer buf-name))))
+  "Render content explicitly derived from formatting ENTRY struct."
+  (cl-check-type entry macher-agent-vfs-entry)
+  (let* ((path (macher-agent-vfs-entry-path entry))
+         (content (macher-agent-vfs-entry-curr entry))
+         (curr (string-trim-right (or content "")))
+         (buf-name (macher-agent--resolve-buffer-name path))
+         (buf (when buf-name (get-buffer buf-name))))
     (when (and buf (buffer-live-p buf))
       (with-current-buffer buf
         (erase-buffer)
@@ -1382,6 +1269,42 @@ Side effects: Modifies live buffer contents and updates context entries."
       (macher-agent--set-context-contents ctx (nreverse normalized-contents)))
     (when ctx
       (macher-agent--auto-sync-context ctx))))
+
+(defun macher-agent-call-with-strict-vfs-pipeline (context body-fn)
+  "Execute BODY-FN within a physical sandbox directory populated with CONTEXT.
+
+CONTEXT is the active context structure.
+BODY-FN is the function containing pipeline logic.
+
+Return the result of BODY-FN.
+Side effects: Creates and cleans up a temporary sandbox directory."
+  (let* ((ctx (or context (bound-and-true-p macher-agent--persistent-context)))
+         (raw-root (when (macher-agent-valid-context-p ctx)
+                     (or (macher-agent-context-project-root ctx)
+                         (macher-agent-context-root ctx))))
+         (canonical-root (and raw-root
+                              (file-truename
+                               (expand-file-name (if (consp raw-root) (cdr raw-root) raw-root)))))
+         (contents (when (macher-agent-valid-context-p ctx)
+                     (macher-agent--get-context-contents ctx)))
+         (sandbox-dir (make-temp-file "macher-sandbox-" t)))
+    (if (not (and ctx canonical-root (file-directory-p canonical-root)))
+        (funcall body-fn)
+      (unwind-protect
+          (progn
+            (macher-agent--vfs-verify-clean-merge canonical-root contents)
+            (macher-agent--vfs-sync-baseline canonical-root sandbox-dir)
+            (when contents
+              (macher-agent--vfs-apply-overlay-stateless contents canonical-root sandbox-dir))
+            (let ((default-directory sandbox-dir))
+              (funcall body-fn)))
+        (when (and sandbox-dir (file-directory-p sandbox-dir))
+          (delete-directory sandbox-dir t))))))
+
+(defmacro macher-agent-with-strict-vfs-pipeline (context &rest body)
+  "Execute BODY with default directory sandboxed to CONTEXT VFS state."
+  (declare (indent 1) (debug t))
+  `(macher-agent-call-with-strict-vfs-pipeline ,context (lambda () ,@body)))
 
 (provide 'macher-agent-vfs)
 ;;; macher-agent-vfs.el ends here

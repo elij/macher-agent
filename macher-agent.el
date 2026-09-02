@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.2.7
+;; Version: 0.8.3.0
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -43,10 +43,14 @@ Return the result message string displayed in the echo area."
   "Minor mode for macher-agent session management."
   :lighter " MA"
   (if macher-agent-mode
-      (progn
-        (macher-agent-gptel-mode-setup)
-        (macher-agent-setup-gptel-buffer)
-        (macher-agent--wrap-macher-tools))
+      (condition-case err
+          (progn
+            (macher-agent-gptel-mode-setup)
+            (macher-agent-setup-gptel-buffer)
+            (macher-agent--wrap-macher-tools))
+        (user-error
+         (setq macher-agent-mode nil)
+         (user-error "%s" (error-message-string err))))
     (remove-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer t)
     (dolist (transformer macher-agent-prompt-transformers)
       (remove-hook 'gptel-prompt-transform-functions transformer t))
@@ -69,8 +73,6 @@ Return the result message string displayed in the echo area."
   (with-eval-after-load 'gptel-transient
     (ignore-errors
       (transient-suffix-put 'gptel-menu 'gptel--infix-tools :save-history nil))))
-
-(defalias 'macher-agent-setup #'macher-agent-install)
 
 (provide 'macher-agent)
 ;;; macher-agent.el ends here
