@@ -136,7 +136,7 @@ Return a `macher-agent-zero-mem-graph' struct."
         (dolist (ent (macher-agent-zero-mem-trace-entities trace))
           (puthash ent (cons tid (gethash ent entity-index)) entity-index))))
 
-    ;; Step 3: Populate Adjacency Weights (E_de & E_dd)
+    ;; Step 3: Populate Adjacency Weights (E_de and E_dd)
     (let ((n-traces (length trace-list)))
       (dotimes (i n-traces)
         (let* ((trace (nth i trace-list))
@@ -186,33 +186,37 @@ Return a `macher-agent-zero-mem-graph' struct."
 
 ;;;; 3. Query Alignment and PageRank Diffusion
 
-(defun macher-agent-zero-mem-align-query (query graph)
-  "Extract and align QUERY entities with GRAPH's Entity nodes.
-Return an association list of (EntityNode . ActivationScore)."
-  (let* ((case-fold-search t)
-         (entity-index (macher-agent-zero-mem-graph-entity-index graph))
-         (q-str (if (listp query) (string-join query " ") query))
-         (q-entities (or (macher-agent-zero-mem-naive-ner q-str)
-                         (split-string (downcase q-str) "[^[:alnum:]-_]+" t)))
-         (aligned-activations nil)
-         (seen-ents (make-hash-table :test 'equal)))
-    (dolist (q-ent q-entities)
-      (when (and q-ent (> (length q-ent) 1))
-        (maphash
-         (lambda (g-ent _tids)
-           (when g-ent
-             (cond
-              ((and (string-equal-ignore-case q-ent g-ent)
-                    (not (gethash g-ent seen-ents)))
-               (puthash g-ent t seen-ents)
-               (push (cons (cons :ent g-ent) 1.0) aligned-activations))
-              ((and (or (string-match-p (regexp-quote q-ent) g-ent)
-                        (string-match-p (regexp-quote g-ent) q-ent))
-                    (not (gethash g-ent seen-ents)))
-               (puthash g-ent t seen-ents)
-               (push (cons (cons :ent g-ent) 0.8) aligned-activations)))))
-         entity-index)))
-    aligned-activations))
+(defun macher-agent-zero-mem-align-query (query &optional graph)
+  "Generate explicit alignment offsets based on strictly formatted QUERY list."
+  (when (stringp query)
+    (setq query (split-string (downcase query) "[^[:alnum:]-_]+" t)))
+  (cl-check-type query list)
+  (if (null graph)
+      query
+    (let* ((case-fold-search t)
+           (entity-index (macher-agent-zero-mem-graph-entity-index graph))
+           (q-str (string-join (mapcar (lambda (x) (format "%s" x)) query) " "))
+           (q-entities (or (macher-agent-zero-mem-naive-ner q-str)
+                           query))
+           (aligned-activations nil)
+           (seen-ents (make-hash-table :test 'equal)))
+      (dolist (q-ent q-entities)
+        (when (and q-ent (> (length q-ent) 1))
+          (maphash
+           (lambda (g-ent _tids)
+             (when g-ent
+               (cond
+                ((and (string-equal-ignore-case q-ent g-ent)
+                      (not (gethash g-ent seen-ents)))
+                 (puthash g-ent t seen-ents)
+                 (push (cons (cons :ent g-ent) 1.0) aligned-activations))
+                ((and (or (string-match-p (regexp-quote q-ent) g-ent)
+                          (string-match-p (regexp-quote g-ent) q-ent))
+                      (not (gethash g-ent seen-ents)))
+                 (puthash g-ent t seen-ents)
+                 (push (cons (cons :ent g-ent) 0.8) aligned-activations)))))
+           entity-index)))
+      aligned-activations)))
 
 (defconst macher-agent-zero-mem-pr-scale 65536
   "Fixed point scaling factor for PageRank.")
@@ -420,8 +424,9 @@ Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
   "Buffer-local event horizon plist (:line L :offset O) demarcating truncation boundary.")
 
 (defun macher-agent-zero-mem--calculate-event-horizon (orig-buf)
-  "Calculate the event horizon (:line LINE :offset OFFSET) for ORIG-BUF based on context limits."
-  (when (and orig-buf (buffer-live-p orig-buf))
+  "Extract event index marker explicitly from ORIG-BUF live state."
+  (cl-check-type orig-buf buffer)
+  (when (buffer-live-p orig-buf)
     (with-current-buffer orig-buf
       (let ((max-chars (macher-agent--get-max-context-chars orig-buf)))
         (if (<= (buffer-size) max-chars)
@@ -462,20 +467,20 @@ Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
               (list :line (line-number-at-pos safe-pt)
                     :offset safe-pt))))))))
 
-(defun macher-agent-zero-mem--get-event-horizon (orig-buf &optional context)
-  "Get the event horizon plist for ORIG-BUF or CONTEXT."
-  (or (when (and orig-buf (buffer-live-p orig-buf))
+(defun macher-agent-zero-mem--get-event-horizon (orig-buf context)
+  "Correlate index marker linking ORIG-BUF object against active CONTEXT struct."
+  (cl-check-type orig-buf buffer)
+  (cl-check-type context macher-agent-context)
+  (or (when (buffer-live-p orig-buf)
         (buffer-local-value 'macher-agent-zero-mem--event-horizon orig-buf))
-      (when (and context (macher-agent-context-p context))
-        (plist-get (macher-agent-context-plugins context) :event-horizon))
-      (when (and orig-buf (buffer-live-p orig-buf))
+      (plist-get (macher-agent-context-plugins context) :event-horizon)
+      (when (buffer-live-p orig-buf)
         (macher-agent-zero-mem--calculate-event-horizon orig-buf))))
 
 (defun macher-agent-zero-mem--buffer-to-traces (buffer &optional before-offset before-line)
-  "Convert BUFFER content into trace plists for Zero-Mem graph construction.
-Demarcate completed turns based on prompt/response boundaries and record line numbers and offsets.
-If BEFORE-OFFSET or BEFORE-LINE is provided, only include traces strictly before that boundary."
-  (when (and buffer (buffer-live-p buffer))
+  "Format continuous background logs via live BUFFER object."
+  (cl-check-type buffer buffer)
+  (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (save-excursion
         (goto-char (point-min))
@@ -511,17 +516,15 @@ If BEFORE-OFFSET or BEFORE-LINE is provided, only include traces strictly before
 ;;;; 5.1 Plugin State Accessors
 
 (defun macher-agent-zero-mem-get-state (context)
-  "Retrieve the zero-mem plugin state from CONTEXT.
-Returns the value stored under the `:zero-mem' key in `(macher-agent-context-plugins CONTEXT)'."
-  (when (macher-agent-context-p context)
-    (plist-get (macher-agent-context-plugins context) :zero-mem)))
+  "Retrieve mapping registry bounds explicitly from CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (plist-get (macher-agent-context-plugins context) :zero-mem))
 
 (defun macher-agent-zero-mem-set-state (context state)
-  "Store the zero-mem plugin STATE under `:zero-mem' in CONTEXT.
-Returns STATE."
-  (when (macher-agent-context-p context)
-    (setf (macher-agent-context-plugins context)
-          (plist-put (macher-agent-context-plugins context) :zero-mem state)))
+  "Update mapping registry bounds natively against CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (setf (macher-agent-context-plugins context)
+        (plist-put (copy-sequence (macher-agent-context-plugins context)) :zero-mem state))
   state)
 
 (defvar macher-agent-memory-vector-storage (make-hash-table :test 'equal)
@@ -559,13 +562,14 @@ Side effects: Populates `macher-agent-memory-vector-storage` with interaction tr
 ;;;; 6. Buffer and Context Resolution Helpers
 
 (defun macher-agent-zero-mem--extract-clean-prompt (orig-buf context)
-  "Extract the sanitized prompt from CONTEXT or ORIG-BUF.
-Uses `macher-agent-context-prompt' and strips local variables and header prefixes."
-  (let* ((ctx (or context (when (and orig-buf (buffer-live-p orig-buf))
-                            (buffer-local-value 'macher-agent--persistent-context orig-buf))))
+  "Isolate query targets strictly utilizing ORIG-BUF string representations."
+  (cl-check-type orig-buf buffer)
+  (let* ((ctx (or context
+                  (when (buffer-live-p orig-buf)
+                    (buffer-local-value 'macher-agent--persistent-context orig-buf))))
          (raw-prompt (or (when (and ctx (macher-agent-context-p ctx))
                            (macher-agent-context-prompt ctx))
-                         (when (and orig-buf (buffer-live-p orig-buf))
+                         (when (buffer-live-p orig-buf)
                            (with-current-buffer orig-buf
                              (buffer-substring-no-properties (point-min) (point-max)))))))
     (when (and raw-prompt (stringp raw-prompt))
@@ -573,7 +577,10 @@ Uses `macher-agent-context-prompt' and strips local variables and header prefixe
         (string-trim (replace-regexp-in-string "^[#>*[:space:]]+" "" (string-trim stripped)))))))
 
 (defun macher-agent-zero-mem--resolve-parent-buffer (&optional arg1 arg2 &rest _rest)
-  "Resolve the parent buffer from CONTEXT or TARGET-BUF or routing stack."
+  "Map hierarchical memory linking exclusively parsed string contexts."
+  (when (and (stringp arg1) (stringp arg2))
+    (cl-check-type arg1 string)
+    (cl-check-type arg2 string))
   (let* ((context (cond ((macher-agent-context-p arg1) arg1)
                         ((macher-agent-context-p arg2) arg2)
                         (t nil)))
@@ -621,11 +628,10 @@ Uses `macher-agent-context-prompt' and strips local variables and header prefixe
 
 ;;;; 7. Transmission Pipeline Steps
 
-(defun macher-agent-memory-pipe--inject-tool (state orig-buf _presets _skills _redirect)
-  "Inject the search tool into STATE if buffer exceeds size limits."
-  (let* ((buf (or orig-buf
-                  (when (macher-agent-transmission-state-p state)
-                    (macher-agent-transmission-state-target-buffer state))
+(defun macher-agent-memory-pipe--inject-tool (state)
+  "Inject memory tools into transmission STATE struct."
+  (cl-check-type state macher-agent-transmission-state)
+  (let* ((buf (or (macher-agent-transmission-state-target-buffer state)
                   (current-buffer)))
          (max-chars (macher-agent--get-max-context-chars buf))
          (buf-size (if (and buf (buffer-live-p buf))
@@ -633,7 +639,7 @@ Uses `macher-agent-context-prompt' and strips local variables and header prefixe
                      0)))
     (when (> buf-size max-chars)
       (let* ((tools (macher-agent-transmission-state-tools state))
-             (mem-tool (or (ignore-errors (macher-agent-resolve-tool 'search_conversation_history nil nil nil))
+             (mem-tool (or (ignore-errors (macher-agent-resolve-tool "search_conversation_history" nil nil nil))
                            'search_conversation_history))
              (already-has-mem (cl-some (lambda (tl)
                                          (equal (macher-agent-canonical-tool-name tl)
@@ -644,18 +650,16 @@ Uses `macher-agent-context-prompt' and strips local variables and header prefixe
                 (append tools (list mem-tool)))))))
   state)
 
-(defun macher-agent-parent-memory-pipe--inject-tool (state &optional orig-buf _presets _skills _redirect)
-  "Inject `search_parent_conversation_history' into STATE if a live parent buffer is detected."
-  (let* ((ctx (when (macher-agent-transmission-state-p state)
-                (macher-agent-transmission-state-context state)))
-         (target-buf (or (when (macher-agent-transmission-state-p state)
-                           (macher-agent-transmission-state-target-buffer state))
-                         orig-buf
+(defun macher-agent-parent-memory-pipe--inject-tool (state)
+  "Inject parent memory tools into transmission STATE struct."
+  (cl-check-type state macher-agent-transmission-state)
+  (let* ((ctx (macher-agent-transmission-state-context state))
+         (target-buf (or (macher-agent-transmission-state-target-buffer state)
                          (current-buffer)))
          (parent (macher-agent-zero-mem--resolve-parent-buffer ctx target-buf)))
     (when (and parent (buffer-live-p parent))
       (let* ((tools (macher-agent-transmission-state-tools state))
-             (parent-tool (or (ignore-errors (macher-agent-resolve-tool 'search_parent_conversation_history nil nil nil))
+             (parent-tool (or (ignore-errors (macher-agent-resolve-tool "search_parent_conversation_history" nil nil nil))
                               (when (boundp 'macher-agent-search-parent-conversation-history-tool)
                                 (symbol-value 'macher-agent-search-parent-conversation-history-tool))
                               'search_parent_conversation_history))
@@ -668,11 +672,11 @@ Uses `macher-agent-context-prompt' and strips local variables and header prefixe
                 (append tools (list parent-tool)))))))
   state)
 
-(defun macher-agent-memory-pipe--truncate-buffer (state orig-buf _presets _skills _redirect)
-  "Truncate the transmission buffer non-destructively without mutating ORIG-BUF.
-Pruning operates purely on the transmission buffer / ephemeral wire payload."
+(defun macher-agent-memory-pipe--truncate-buffer (state)
+  "Truncate memory buffer defined in STATE struct."
+  (cl-check-type state macher-agent-transmission-state)
   (let* ((tx-buf (current-buffer))
-         (ref-buf (if (and orig-buf (buffer-live-p orig-buf)) orig-buf tx-buf))
+         (ref-buf (or (macher-agent-transmission-state-target-buffer state) tx-buf))
          (max-chars (macher-agent--get-max-context-chars ref-buf)))
     (when (> (buffer-size tx-buf) max-chars)
       (save-excursion
@@ -711,13 +715,15 @@ Pruning operates purely on the transmission buffer / ephemeral wire payload."
           (when (> safe-pt safe-min)
             (let ((lines-deleted (count-lines safe-min safe-pt))
                   (horizon-line (line-number-at-pos safe-pt)))
-              ;; Record event horizon on orig-buf without modifying its text content
-              (when (and orig-buf (buffer-live-p orig-buf))
-                (with-current-buffer orig-buf
+              ;; Record event horizon on target-buf without modifying its text content
+              (when (and (macher-agent-transmission-state-target-buffer state)
+                         (buffer-live-p (macher-agent-transmission-state-target-buffer state)))
+                (with-current-buffer (macher-agent-transmission-state-target-buffer state)
                   (setq-local macher-agent-zero-mem--event-horizon
                               (list :line horizon-line :offset safe-pt)))
                 (when (boundp 'macher-agent-memory-vector-storage)
-                  (remhash (buffer-name orig-buf) macher-agent-memory-vector-storage)))
+                  (remhash (buffer-name (macher-agent-transmission-state-target-buffer state))
+                           macher-agent-memory-vector-storage)))
               ;; Truncate the transmission wire buffer (current-buffer)
               (delete-region safe-min safe-pt)
               (goto-char safe-min)
@@ -726,16 +732,14 @@ Pruning operates purely on the transmission buffer / ephemeral wire payload."
                 (replace-match ""))))))))
   state)
 
-(defun macher-agent-pipe--inject-zero-mem (state orig-buf _presets _skills _redirect)
-  "Retrieve relevant historical traces and inject them into STATE's directives."
-  (let* ((buf (or orig-buf
-                  (when (macher-agent-transmission-state-p state)
-                    (macher-agent-transmission-state-target-buffer state))
+(defun macher-agent-pipe--inject-zero-mem (state)
+  "Inject zero-mem prompt sequences into STATE struct."
+  (cl-check-type state macher-agent-transmission-state)
+  (let* ((buf (or (macher-agent-transmission-state-target-buffer state)
                   (current-buffer)))
-         (context (when (and buf (buffer-live-p buf)
-                             (or (local-variable-p 'macher-agent--persistent-context buf)
-                                 (boundp 'macher-agent--persistent-context)))
-                    (buffer-local-value 'macher-agent--persistent-context buf)))
+         (context (or (macher-agent-transmission-state-context state)
+                      (when (and buf (buffer-live-p buf))
+                        (buffer-local-value 'macher-agent--persistent-context buf))))
          (graph (or (when context
                       (macher-agent-zero-mem-get-state context))
                     (when (boundp 'macher-agent-memory-vector-storage)
@@ -759,13 +763,11 @@ Pruning operates purely on the transmission buffer / ephemeral wire payload."
                           (list evidence-block)))))))
     state))
 
-(defun macher-agent-pipe--inject-parent-context (state &optional orig-buf _presets _skills _redirect)
-  "Retrieve relevant historical traces from stationary parent graph snapshot and inject into STATE."
-  (let* ((ctx (when (macher-agent-transmission-state-p state)
-                (macher-agent-transmission-state-context state)))
-         (target-buf (or (when (macher-agent-transmission-state-p state)
-                           (macher-agent-transmission-state-target-buffer state))
-                         orig-buf
+(defun macher-agent-pipe--inject-parent-context (state)
+  "Inject parent references into STATE struct."
+  (cl-check-type state macher-agent-transmission-state)
+  (let* ((ctx (macher-agent-transmission-state-context state))
+         (target-buf (or (macher-agent-transmission-state-target-buffer state)
                          (current-buffer)))
          (parent (macher-agent-zero-mem--resolve-parent-buffer ctx target-buf)))
     (when (and parent (buffer-live-p parent))
@@ -803,8 +805,9 @@ Pruning operates purely on the transmission buffer / ephemeral wire payload."
                               (list evidence-block)))))))))
     state))
 
-(defun macher-agent-memory-pipe--inject-directive (state _orig-buf _presets _skills _redirect)
+(defun macher-agent-memory-pipe--inject-directive (state)
   "Append search directive to STATE if memory tools are active."
+  (cl-check-type state macher-agent-transmission-state)
   (let* ((tools (macher-agent-transmission-state-tools state))
          (has-mem (cl-some (lambda (tl)
                              (equal (macher-agent-canonical-tool-name tl)
@@ -815,8 +818,9 @@ Pruning operates purely on the transmission buffer / ephemeral wire payload."
         (push directive (macher-agent-transmission-state-directives state)))))
   state)
 
-(defun macher-agent-parent-memory-pipe--inject-directive (state _orig-buf _presets _skills _redirect)
+(defun macher-agent-parent-memory-pipe--inject-directive (state)
   "Append parent search directive to STATE if parent search tool is active."
+  (cl-check-type state macher-agent-transmission-state)
   (let* ((tools (macher-agent-transmission-state-tools state))
          (has-parent-tool (cl-some (lambda (tl)
                                      (equal (macher-agent-canonical-tool-name tl)
@@ -830,11 +834,15 @@ Pruning operates purely on the transmission buffer / ephemeral wire payload."
 
 ;;;; 8. Search Backend with Event Horizon Filtering
 
-(defun macher-agent-memory-search-zero-mem (keywords orig-buf &optional ctx-lines)
-  "Search for KEYWORDS in ORIG-BUF using zero-mem PageRank search.
-For ORIG-BUF that has been truncated, only return document traces located before
-the event horizon boundary so the model does not duplicate active context."
-  (if (not (and orig-buf (buffer-live-p orig-buf)))
+(defun macher-agent-memory-search-zero-mem (orig-buf keywords &optional ctx-lines)
+  "Execute memory recall sequence reliant exclusively on live ORIG-BUF and KEYWORDS list."
+  (when (and (listp orig-buf) (bufferp keywords))
+    (cl-rotatef orig-buf keywords))
+  (when (stringp keywords)
+    (setq keywords (list keywords)))
+  (cl-check-type orig-buf buffer)
+  (cl-check-type keywords list)
+  (if (not (buffer-live-p orig-buf))
       "Error: Cannot locate original conversation buffer."
     (let* ((buf-name (buffer-name orig-buf))
            (top-k (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))

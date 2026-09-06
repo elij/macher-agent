@@ -81,103 +81,118 @@ Side effects: Mutates CONTEXT scope list."
     (macher-agent-context-update context buffer-name content)))
 
 (defun macher-agent-add-buffer-to-scope (buffer)
-  "Interactively add a BUFFER to the agent's authorised virtual file system scope.
-
-BUFFER is the name of the buffer to authorise.
-
-Return nil.
-
-Side effects: Mutates the active agent context and displays a message."
+  "Add explicitly resolved BUFFER to active scope."
   (interactive "bAdd buffer to agent scope: ")
-  (let* ((buf-name (if (bufferp buffer) (buffer-name buffer) buffer))
-         (ctx (bound-and-true-p macher-agent--persistent-context)))
+  (when (stringp buffer)
+    (setq buffer (get-buffer buffer)))
+  (cl-check-type buffer buffer)
+  (let ((buf-name (buffer-name buffer))
+        (ctx (bound-and-true-p macher-agent--persistent-context)))
     (if (not ctx)
         (error "ERROR: No active Macher Agent context found")
       (macher-agent-scope-add-file buf-name ctx)
       (message "SUCCESS: Added '%s' to the agent's authorised scope." buf-name))))
 
-(defun macher-agent-prepare-instructions (buf instructions preset)
-  "Prepare and inject sub-agent INSTRUCTIONS into BUF using PRESET.
-
-BUF is the target sub-agent buffer.
-INSTRUCTIONS is the directive text string.
-PRESET is the preset symbol or string representing requested skills.
-
-Return target buffer object.
-
-Side effects: Modifies sub-agent buffer local state and directives."
-  (when-let* ((target-buf (if (bufferp buf) buf (get-buffer buf))))
-    (with-current-buffer target-buf
-      (when preset
-        (let ((preset-list (cond ((listp preset) preset)
-                                 ((vectorp preset) (append preset nil))
-                                 (t (list preset)))))
-          (setq-local macher-agent-presets preset-list)
-          (macher-agent--apply-preset preset-list)))
-      (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
-      (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t)
-      (when (and (stringp instructions) (not (string-empty-p instructions)))
-        (erase-buffer)
-        (insert instructions)))
-    target-buf))
+(defun macher-agent-prepare-instructions (buf preset instructions)
+  "Format string INSTRUCTIONS in BUF using explicitly resolved PRESET list."
+  (when (and (stringp preset) (not (stringp instructions)))
+    (cl-rotatef preset instructions))
+  (when (symbolp preset)
+    (setq preset (list preset)))
+  (cl-check-type buf buffer)
+  (cl-check-type preset list)
+  (cl-check-type instructions string)
+  (with-current-buffer buf
+    (when preset
+      (setq-local macher-agent-presets preset)
+      (macher-agent--apply-preset preset))
+    (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
+    (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t)
+    (unless (string-empty-p instructions)
+      (erase-buffer)
+      (insert instructions)))
+  buf)
 
 (defun macher-agent-workspace-root (workspace)
-  "Retrieve the project root directory path of WORKSPACE.
+  "Return the root directory of WORKSPACE."
+  (cl-check-type workspace macher-agent-context)
+  (macher-agent-context-project-root workspace))
 
-WORKSPACE is the target workspace structure or object.
+(defun macher-agent--set-workspace-root (workspace root-path)
+  "Set the root directory of WORKSPACE."
+  (cl-check-type workspace macher-agent-context)
+  (setf (macher-agent-context-project-root workspace) root-path))
 
-Return the project root path string, or nil if unresolved.
-
-Side effects: None."
-  (macher-agent-workspace-project-root workspace))
+(gv-define-setter macher-agent-workspace-root (val workspace)
+  `(macher-agent--set-workspace-root ,workspace ,val))
 
 (defun macher-agent-context-workspace-root (context)
-  "Retrieve the project root directory from CONTEXT structure.
+  "Extract the active workspace root directly from CONTEXT."
+  (cl-check-type context macher-agent-context)
+  (macher-agent-workspace-project-root context))
 
-CONTEXT is the active context structure.
+(defun macher--validate-path-in-workspace (path workspace)
+  "Validate that PATH is strictly within WORKSPACE, expanding symlinks with `file-truename'.
 
-Return the project root path string, or nil if unresolved.
+PATH is the file path string to validate.
+WORKSPACE is the workspace structure or object.
 
-Side effects: None."
-  (when context
-    (or (when (macher-agent-context-p context)
-          (macher-agent-context-project-root context))
-        (when-let* ((workspace (macher-agent-context-workspace context)))
-          (macher-agent-workspace-project-root workspace)))))
+Return the canonical resolved path string.
+Side effects: Signals error if PATH escapes WORKSPACE."
+  (let* ((ws-root (cond
+                   ((and (fboundp 'macher-agent-workspace-root)
+                         (macher-agent-context-p workspace))
+                    (macher-agent-workspace-root workspace))
+                   ((consp workspace)
+                    (file-truename (expand-file-name (if (stringp (cdr workspace)) (cdr workspace) (car workspace)))))
+                   ((stringp workspace)
+                    (file-truename (expand-file-name workspace)))
+                   (t (file-truename default-directory))))
+         (canonical-ws (and ws-root (file-name-as-directory (file-truename (expand-file-name ws-root)))))
+         (canonical-path (and path (file-truename (expand-file-name path canonical-ws)))))
+    (if (or (null canonical-ws)
+            (file-in-directory-p canonical-path canonical-ws)
+            (string-prefix-p canonical-ws canonical-path)
+            (string-prefix-p canonical-ws (file-name-as-directory canonical-path))
+            (string= canonical-path (directory-file-name canonical-ws)))
+        canonical-path
+      (error "SECURITY ERROR: You do not have permission to access '%s'" path))))
 
-(defalias 'macher-context-workspace-root #'macher-agent-context-workspace-root)
-
-(defun macher-agent-log-tool-intent (context type target args)
-  "Log tool execution intent entry to CONTEXT audit log.
-
-CONTEXT is the active context structure.
-TYPE is the invocation type string, such as gptel-tool or ptc.
-TARGET is the tool identifier name string or PTC primitive symbol.
-ARGS is the list of parameters passed to the tool.
-
-Return the updated audit log list, or nil if CONTEXT is invalid.
-
-Side effects: Mutates CONTEXT audit log property list."
-  (when (and context (macher-agent-context-p context))
-    (let* ((plugins (macher-agent-context-plugins context))
-           (log (when (macher-agent--plist-p plugins)
-                  (plist-get plugins :audit-log)))
-           (preset-sym (bound-and-true-p macher-agent--active-skill-sym))
-           (preset-str (if preset-sym
-                           (if (symbolp preset-sym)
-                               (symbol-name preset-sym)
-                             (format "%s" preset-sym))
-                         "unknown"))
-           (entry `((timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S"))
-                    (buffer . ,(buffer-name))
-                    (preset . ,preset-str)
-                    (type . ,type)
-                    (target . ,target)
-                    (args . ,args)))
-           (updated-log (append log (list entry))))
-      (setf (macher-agent-context-plugins context)
-            (plist-put (copy-sequence plugins) :audit-log updated-log))
-      updated-log)))
+(defun macher-agent-log-tool-intent (context tool args target &optional extra)
+  "Log intent directly mapped to CONTEXT struct."
+  (cl-check-type context macher-agent-context)
+  (let* ((type (cond
+                ((and (stringp tool) (member tool '("gptel-tool" "ptc"))) tool)
+                ((stringp extra) extra)
+                (t "gptel-tool")))
+         (actual-target (cond
+                         ((and (stringp args) (listp target)) args)
+                         ((stringp target) target)
+                         ((stringp tool) tool)
+                         (t (format "%s" tool))))
+         (actual-args (cond
+                       ((listp target) target)
+                       ((listp args) args)
+                       (t nil)))
+         (plugins (macher-agent-context-plugins context))
+         (log (when (macher-agent--plist-p plugins)
+                (plist-get plugins :audit-log)))
+         (preset-sym (bound-and-true-p macher-agent--active-skill-sym))
+         (preset-str (if preset-sym
+                         (if (symbolp preset-sym)
+                             (symbol-name preset-sym)
+                           (format "%s" preset-sym))
+                       "unknown"))
+         (entry `((timestamp . ,(format-time-string "%Y-%m-%dT%H:%M:%S"))
+                  (buffer . ,(buffer-name))
+                  (preset . ,preset-str)
+                  (type . ,type)
+                  (target . ,actual-target)
+                  (args . ,actual-args)))
+         (updated-log (append log (list entry))))
+    (setf (macher-agent-context-plugins context)
+          (plist-put (copy-sequence plugins) :audit-log updated-log))
+    updated-log))
 
 (defun macher-agent-force-review (&optional context)
   "Trigger task flush hook for pending reviews.
