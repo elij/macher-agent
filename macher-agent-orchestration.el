@@ -1083,6 +1083,7 @@ Resolve context, clone it, and determine target directory in STATE."
                   (needs-gptel (not gptel-mode)))
         (gptel-mode 1))
 
+      ;; Inside macher-agent-subagent-pipe--init-buffer
       (when-let* ((is-live (buffer-live-p parent)))
         (setq-local gptel-model (buffer-local-value 'gptel-model parent))
         (setq-local gptel-backend (buffer-local-value 'gptel-backend parent))
@@ -1095,6 +1096,10 @@ Resolve context, clone it, and determine target directory in STATE."
          macher-agent--boot-directive
          (with-current-buffer parent (bound-and-true-p macher-agent--boot-directive)))
         (setq-local gptel--known-presets (buffer-local-value 'gptel--known-presets parent))
+        
+        ;; FIX: Inherit known tools so the subagent can resolve preset dependencies
+        (setq-local gptel--known-tools (buffer-local-value 'gptel--known-tools parent))
+        
         (setq-local gptel-directives (buffer-local-value 'gptel-directives parent)))
 
       (when-let* ((c-ctx cloned-ctx))

@@ -292,15 +292,13 @@ Side effects: Stubs duplicate tool usage blocks with JSON omitted notice."
                         (buffer-local-value 'macher-agent--persistent-context buf)))))
     (when (and context buf (buffer-live-p buf))
       (with-current-buffer buf
-        (unless (and (local-variable-p 'gptel--known-presets buf)
-                     (buffer-local-value 'gptel--known-presets buf))
-          (when (local-variable-p 'gptel--known-presets buf)
-            (macher-agent-initialize-skills context))))
+        (unless (macher-agent-context-skills context)
+          (macher-agent-initialize-skills context))
+        (macher-agent--sync-gptel-known-presets (macher-agent-workspace-skills-alist context)))
       (when (local-variable-p 'gptel--known-presets buf)
         (setf (macher-agent-transmission-state-known-presets state)
               (buffer-local-value 'gptel--known-presets buf)))))
   state)
-
 
 (defun macher-agent--transformer-sync-context (orig-buf context)
   "Sync CONTEXT struct to live ORIG-BUF."

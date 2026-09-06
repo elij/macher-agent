@@ -101,8 +101,7 @@ Side effects: None."
   "Parse explicitly mapped FILEPATH string strictly bound to CONTEXT struct."
   (cl-check-type filepath string)
   (cl-check-type context macher-agent-context)
-  (unless (file-exists-p filepath)
-    (error "Skill file not found: %s" filepath))
+  
   (let* ((workspace-root (macher-agent-context-project-root context))
          (abs-file (expand-file-name filepath))
          (rel-to-workspace (when (and workspace-root abs-file)
@@ -112,6 +111,10 @@ Side effects: None."
          (candidates (delq nil (list filepath abs-file rel-to-workspace visiting-buf-name)))
          (vfs-content (when (fboundp 'macher-agent--resolve-skill-vfs-content)
                         (macher-agent--resolve-skill-vfs-content candidates context))))
+    
+    (unless (or (file-exists-p filepath) vfs-content)
+      (error "Skill file not found on disk or in VFS: %s" filepath))
+    
     (with-temp-buffer
       (let ((org-inhibit-startup t))
         (setq default-directory (file-name-directory abs-file))
@@ -586,14 +589,20 @@ Return nil.
 Side effects: Reads skill file and updates skills association list."
   (cl-check-type path string)
   (cl-check-type context macher-agent-context)
-  (let ((skill-file (cond
-                     ((and (file-directory-p path)
-                           (file-exists-p (expand-file-name "SKILL.md" path)))
-                      (expand-file-name "SKILL.md" path))
-                     ((and (file-regular-p path)
-                           (string-match-p "\\.md$" path))
-                      path)
-                     (t nil))))
+  
+  (let* ((in-vfs (and (fboundp 'macher-agent--read-context-file)
+                      (ignore-errors (macher-agent--read-context-file context path))))
+         (skill-file (cond
+                      ((and (file-directory-p path)
+                            (file-exists-p (expand-file-name "SKILL.md" path)))
+                       (expand-file-name "SKILL.md" path))
+                      ((and (file-regular-p path)
+                            (string-match-p "\\.md$" path))
+                       path)
+                      ((and in-vfs
+                            (string-match-p "\\.md$" path))
+                       path)
+                      (t nil))))
     (when skill-file
       (let ((parsed (macher-agent-parse-skill-file skill-file context)))
         (when parsed
