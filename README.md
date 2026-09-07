@@ -261,4 +261,11 @@ This project draws architectural patterns, memory management concepts, and evalu
       url={https://github.com/bojieli/ai-agent-book}
 }
 
+@misc{google2025a2aspec,
+      title={Agent-to-Agent (A2A) Protocol Specification},
+      author={{Google LLC and Linux Foundation}},
+      year={2025},
+      howpublished={\url{https://github.com/google/a2a}},
+      url={https://github.com/google/a2a}
+}
 ```

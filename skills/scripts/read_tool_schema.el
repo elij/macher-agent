@@ -13,11 +13,18 @@
 
 (put 'macher-agent-read-tool-schema-tool 'ptc-function
      (lambda (tool-name &optional context)
-       (let* ((registry (or (when (macher-agent-valid-context-p context)
-                              (macher-agent-context-tools context))
-                            (bound-and-true-p macher-agent-tools-registry)))
-              (tool (when (hash-table-p registry)
-                      (gethash tool-name registry))))
+       (let* ((name-str (if (stringp tool-name) tool-name (symbol-name tool-name)))
+              (tool (or 
+                     (when (fboundp 'gptel-get-tool)
+                       (ignore-errors (gptel-get-tool name-str)))
+                     (when (bound-and-true-p gptel--known-tools)
+                       (cl-loop for cat in gptel--known-tools
+                                thereis (alist-get name-str (cdr cat) nil nil #'equal)))
+                     (let ((registry (or (when (macher-agent-valid-context-p context)
+                                           (macher-agent-context-tools context))
+                                         (bound-and-true-p macher-agent-tools-registry))))
+                       (when (hash-table-p registry)
+                         (gethash name-str registry))))))
          (if tool
              (json-encode (gptel-tool-args tool))
-           (format "ERROR: Tool '%s' not found." tool-name)))))
+           (format "ERROR: Tool '%s' not found." name-str)))))
