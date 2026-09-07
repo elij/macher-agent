@@ -8,6 +8,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'macher)
 (require 'macher-agent-core)
 
 (defvar gptel-directives)
@@ -16,19 +17,6 @@
 (defvar macher--workspace)
 
 (declare-function project-root "project" (project))
-(declare-function macher--workspace-hash "macher" (workspace &optional len))
-(declare-function macher--workspace-name "macher" (workspace))
-(declare-function macher--build-patch "macher" (context &optional fsm))
-(declare-function macher--make-context "macher" (&rest args))
-(declare-function make-macher-context "macher" (&rest args))
-(declare-function macher-context-p "macher" (obj))
-(declare-function macher-context-workspace "macher" (ctx))
-(declare-function macher-context-contents "macher" (ctx))
-(declare-function macher-context-dirty-p "macher" (ctx))
-(declare-function macher-context-shadow-buffers "macher" (ctx))
-(declare-function macher-context-data "macher" (ctx))
-(declare-function macher-context-prompt "macher" (ctx))
-(declare-function macher-patch-buffer "macher" (workspace))
 
 (defun macher-agent--unwrap-workspace (ws)
   "Unwrap the raw properties from WS context struct."
@@ -141,18 +129,12 @@
          (mapped-contents (mapcar (lambda (entry)
                                     (macher-agent-vfs-entry-to-macher-entry entry canonical-root))
                                   vfs-entries))
-         (ephemeral-ctx (if (fboundp 'macher--make-context)
-                            (macher--make-context
-                             :contents mapped-contents
-                             :workspace ws
-                             :prompt prompt
-                             :dirty-p t)
-                          (when (fboundp 'make-macher-context)
-                            (make-macher-context
-                             :contents mapped-contents
-                             :workspace ws
-                             :prompt prompt
-                             :dirty-p t))))
+         (ephemeral-ctx (when (fboundp 'macher--make-context)
+                          (funcall 'macher--make-context
+                                   :contents mapped-contents
+                                   :workspace ws
+                                   :prompt prompt
+                                   :dirty-p t)))
          (patch-result (when (fboundp 'macher--build-patch)
                          (let ((default-directory (if canonical-root
                                                       (file-name-as-directory canonical-root)
@@ -213,21 +195,6 @@ Side effects: Modifies global Macher tables, hooks, and symbol definitions."
            (ctx (macher-agent--make-context :project-root root :plugins plugins)))
       (when (and ctx prompt)
         (setf (macher-agent-context-prompt ctx) prompt))
-
-      (when (and (macher-agent-context-p ctx)
-                 (or (fboundp 'macher--make-context) (fboundp 'make-macher-context)))
-        (let ((proxy (let ((macher-agent--persistent-context nil))
-                       (if (fboundp 'macher--make-context)
-                           (funcall 'macher--make-context
-                                    :workspace ws
-                                    :contents contents
-                                    :prompt prompt)
-                         (funcall 'make-macher-context
-                                  :workspace ws
-                                  :contents contents
-                                  :prompt prompt)))))
-          (setf (macher-agent-context-plugins ctx)
-                (plist-put (copy-sequence (macher-agent-context-plugins ctx)) :upstream-proxy proxy))))
       ctx)))
 
 (defun macher-agent--get-active-workspace ()
@@ -332,7 +299,6 @@ Side effects: May initialise workspace state for current directory."
   "Install context resolution pipeline steps."
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--explicit 10)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--buffer 15)
-  (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-resolve-from-transit-payload 15)
   (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--lazy-init 80))
 
 (cl-defun make-macher-agent-workspace (&key project-root &allow-other-keys)
@@ -393,7 +359,8 @@ Return the copied workspace."
   (macher-agent--workspace-get-hash-table ctx :mtime-tracker))
 
 (defun macher-agent-workspace-tools-registry (ctx)
-  "Extract combined tools registry for CTX, overlaying workspace tools on global tools."
+  "Extract combined tools registry for CTX.
+Overlays workspace tools on global tools."
   (cl-check-type ctx macher-agent-context)
   (let ((local-table (or (macher-agent-context-tools ctx)
                          (let ((plugins (macher-agent-context-plugins ctx)))
@@ -408,7 +375,8 @@ Return the copied workspace."
     merged-table))
 
 (defun macher-agent-workspace-skills-alist (ctx)
-  "Extract skills alist for CTX, merging local workspace skills over global skills."
+  "Extract skills alist for CTX.
+Merges local workspace skills over global skills."
   (cl-check-type ctx macher-agent-context)
   (let ((local-skills (or (macher-agent-context-skills ctx)
                           (let ((plugins (macher-agent-context-plugins ctx)))

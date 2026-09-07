@@ -93,7 +93,8 @@ Side effects: None."
 
 (defun macher-agent--fsm-hijack-transform (arg1 &optional arg2)
   "Adapter Boundary: Mutate the FSM to inject media, callbacks, and patches.
-Dynamically resolves incoming arguments to support varying Emacs execution trampolines."
+Dynamically resolves incoming arguments to support varying Emacs execution
+trampolines."
 
   (let* ((callback (cond ((functionp arg1) arg1)
                          ((functionp arg2) arg2)
@@ -571,7 +572,8 @@ to the base prompt for this single request frame."
   state)
 
 (defun macher-agent--compile-transmission-payload (orig-buf presets skills redirected-skill &optional context)
-  "Compile payload strictly for live ORIG-BUF using unary transmission pipeline steps."
+  "Compile payload strictly for live ORIG-BUF.
+Uses unary transmission pipeline steps."
   (cl-check-type orig-buf buffer)
   (let ((initial-state (make-macher-agent-transmission-state
                         :target-buffer orig-buf
@@ -797,7 +799,8 @@ Side effects: Schedules asynchronous timer to reap target buffer."
 
 (defun macher-agent-sweep-subagents (originator-name &optional force-terminal)
   "Execute sweep exclusively for string ORIGINATOR-NAME.
-When FORCE-TERMINAL is non-nil, cleans up both ephemeral and non-ephemeral children."
+When FORCE-TERMINAL is non-nil, cleans up both ephemeral
+and non-ephemeral children."
   (cl-check-type originator-name string)
   (let ((visited (make-hash-table :test 'equal)))
     (letrec ((sweep-subagent-tree
@@ -965,7 +968,8 @@ Prevent recursive media injection loops during state transitions.")
         t))))
 
 (defun macher-agent--perform-pending-media-injection (fsm)
-  "Inject base64 media directly into FSM payload enforcing a strict string contract."
+  "Inject base64 media directly into FSM payload.
+Enforces a strict string contract."
   (let* ((info (ignore-errors (gptel-fsm-info fsm)))
          (ctx (when (macher-agent--plist-p info)
                 (or (plist-get info :macher-agent-context)
@@ -989,7 +993,7 @@ Prevent recursive media injection loops during state transitions.")
              (msg-plist (if parsed-list
                             (car parsed-list)
                           (list :role "user" :content msg-text)))
-             
+
              (prompts (list msg-plist))
              (media-spec (if (consp media) media (list media :mime "image/png")))
              (gptel-context (list media-spec)))
@@ -1217,7 +1221,6 @@ Return nil.
 Side effects: Creates new chat buffer and sets buffer-local agent variables."
   (interactive "sNew branch name: ")
   (let* ((parent-buf (current-buffer))
-         (parent-name (buffer-name parent-buf))
          (parent-mode major-mode)
          (content (buffer-string))
          (active-backend gptel-backend)
@@ -1370,7 +1373,8 @@ Side effects: Initiates gptel network request."
   "Track wrapped `gptel-tool' instances in a hash table.")
 
 (defun macher-agent--extract-tool-name (tool)
-  "Extract canonical name string from TOOL struct, string, symbol, or alist pair."
+  "Extract canonical name string from TOOL.
+Accepts a tool struct, string, symbol, or alist pair."
   (let ((actual-tool (if (consp tool) (cdr tool) tool)))
     (cond
      ((and (fboundp 'gptel-tool-p) (gptel-tool-p actual-tool))
@@ -1551,7 +1555,7 @@ Side effects: Mutates tool functions in `gptel--known-tools' and populates
       (condition-case nil
           (gptel-abort buf)
         (wrong-number-of-arguments
-         (gptel-abort))))))
+         (funcall (symbol-function 'gptel-abort)))))))
 
 (provide 'macher-agent-gptel)
 ;;; macher-agent-gptel.el ends here

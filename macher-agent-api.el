@@ -132,7 +132,8 @@ Side effects: Mutates CONTEXT scope list."
   (macher-agent-workspace-project-root context))
 
 (defun macher--validate-path-in-workspace (path workspace)
-  "Validate that PATH is strictly within WORKSPACE, expanding symlinks with `file-truename'.
+  "Validate that PATH is strictly within WORKSPACE.
+Expands symlinks with `file-truename'.
 
 PATH is the file path string to validate.
 WORKSPACE is the workspace structure or object.

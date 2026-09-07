@@ -421,7 +421,8 @@ Return the TOP-K highest-ranked `macher-agent-zero-mem-trace' structs."
 ;;;; 5. Event Horizon and Trace Indexing
 
 (defvar-local macher-agent-zero-mem--event-horizon nil
-  "Buffer-local event horizon plist (:line L :offset O) demarcating truncation boundary.")
+  "Buffer-local event horizon plist (:line L :offset O).
+Demarcates the truncation boundary.")
 
 (defun macher-agent-zero-mem--calculate-event-horizon (orig-buf)
   "Extract event index marker explicitly from ORIG-BUF live state."
@@ -535,11 +536,13 @@ Maps session or buffer identifiers to compiled relational trace graphs.")
 (defun macher-agent-memory--persist-interaction (&optional buffer)
   "Commit conversation history in BUFFER to vector storage.
 
-BUFFER is the optional interaction buffer, defaulting to the current buffer.
-Demarcates completed turns based on prompt/response boundaries and records line numbers/offsets.
+BUFFER is the optional interaction buffer, defaulting to current buffer.
+Demarcates completed turns based on prompt/response boundaries
+and records line numbers/offsets.
 
 Return the committed vector storage graph structure, or nil if no traces exist.
-Side effects: Populates `macher-agent-memory-vector-storage` with interaction traces."
+Side effects: Populates `macher-agent-memory-vector-storage'
+with interaction traces."
   (let* ((buf (or buffer (current-buffer)))
          (buf-name (cond
                     ((bufferp buf) (buffer-name buf))
@@ -835,7 +838,8 @@ Side effects: Populates `macher-agent-memory-vector-storage` with interaction tr
 ;;;; 8. Search Backend with Event Horizon Filtering
 
 (defun macher-agent-memory-search-zero-mem (orig-buf keywords &optional ctx-lines)
-  "Execute memory recall sequence reliant exclusively on live ORIG-BUF and KEYWORDS list."
+  "Execute memory recall sequence.
+Relies exclusively on live ORIG-BUF and KEYWORDS list."
   (when (and (listp orig-buf) (bufferp keywords))
     (cl-rotatef orig-buf keywords))
   (when (stringp keywords)

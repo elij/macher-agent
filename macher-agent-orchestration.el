@@ -18,6 +18,7 @@
 
 (defvar gptel--known-presets)
 (defvar gptel-directives)
+(defvar macher-agent--pending-callbacks)
 
 (defvar macher-agent-active-subagents nil
   "Store active sub-agents and their locked directories as an alist.
@@ -562,13 +563,12 @@ Safely accommodates strings, live buffer objects, and symbols."
                (and (macher-agent-ready-to-reap-p)
                     (or (bound-and-true-p macher-agent-task-finished)
                         (bound-and-true-p macher-agent--ready-to-reap)))))
-    (let ((name (buffer-name buf)))
-      (macher-agent--remove-active-subagent-registries buf)
-      (with-current-buffer buf
-        (set-buffer-modified-p nil)
-        (ignore-errors (macher-agent-bridge-abort buf))
-        (let ((kill-buffer-query-functions nil))
-          (kill-buffer buf))))))
+    (macher-agent--remove-active-subagent-registries buf)
+    (with-current-buffer buf
+      (set-buffer-modified-p nil)
+      (ignore-errors (macher-agent-bridge-abort buf))
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buf)))))
 
 (defun macher-agent--compose-merge-system-prompt (current-sys sym sys-spec)
   "Merge SYS-SPEC into CURRENT-SYS for skill SYM.
@@ -1078,10 +1078,10 @@ Resolve context, clone it, and determine target directory in STATE."
          macher-agent--boot-directive
          (with-current-buffer parent (bound-and-true-p macher-agent--boot-directive)))
         (setq-local gptel--known-presets (buffer-local-value 'gptel--known-presets parent))
-        
+
         ;; FIX: Inherit known tools so the subagent can resolve preset dependencies
         (setq-local gptel--known-tools (buffer-local-value 'gptel--known-tools parent))
-        
+
         (setq-local gptel-directives (buffer-local-value 'gptel-directives parent)))
 
       (when-let* ((c-ctx cloned-ctx))

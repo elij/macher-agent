@@ -817,8 +817,7 @@ Side effects: Toggles block visibility in Org mode or Markdown mode."
   (cl-check-type target-buf buffer)
   (cl-check-type tool-lisp-sym symbol)
   (cl-check-type resolved-tool gptel-tool)
-  (let* ((sym-name (symbol-name tool-lisp-sym))
-         (clean-name (gptel-tool-name resolved-tool))
+  (let* ((clean-name (gptel-tool-name resolved-tool))
          (hyphen-name (replace-regexp-in-string "_" "-" clean-name))
          (under-name (replace-regexp-in-string "-" "_" clean-name))
          (tool-var-hyphen (intern-soft (format "macher-agent-%s-tool" hyphen-name)))
@@ -980,8 +979,7 @@ Side effects: Evaluates Lisp code in a sandboxed environment."
             (when (boundp 'macher-agent-sandbox--functions)
               (setq macher-agent-sandbox--functions (make-hash-table :test 'eq)))
             (macher-agent-sandbox--init prims))
-          (let* ((ast (macroexpand-all (let ((read-eval nil))
-                                         (read (format "(progn\n%s\n)" script)))))
+          (let* ((ast (macroexpand-all (read (format "(progn\n%s\n)" script))))
                  (iterator (with-current-buffer target-buf
                              (macher-agent-sandbox--eval-iter ast nil)))
                  (stop-iter-fn (lambda (reason)
@@ -1015,35 +1013,41 @@ Return the result of evaluating EXPRESSION.
 
 Side effects: Evaluates sandboxed Lisp expression."
   (declare (ftype (function (t list t t) t)))
-  (let ((macher-agent-sandbox--primitives (make-hash-table :test 'eq))
-        (macher-agent-sandbox--functions (make-hash-table :test 'eq))
-        (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
-    (macher-agent-sandbox--init extra-operations)
-    (let* ((iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
-           (yield-val nil)
-           (next-yield nil))
-      (if (null iterator)
-          (error "macher-agent-sandbox--eval-iter is unmapped")
-        (condition-case err
-            (while t
-              (setq next-yield (iter-next iterator yield-val))
-              (let ((tc (cond
-                         ((macher-agent-tool-call-p next-yield) next-yield)
-                         ((and (listp next-yield)
-                               (or (eq (plist-get next-yield :interrupt) 'tool-call)
-                                   (plist-get next-yield :name)))
-                          (make-macher-agent-tool-call
-                           :name (or (plist-get next-yield :name) (plist-get next-yield :target))
-                           :args (or (plist-get next-yield :args) (plist-get next-yield :payload))))
-                         (t nil))))
-                (when (and tc (macher-agent-tool-call-name tc))
-                  (let ((target (macher-agent-tool-call-name tc))
-                        (args (macher-agent-tool-call-args tc)))
-                    (when (and context target)
-                      (when (fboundp 'macher-agent-log-tool-intent)
-                        (macher-agent-log-tool-intent context "ptc" target args))))))
-              (setq yield-val next-yield))
-          (iter-end-of-sequence (cdr err)))))))
+  (let ((run-eval
+         (lambda ()
+           (let ((macher-agent-sandbox--primitives (make-hash-table :test 'eq))
+                 (macher-agent-sandbox--functions (make-hash-table :test 'eq))
+                 (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
+             (macher-agent-sandbox--init extra-operations)
+             (let* ((iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
+                    (yield-val nil)
+                    (next-yield nil))
+               (if (null iterator)
+                   (error "macher-agent-sandbox--eval-iter is unmapped")
+                 (condition-case err
+                     (while t
+                       (setq next-yield (iter-next iterator yield-val))
+                       (let ((tc (cond
+                                  ((macher-agent-tool-call-p next-yield) next-yield)
+                                  ((and (listp next-yield)
+                                        (or (eq (plist-get next-yield :interrupt) 'tool-call)
+                                            (plist-get next-yield :name)))
+                                   (make-macher-agent-tool-call
+                                    :name (or (plist-get next-yield :name) (plist-get next-yield :target))
+                                    :args (or (plist-get next-yield :args) (plist-get next-yield :payload))))
+                                  (t nil))))
+                         (when (and tc (macher-agent-tool-call-name tc))
+                           (let ((target (macher-agent-tool-call-name tc))
+                                 (args (macher-agent-tool-call-args tc)))
+                             (when (and context target)
+                               (when (fboundp 'macher-agent-log-tool-intent)
+                                 (macher-agent-log-tool-intent context "ptc" target args))))))
+                       (setq yield-val next-yield))
+                   (iter-end-of-sequence (cdr err)))))))))
+    (if (and (bufferp target-buf) (buffer-live-p target-buf))
+        (with-current-buffer target-buf
+          (funcall run-eval))
+      (funcall run-eval))))
 
 (defun macher-agent-sandbox-append-ptc-to-transmission (state)
   "Append PTC instructions explicitly to a transmission STATE struct."
@@ -1057,7 +1061,7 @@ Side effects: Evaluates sandboxed Lisp expression."
                 (macher-agent-transmission-state-directives state))))))
   state)
 
-(defun macher-agent-sandbox-append-ptc-to-plist (state &optional _item)
+(defun macher-agent-sandbox-append-ptc-to-plist (state)
   "Append PTC instructions explicitly to a STATE property list."
   (cl-check-type state list)
   (let ((prims (plist-get state :ptc-primitives)))

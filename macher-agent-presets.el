@@ -101,7 +101,7 @@ Side effects: None."
   "Parse explicitly mapped FILEPATH string strictly bound to CONTEXT struct."
   (cl-check-type filepath string)
   (cl-check-type context macher-agent-context)
-  
+
   (let* ((workspace-root (macher-agent-context-project-root context))
          (abs-file (expand-file-name filepath))
          (rel-to-workspace (when (and workspace-root abs-file)
@@ -111,10 +111,10 @@ Side effects: None."
          (candidates (delq nil (list filepath abs-file rel-to-workspace visiting-buf-name)))
          (vfs-content (when (fboundp 'macher-agent--resolve-skill-vfs-content)
                         (macher-agent--resolve-skill-vfs-content candidates context))))
-    
+
     (unless (or (file-exists-p filepath) vfs-content)
       (error "Skill file not found on disk or in VFS: %s" filepath))
-    
+
     (with-temp-buffer
       (let ((org-inhibit-startup t))
         (setq default-directory (file-name-directory abs-file))
@@ -499,7 +499,8 @@ Side effects: Mutates `gptel--known-tools' association list."
             tool))))
 
 (defun macher-agent--sync-gptel-known-presets (skills-alist)
-  "Publish SKILLS-ALIST into buffer-local `gptel--known-presets' and `gptel--known-tools'.
+  "Publish SKILLS-ALIST into buffer-local gptel tables.
+Specifically targets `gptel--known-presets' and `gptel--known-tools'.
 
 SKILLS-ALIST is an association list of (SYMBOL . PLIST).
 
@@ -589,7 +590,7 @@ Return nil.
 Side effects: Reads skill file and updates skills association list."
   (cl-check-type path string)
   (cl-check-type context macher-agent-context)
-  
+
   (let* ((in-vfs (and (fboundp 'macher-agent--read-context-file)
                       (ignore-errors (macher-agent--read-context-file context path))))
          (skill-file (cond
@@ -700,7 +701,8 @@ skills into a temporary sandbox and promoting them to global defaults."
         (macher-agent--sync-gptel-known-presets merged)))))
 
 (defun macher-agent-refresh-skills-and-tools (context)
-  "Reset buffer-local GPTel tables to defaults, then reload skills and tools for CONTEXT.
+  "Reset buffer-local GPTel tables to defaults.
+Then reloads skills and tools for CONTEXT.
 
 CONTEXT is a typed `macher-agent-context' struct.
 
@@ -799,7 +801,7 @@ Side effects: None."
           (or (ignore-errors (gptel-get-tool tool-name))
               (ignore-errors (gptel-get-tool normalised-target)))))))
 
-(defun macher-agent--select-resolved-tool (resolved item)
+(defun macher-agent--select-resolved-tool (resolved _item)
   "Select strictly validated RESOLVED struct."
   (cl-check-type resolved gptel-tool)
   (list resolved))

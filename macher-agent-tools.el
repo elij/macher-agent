@@ -21,7 +21,8 @@
 
 (defmacro macher-agent-with-presentation-context (args &rest body)
   "Execute BODY with named ARGS and an injected `context` variable.
-Strictly asserts the presence of an active gptel FSM and extracts context directly."
+Strictly asserts the presence of an active gptel FSM and extracts
+context directly."
   (declare (indent 1))
   (let ((cb-sym (gensym "cb-"))
         (fsm-sym (gensym "fsm-")))
@@ -41,21 +42,6 @@ Strictly asserts the presence of an active gptel FSM and extracts context direct
                (funcall ,cb-sym (progn ,@body)))
            (error
             (funcall ,cb-sym (format "Error executing tool: %s" (error-message-string err)))))))))
-
-;;; Argument Extraction
-
-(defun macher-agent--spec-has-param-p (args-spec key)
-  "Return non-nil if KEY matches any parameter name in ARGS-SPEC.
-
-ARGS-SPEC is the expected argument schema specification list.
-KEY is the candidate parameter symbol or string.
-
-Return t if KEY matches a parameter name in ARGS-SPEC, nil otherwise.
-Side effects: None."
-  (cl-some (lambda (spec)
-             (let ((name (plist-get spec :name)))
-               (and name (macher-agent--param-name-matches-p key name))))
-           args-spec))
 
 ;;; Instruction Queue
 

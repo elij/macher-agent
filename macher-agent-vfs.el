@@ -104,7 +104,12 @@ Functions in this hook receive the active `macher-agent-context' struct.")
                        (plist-get payload :resource_path)
                        (plist-get payload :resource-path)
                        (plist-get payload :path)))
-             (task-id (or (plist-get payload :task-id) (macher-agent--generate-uuid)))
+             (task-id (or (plist-get payload :task-id)
+                          (md5 (format "%s%s%s%s"
+                                       (emacs-pid)
+                                       (current-time)
+                                       (random)
+                                       (recent-keys)))))
              (explicit-cb (plist-get payload :callback))
              (cb (or explicit-cb
                      (when path (gethash path macher-agent--pending-callbacks)))))
@@ -907,7 +912,8 @@ Fails fast by signaling an error if the context cannot be resolved.
 Evaluates CONTEXT exactly once using uninterned lexical symbols.
 
 Return the result of evaluating the last form in BODY.
-Side effects: Binds `macher-agent--persistent-context' and adjusts `default-directory'."
+Side effects: Binds `macher-agent--persistent-context'
+and adjusts `default-directory'."
   (declare (indent 1) (debug t))
   (let ((raw-ctx-sym (gensym "raw-ctx-"))
         (ctx-sym (gensym "ctx-"))
@@ -930,9 +936,9 @@ Side effects: Binds `macher-agent--persistent-context' and adjusts `default-dire
          ,@body))))
 
 (defun macher-agent--expressive-patch-buffer-name (context patch-type &optional orig-buf)
-  "Build expressive patch buffer name strictly from CONTEXT, PATCH-TYPE, and ORIG-BUF.
+  "Build expressive patch buffer name from CONTEXT, PATCH-TYPE, and ORIG-BUF.
 CONTEXT is a `macher-agent-context' struct.
-PATCH-TYPE is a symbol or string (e.g. 'diff or 'buffer).
+PATCH-TYPE is a symbol or string (for example `diff' or `buffer').
 ORIG-BUF is an optional buffer or buffer name string."
   (cl-check-type context macher-agent-context)
   (let* ((type-sym (if (symbolp patch-type) patch-type (intern (format "%s" patch-type))))
@@ -955,7 +961,7 @@ ORIG-BUF is an optional buffer or buffer name string."
 (defun macher-agent--build-and-rename-patch (ctx patch-type &optional files)
   "Format active patch view bound explicitly to dirty CTX struct.
 CTX is a `macher-agent-context' struct.
-PATCH-TYPE is a symbol or string designating the patch type (e.g. 'diff or 'buffer).
+PATCH-TYPE is a symbol or string (for example `diff' or `buffer').
 FILES is an optional list of `macher-agent-vfs-entry' objects."
   (cl-check-type ctx macher-agent-context)
   (let* ((type-sym (if (symbolp patch-type) patch-type (intern (format "%s" patch-type))))
@@ -1080,7 +1086,7 @@ Side effects: None."
     (macher-agent-macher-install)))
 
 (defun macher-agent--merge-contexts (parent-ctx child-ctx)
-  "Sync differential data relying on explicitly defined PARENT-CTX and CHILD-CTX structs."
+  "Sync differential data between PARENT-CTX and CHILD-CTX structs."
   (cl-check-type parent-ctx macher-agent-context)
   (cl-check-type child-ctx macher-agent-context)
   (unless (eq parent-ctx child-ctx)
@@ -1109,11 +1115,11 @@ Side effects: None."
   parent-ctx)
 
 (defun macher-agent-vfs--merge-payload (payload)
-  "Merge Virtual File System PAYLOAD into the target parent context directly.
+  "Merge Virtual File System PAYLOAD into target parent context directly.
 
 PAYLOAD is a `macher-agent-transit-payload' struct, a property list,
 or a `macher-agent-context' struct.
-Applies file diffs and child-context modifications to the resolved parent context,
+Applies file diffs and child-context modifications to parent context,
 handling deletions when diff items have nil content.
 Synchronises `macher-agent--persistent-context' across relevant buffers and
 updates `:target-context' on the returned payload structure.
@@ -1232,8 +1238,8 @@ Return updated PAYLOAD or context."
   (let* ((path (macher-agent-vfs-entry-path entry))
          (content (macher-agent-vfs-entry-curr entry))
          (curr (string-trim-right (or content "")))
-         (buf-name (macher-agent--resolve-buffer-name path))
-         (buf (when buf-name (get-buffer buf-name))))
+         (buf (cond ((bufferp path) (when (buffer-live-p path) path))
+                    ((stringp path) (or (get-buffer path) (get-file-buffer path))))))
     (when (and buf (buffer-live-p buf))
       (with-current-buffer buf
         (erase-buffer)

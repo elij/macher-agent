@@ -425,9 +425,9 @@ Side effects: None."
   (with-current-buffer (or buffer (current-buffer))
     (bound-and-true-p macher-agent--ready-to-reap)))
 
-(defun macher-agent--remove-active-subagent-registries (child-buf &optional _ignored)
+(defun macher-agent--remove-active-subagent-registries (child-buf &optional fallback-buf)
   "Clear registries strictly tied to CHILD-BUF object."
-  (let ((buf (if (bufferp child-buf) child-buf (if (bufferp _ignored) _ignored (get-buffer child-buf)))))
+  (let ((buf (if (bufferp child-buf) child-buf (if (bufferp fallback-buf) fallback-buf (get-buffer child-buf)))))
     (cl-check-type buf buffer)
     (let ((child-name (buffer-name buf)))
       (when (boundp 'macher-agent-active-subagents)
@@ -487,7 +487,8 @@ Side effects: Modifies buffer-local `macher-agent--routing-stack'."
 
 (defun macher-agent--pop-routing ()
   "Pop a routing context frame from `macher-agent--routing-stack'.
-Restores the previous routing frame's task-id and suppress-patch, or clears them.
+Restores the previous routing frame's task-id and suppress-patch,
+or clears them.
 
 Return the popped frame plist, or nil if stack was empty.
 
