@@ -523,31 +523,13 @@ generation hooks."
                                (plist-get state :a2a-cb)))
                    (target-name (buffer-name child-buf))
                    (callbacks
-                    (list :success-cb
+                    (list :on-success
                           (lambda (res)
                             (let ((cb (and task-id (gethash task-id macher-agent--pending-callbacks))))
                               (when (and cb (functionp cb))
                                 (remhash task-id macher-agent--pending-callbacks)
                                 (funcall cb (list :status 'success
                                                   :data res
-                                                  :task-id task-id
-                                                  :buffer-name target-name)))))
-                          :on-success
-                          (lambda (res)
-                            (let ((cb (and task-id (gethash task-id macher-agent--pending-callbacks))))
-                              (when (and cb (functionp cb))
-                                (remhash task-id macher-agent--pending-callbacks)
-                                (funcall cb (list :status 'success
-                                                  :data res
-                                                  :task-id task-id
-                                                  :buffer-name target-name)))))
-                          :error-cb
-                          (lambda (err)
-                            (let ((cb (or (and task-id (gethash task-id macher-agent--pending-callbacks)) a2a-cb)))
-                              (when (and cb (functionp cb))
-                                (when task-id (remhash task-id macher-agent--pending-callbacks))
-                                (funcall cb (list :status 'error
-                                                  :error err
                                                   :task-id task-id
                                                   :buffer-name target-name)))))
                           :on-error

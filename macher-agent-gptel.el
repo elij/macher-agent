@@ -854,30 +854,29 @@ trigger `macher-agent-sweep-subagents`."
         (unless tool-calls
           (macher-agent-sweep-subagents (buffer-name cur) t))))))
 
-(defun macher-agent--make-transmit-response-hook (error-cb &optional err-cb2)
-  "Build response hook relying strictly on ERROR-CB function closure."
-  (let ((actual-error-cb (if (and err-cb2 (functionp err-cb2)) err-cb2 error-cb)))
-    (cl-check-type actual-error-cb function)
-    (let ((hook-fn nil))
-      (setq
-       hook-fn
-       (lambda (_beg _end)
-         (let* ((res (string-trim (buffer-substring-no-properties (point-min) (point-max))))
-                (fsm (macher-agent-get-active-fsm))
-                (info (and fsm (fboundp 'gptel-fsm-info) (ignore-errors (gptel-fsm-info fsm))))
-                (err-data (and info (plist-get info :error))))
-           (cond
-            (err-data
-             (let ((err-msg (if (stringp err-data) err-data
-                              (or (plist-get err-data :message)
-                                  (format "%s" err-data)))))
-               (funcall actual-error-cb err-msg)))
-            ((string-empty-p res)
-             (funcall actual-error-cb "Buffer stopped silently or returned empty."))
-            ((not (bound-and-true-p macher-agent-task-finished))
-             (funcall actual-error-cb "Agent halted without invoking submit_task_result.")))
-           (remove-hook 'gptel-post-response-functions hook-fn t))))
-      hook-fn)))
+(defun macher-agent--make-transmit-response-hook (on-error)
+  "Build response hook relying strictly on ON-ERROR function closure."
+  (cl-check-type on-error function)
+  (let ((hook-fn nil))
+    (setq
+     hook-fn
+     (lambda (_beg _end)
+       (let* ((res (string-trim (buffer-substring-no-properties (point-min) (point-max))))
+              (fsm (macher-agent-get-active-fsm))
+              (info (and fsm (fboundp 'gptel-fsm-info) (ignore-errors (gptel-fsm-info fsm))))
+              (err-data (and info (plist-get info :error))))
+         (cond
+          (err-data
+           (let ((err-msg (if (stringp err-data) err-data
+                            (or (plist-get err-data :message)
+                                (format "%s" err-data)))))
+             (funcall on-error err-msg)))
+          ((string-empty-p res)
+           (funcall on-error "Buffer stopped silently or returned empty."))
+          ((not (bound-and-true-p macher-agent-task-finished))
+           (funcall on-error "Agent halted without invoking submit_task_result.")))
+         (remove-hook 'gptel-post-response-functions hook-fn t))))
+    hook-fn))
 
 (defun macher-agent-gptel-transmit (task-context callbacks)
   "Transmit network request restoring buffer-centric execution.
@@ -891,20 +890,12 @@ Side effects: Modifies `gptel-system-prompt', adds response hook, and
 calls `gptel-send'."
   (let* ((target-buffer (macher-agent-task-context-target-buffer task-context))
          (sys-msg (macher-agent-task-context-system-message task-context))
-         (ctx (when (and target-buffer (buffer-live-p target-buffer))
-                (buffer-local-value 'macher-agent--persistent-context target-buffer)))
-         (success-cb (or (plist-get callbacks :on-success)
-                         (plist-get callbacks :success-cb)))
-         (error-cb (or (plist-get callbacks :on-error)
-                       (plist-get callbacks :error-cb))))
-    (when (and ctx (macher-agent-valid-context-p ctx) sys-msg)
-      (unless (macher-agent-context-prompt ctx)
-        (setf (macher-agent-context-prompt ctx) sys-msg)))
+         (on-error (plist-get callbacks :on-error)))
     (with-current-buffer target-buffer
       (when sys-msg
         (setq-local gptel-system-prompt sys-msg))
       (add-hook 'gptel-post-response-functions
-                (macher-agent--make-transmit-response-hook success-cb error-cb)
+                (macher-agent--make-transmit-response-hook on-error)
                 nil t)
       (goto-char (point-max))
       (gptel-send))))

@@ -252,18 +252,18 @@ Side effects: Invokes task flush hooks."
        (let ((script-str (prin1-to-string ',(if (> (length script-body) 1)
                                                 `(progn ,@script-body)
                                               (car script-body))))
-             (success-cb (or ,on-success (lambda (res) (message "PTC Success: %s" res))))
-             (error-cb (or ,on-error (lambda (err) (message "PTC Error: %s" err)))))
+             (success-fn (or ,on-success (lambda (res) (message "PTC Success: %s" res))))
+             (error-fn (or ,on-error (lambda (err) (message "PTC Error: %s" err)))))
 
          (macher-agent-execute-ptc-script
           script-str
           macher-agent--persistent-context
           root-buf
           (lambda (res)
-            (funcall success-cb res)
+            (funcall success-fn res)
             (when ,reap (kill-buffer root-buf)))
           (lambda (err)
-            (funcall error-cb err)
+            (funcall error-fn err)
             (when ,reap (kill-buffer root-buf)))
           nil)))))
 

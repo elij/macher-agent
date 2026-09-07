@@ -827,7 +827,7 @@ This satisfies the upstream `macher-workspace-types-alist' interface."
     (if (not (buffer-live-p buf))
         "Error: Cannot locate original conversation buffer."
       (if macher-agent-search-backend-function
-          (funcall macher-agent-search-backend-function query buf context-lines)
+          (funcall macher-agent-search-backend-function buf query context-lines)
         (macher-agent-search-glob buf query context-lines)))))
 
 (defun macher-agent--get-context-contents (ctx)
