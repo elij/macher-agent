@@ -227,3 +227,38 @@ git init
 ## Documentation and wiki
 
 For detailed guides, architectural diagrams, and cookbook patterns, refer to the [project wiki](https://github.com/elij/macher-agent/wiki).
+
+## References and inspiration
+
+This project draws architectural patterns, memory management concepts, and evaluation methodologies from the following research publications and reference materials:
+
+```bibtex
+@misc{zhang2026ratchet,
+      title={Ratchet: How Reliable Must an LLM Judge Be to Retire a Skill?}, 
+      author={Xing Zhang and Yanwei Cui and Guanghui Wang and Ziyuan Li and Wei Qiu and Bing Zhu and Peiyang He},
+      year={2026},
+      eprint={2605.22148},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2605.22148}
+}
+
+@misc{tavakoli2025beyondmilliontokens,
+      title={Beyond a Million Tokens: Benchmarking and Enhancing Long-Term Memory in LLMs}, 
+      author={Mohammad Tavakoli and Alireza Salemi and Carrie Ye and Mohamed Abdalla and Hamed Zamani and J. Ross Mitchell},
+      year={2025},
+      eprint={2510.27246},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2510.27246}
+}
+
+@misc{li2026aiagentbook,
+      title={Deep Understanding of AI Agents: Design Principles and Engineering Practice},
+      author={Bojie Li},
+      year={2026},
+      howpublished={\url{https://github.com/bojieli/ai-agent-book}},
+      url={https://github.com/bojieli/ai-agent-book}
+}
+
+```
