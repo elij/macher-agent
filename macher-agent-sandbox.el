@@ -500,7 +500,6 @@ If IS-STAR is non-nil, evaluate as `let*', otherwise evaluate as `let'."
 
 (iter-defun macher-agent-sandbox--eval-iter (expression environment)
             "Evaluate EXPRESSION in ENVIRONMENT yielding on PTC tool calls."
-            (macher-agent-sandbox--init)
             (cond
              ((or (numberp expression) (stringp expression) (memq expression '(t nil)))
               expression)
