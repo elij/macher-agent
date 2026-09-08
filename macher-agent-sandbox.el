@@ -739,9 +739,6 @@ Side effects: None."
                                          (hash-table-p macher-agent-tools-registry))
                                 (or (gethash original-name-str macher-agent-tools-registry)
                                     (gethash hyphen-name macher-agent-tools-registry))))))
-         (desc (if (macher-tool-valid-p resolved-tool)
-                   (gptel-tool-description resolved-tool)
-                 original-name-str))
          (block-reason nil))
 
     (when (bound-and-true-p gptel-pre-tool-call-functions)
@@ -758,7 +755,7 @@ Side effects: None."
 
     (if block-reason
         (error "%s" block-reason)
-      (message "PTC Executing: %s" (or desc original-name-str))
+      (message "PTC Executing: %s" original-name-str)
       (when (fboundp 'macher-agent-gptel-spoof-tool-ui)
         (macher-agent-gptel-spoof-tool-ui target-buf (intern hyphen-name)))
       (cons original-name-str resolved-tool))))
@@ -963,7 +960,7 @@ Side effects: Evaluates Lisp code in a sandboxed environment."
   (let* ((prims (append
                  '(nreverse sort delete delq nconc plist-put aset puthash remhash error signal message random emacs-version)
                  extra-operations))
-         (macher-agent--active-ptc-primitives
+         (active-ptc-prims
           (delete-dups (append extra-operations
                                (bound-and-true-p macher-agent--active-ptc-primitives))))
          (macher-agent--active-ptc-execution t))
@@ -971,7 +968,7 @@ Side effects: Evaluates Lisp code in a sandboxed environment."
         (progn
           (with-current-buffer target-buf
             (setq macher-agent--persistent-context context)
-            (setq-local macher-agent--active-ptc-primitives macher-agent--active-ptc-primitives)
+            (setq-local macher-agent--active-ptc-primitives active-ptc-prims)
             (when (boundp 'macher-agent-sandbox--globals)
               (setq macher-agent-sandbox--globals (make-hash-table :test 'eq)))
             (when (boundp 'macher-agent-sandbox--primitives)

@@ -15,30 +15,19 @@
 (defvar macher-workspace-types-alist)
 (defvar macher-workspace-functions)
 (defvar macher--workspace)
+(defvar macher-agent-global-skills-alist)
+(defvar macher-agent-tools-registry)
 
 (declare-function project-root "project" (project))
 
-(defun macher-agent--unwrap-workspace (ws)
-  "Unwrap the raw properties from WS context struct."
-  (cl-check-type ws macher-agent-context)
-  (or (macher-agent-context-project-root ws)
-      (macher-agent-context-root ws)))
-
-(defun macher-agent-macher-safe-workspace-hash (context &optional length)
-  "Generate a safe hash strictly from the CONTEXT struct."
+(defun macher-agent-macher-safe-workspace-hash (context)
+  "Generate a safe 16-character hash strictly from the CONTEXT struct."
   (cl-check-type context macher-agent-context)
-  (let* ((ws-id (or (when (fboundp 'macher-agent-context-project-root)
-                      (macher-agent-context-project-root context))
-                    (when (fboundp 'macher-agent-context-root)
-                      (macher-agent-context-root context))
-                    (when (fboundp 'macher-agent-context-workspace-root)
-                      (macher-agent-context-workspace-root context))
-                    ""))
+  (let* ((ws-id (or (macher-agent-context-project-root context) ""))
          (hash-input (secure-hash 'sha256 (concat "project" ws-id)))
          (chars "abcdefghijklmnopqrstuvwxyz0123456789")
-         (hash-length (or length 16))
          (result ""))
-    (dotimes (i hash-length)
+    (dotimes (i 16)
       (let* ((hex-char (aref hash-input i))
              (idx (mod (if (>= hex-char ?a) (- hex-char ?a -10) (- hex-char ?0)) (length chars))))
         (setq result (concat result (substring chars idx (1+ idx))))))
@@ -125,7 +114,9 @@
          (canonical-root (when raw-root
                            (file-truename (expand-file-name raw-root))))
          (ws (cons 'project canonical-root))
-         (vfs-entries (or files (macher-agent-vfs-modified-files ctx)))
+         (vfs-entries (if (fboundp 'macher-agent--gather-vfs-entries)
+                          (macher-agent--gather-vfs-entries ctx files)
+                        (or files (macher-agent-vfs-modified-files ctx))))
          (mapped-contents (mapcar (lambda (entry)
                                     (macher-agent-vfs-entry-to-macher-entry entry canonical-root))
                                   vfs-entries))
@@ -144,65 +135,32 @@
         (macher-agent-macher-patch-buffer ws))))
 
 (defun macher-agent-macher-install ()
-  "Install Macher Core integration, upstream alias, and workspace hooks.
+  "Install Macher Core integration and workspace hooks idempotently.
 
-Configures `macher--workspace-hash' alias to use safe workspace hashing,
-registers base agent workspace handlers in `macher-workspace-types-alist',
+Registers base agent workspace handlers in `macher-workspace-types-alist',
 and registers `macher-agent-workspace-agent' in `macher-workspace-functions'.
 
-Side effects: Modifies global Macher tables, hooks, and symbol definitions."
-  (when (boundp 'macher-workspace-types-alist)
-    (let* ((existing (alist-get 'agent macher-workspace-types-alist))
-           (merged (append existing '(:get-root macher-agent-workspace-project-root :get-name macher-agent--get-name))))
-      (unless (plist-get merged :get-files)
-        (setq merged (plist-put merged :get-files 'macher-agent--collect-raw-files)))
-      (setf (alist-get 'agent macher-workspace-types-alist) merged)))
-  (when (boundp 'macher-workspace-functions)
-    (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent))
-  (with-eval-after-load 'macher
-    (when (boundp 'macher-workspace-types-alist)
-      (let* ((existing (alist-get 'agent macher-workspace-types-alist))
-             (merged (append existing '(:get-root macher-agent-workspace-project-root :get-name macher-agent--get-name))))
-        (unless (plist-get merged :get-files)
-          (setq merged (plist-put merged :get-files 'macher-agent--collect-raw-files)))
-        (setf (alist-get 'agent macher-workspace-types-alist) merged)))
-    (when (boundp 'macher-workspace-functions)
-      (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent))))
-
-(defun macher-agent--make-vfs-context (workspace &rest rest)
-  "Generate a new VFS context tree explicitly for WORKSPACE list."
-  (let* ((ws (cond
-              ((eq workspace :workspace) (car rest))
-              ((and (listp workspace) (plist-member workspace :workspace))
-               (plist-get workspace :workspace))
-              (t workspace)))
-         (contents (cond
-                    ((plist-member rest :contents) (plist-get rest :contents))
-                    ((and (listp workspace) (plist-member workspace :contents)) (plist-get workspace :contents))
-                    (t nil)))
-         (prompt (cond
-                  ((plist-member rest :prompt) (plist-get rest :prompt))
-                  ((and (listp workspace) (plist-member workspace :prompt)) (plist-get workspace :prompt))
-                  (t nil))))
-    (cl-check-type ws list)
-    (let* ((root (cond
-                  ((consp ws) (if (stringp (cdr ws)) (expand-file-name (cdr ws)) (plist-get ws :project-root)))
-                  ((plist-member ws :project-root) (plist-get ws :project-root))
-                  (t default-directory)))
-           (root (if (stringp root) (expand-file-name root) (expand-file-name default-directory)))
-           (vfs-state (list :contents (or contents nil) :dirty-p nil))
-           (plugins (list :vfs vfs-state :workspace ws))
-           (ctx (macher-agent--make-context :project-root root :plugins plugins)))
-      (when (and ctx prompt)
-        (setf (macher-agent-context-prompt ctx) prompt))
-      ctx)))
+Side effects: Modifies global Macher tables and hooks."
+  (let ((register-fn
+         (lambda ()
+           (when (boundp 'macher-workspace-types-alist)
+             (let ((merged (copy-sequence (alist-get 'agent macher-workspace-types-alist))))
+               (setq merged (plist-put merged :get-root 'macher-agent-workspace-project-root))
+               (setq merged (plist-put merged :get-name 'macher-agent--get-name))
+               (unless (plist-get merged :get-files)
+                 (setq merged (plist-put merged :get-files 'macher-agent--collect-raw-files)))
+               (setf (alist-get 'agent macher-workspace-types-alist) merged)))
+           (when (boundp 'macher-workspace-functions)
+             (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent)))))
+    (funcall register-fn)
+    (with-eval-after-load 'macher
+      (funcall register-fn))))
 
 (defun macher-agent--get-active-workspace ()
   "Retrieve the globally active workspace.
 
-Return the unwrapped workspace structure, or nil if unbound."
-  (let ((ws (bound-and-true-p macher--workspace)))
-    (macher-agent--unwrap-workspace ws)))
+Return the workspace structure, or nil if unbound."
+  (bound-and-true-p macher--workspace))
 
 (defun macher-agent-trigger-patch (&optional ctx)
   "Retrieve the underlying patch buffer for CTX.
@@ -214,7 +172,8 @@ Return the live patch buffer, or nil."
   (let* ((ws (if ctx
                  (macher-agent-context-workspace ctx)
                (macher-agent--get-active-workspace)))
-         (patch-buf (and (fboundp 'macher-patch-buffer)
+         (patch-buf (and ws
+                         (fboundp 'macher-patch-buffer)
                          (macher-patch-buffer ws))))
     patch-buf))
 
@@ -316,11 +275,6 @@ WS is the workspace structure to copy.
 
 Return the copied workspace."
   (if (consp ws) (copy-tree ws) ws))
-
-(defun macher-agent-workspace-p (ws)
-  "Verify WS is a strictly formatted workspace list."
-  (cl-check-type ws list)
-  (plist-member ws :workspace-id))
 
 (defun macher-agent-context-lookup (ws-or-id)
   "Retrieve active context mapped to WS-OR-ID string."
@@ -494,7 +448,7 @@ Side effects: Invokes external process (`git` or `patch`) to apply patch."
          (ctx (or (macher-agent-context-from-buffer (current-buffer))
                   (bound-and-true-p macher-agent--persistent-context)))
          (root (if ctx
-                   (macher-agent-context-root ctx)
+                   (macher-agent-context-project-root ctx)
                  (or (locate-dominating-file default-directory ".git") default-directory)))
          (default-directory (file-name-as-directory (expand-file-name root)))
          (use-git (locate-dominating-file default-directory ".git"))

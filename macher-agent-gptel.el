@@ -1145,8 +1145,9 @@ transformer hook."
                           (make-macher-agent-workspace :project-root expanded)))
            (canonical-context
             (or existing
-                (when (fboundp 'macher-agent--make-vfs-context)
-                  (macher-agent--make-vfs-context :workspace workspace :contents nil))))
+                (macher-agent--make-context
+                 :project-root expanded
+                 :plugins (list :workspace workspace))))
            (buffer-context (if (and canonical-context (fboundp 'macher-agent--clone-context))
                                (macher-agent--clone-context canonical-context)
                              canonical-context)))
@@ -1261,8 +1262,16 @@ Side effects: Clears `macher-agent--persistent-context' and resets FSM context."
         ((raw-ws (when (bound-and-true-p macher-agent--persistent-context)
                    (macher-agent-context-workspace macher-agent--persistent-context)))
          (ws (if (stringp raw-ws) (cons 'agent raw-ws) raw-ws))
-         (fresh-ctx (when (and ws (fboundp 'macher-agent--make-vfs-context))
-                      (macher-agent--make-vfs-context :workspace ws :contents nil))))
+         (root (cond
+                ((consp ws) (if (stringp (cdr ws)) (cdr ws) (plist-get ws :project-root)))
+                ((and (fboundp 'macher-agent-workspace-p) (macher-agent-workspace-p ws))
+                 (macher-agent-workspace-project-root ws))
+                ((stringp ws) ws)
+                (t default-directory)))
+         (fresh-ctx (when ws
+                      (macher-agent--make-context
+                       :project-root (if (stringp root) (expand-file-name root) (expand-file-name default-directory))
+                       :plugins (list :workspace ws)))))
       (setq-local macher-agent--persistent-context fresh-ctx)
       (when (and (bound-and-true-p macher-agent--active-fsm)
                  (fboundp 'gptel-fsm-info))

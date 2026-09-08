@@ -953,7 +953,7 @@ ORIG-BUF is an optional buffer or buffer name string."
          (ws (macher-agent-context-workspace context))
          (ws-type (if (consp ws) (car ws) 'project))
          (ws-name (macher-agent-macher-workspace-name context))
-         (hash (macher-agent-macher-safe-workspace-hash context 4)))
+         (hash (macher-agent-macher-safe-workspace-hash context)))
     (if (and buf-name (not (string-empty-p buf-name)))
         (format "*macher-%s-patch:%s@%s<%s>[%s]*" category ws-type ws-name hash buf-name)
       (format "*macher-%s-patch:%s@%s<%s>*" category ws-type ws-name hash))))
@@ -1076,6 +1076,14 @@ Side effects: None."
                          (buffer-local-value 'macher-agent--persistent-context (current-buffer)))))
   (cl-check-type ctx macher-agent-context)
   (macher-agent-vfs-handle-flush ctx))
+
+(defun macher-agent--gather-vfs-entries (ctx &optional files)
+  "Gather VFS entries from CTX, optionally restricted to FILES."
+  (cl-check-type ctx macher-agent-context)
+  (or files
+      (macher-agent--get-context-contents ctx)
+      (when (fboundp 'macher-agent-vfs-modified-files)
+        (macher-agent-vfs-modified-files ctx))))
 
 (defun macher-agent-vfs-install ()
   "Install VFS storage hooks, patch interfaces, and pipeline steps."
