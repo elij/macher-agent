@@ -314,9 +314,10 @@ Side effects: Stubs duplicate tool usage blocks with JSON omitted notice."
   (let* ((active-fsm (macher-agent-get-active-fsm))
          (info-prompt (when active-fsm
                         (ignore-errors (plist-get (gptel-fsm-info active-fsm) :prompt)))))
-    (when info-prompt
-      (unless (macher-agent-context-prompt context)
-        (setf (macher-agent-context-prompt context) info-prompt)))
+
+    (when (and info-prompt (not (string-empty-p (string-trim info-prompt))))
+      (setf (macher-agent-context-prompt context) info-prompt))
+
     (when (and active-fsm (fboundp 'macher-agent--inject-context-into-fsm-info))
       (macher-agent--inject-context-into-fsm-info context active-fsm)))
   context)
@@ -644,8 +645,14 @@ and transforms prompt."
           (setq-local macher-agent--active-fsm active-fsm))
         (when context
           (macher-agent--transformer-sync-context orig-buf context)
+
+          (let ((raw-prompt (with-current-buffer temp-buf
+                              (string-trim (buffer-substring-no-properties (point-min) (point-max))))))
+            (unless (string-empty-p raw-prompt)
+              (setf (macher-agent-context-prompt context) raw-prompt)))
+
           (when-let* ((info-prompt (and info (plist-get info :prompt))))
-            (unless (macher-agent-context-prompt context)
+            (unless (string-empty-p (string-trim info-prompt))
               (setf (macher-agent-context-prompt context) info-prompt))))))
 
     (when (and active-fsm context)
