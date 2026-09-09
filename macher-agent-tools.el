@@ -20,17 +20,15 @@
 ;;; Presentation Macro
 
 (defmacro macher-agent-with-presentation-context (args &rest body)
-  "Execute BODY with named ARGS and an injected `context` variable.
-Strictly asserts the presence of an active gptel FSM and extracts
-context directly."
+  "Wrap tool execution to provide CONTEXT and safely route errors to the LLM via callback.
+Extracts context from active FSM or falls back to persistent context for detached PTC execution."
   (declare (indent 1))
-  (let ((cb-sym (gensym "cb-"))
-        (fsm-sym (gensym "fsm-")))
-    `(lambda (,cb-sym ,@args)
+  (let ((fsm-sym (gensym "fsm-")))
+    `(lambda (callback ,@args)
        (let* ((,fsm-sym (macher-agent-get-active-fsm))
-              (context (if ,fsm-sym
-                           (macher-agent-gptel-context-from-fsm ,fsm-sym)
-                         (error "STRICT CONTRACT VIOLATION: Tool invoked outside of active gptel FSM")))
+              (context (or (when ,fsm-sym
+                             (macher-agent-gptel-context-from-fsm ,fsm-sym))
+                           (bound-and-true-p macher-agent--persistent-context)))
               (target-buf (when ,fsm-sym
                             (or (ignore-errors (plist-get (gptel-fsm-info ,fsm-sym) :buffer))
                                 (when (fboundp 'gptel-fsm-buffer)
@@ -38,10 +36,23 @@ context directly."
          (condition-case err
              (if (and target-buf (buffer-live-p target-buf))
                  (with-current-buffer target-buf
-                   (funcall ,cb-sym (progn ,@body)))
-               (funcall ,cb-sym (progn ,@body)))
+                   (let ((res (progn ,@body)))
+                     (when (and res (functionp callback))
+                       (funcall callback res))
+                     res))
+               (let ((res (progn ,@body)))
+                 (when (and res (functionp callback))
+                   (funcall callback res))
+                 res))
            (error
-            (funcall ,cb-sym (format "Error executing tool: %s" (error-message-string err)))))))))
+            (let ((err-msg (format "ERROR: %s" (error-message-string err))))
+              (if (and target-buf (buffer-live-p target-buf))
+                  (with-current-buffer target-buf
+                    (when (functionp callback)
+                      (funcall callback err-msg)))
+                (when (functionp callback)
+                  (funcall callback err-msg)))
+              err-msg)))))))
 
 ;;; Instruction Queue
 

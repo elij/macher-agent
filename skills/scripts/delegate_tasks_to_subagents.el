@@ -14,24 +14,35 @@
                                     :required ["buffer_name" "instructions"])
                       :description "List of tasks to delegate. Set ephemeral to true unless subagents are to be reused."))
        :async t
-       :function (lambda (callback tasks)
-                   (let* ((fsm (macher-agent-get-active-fsm))
-                          (context (if fsm
-                                       (macher-agent-gptel-context-from-fsm fsm)
-                                     (bound-and-true-p macher-agent--persistent-context))))
-                     (funcall (get 'macher-agent-delegate-tasks-to-subagents-tool 'ptc-function)
-                              tasks context callback)))))
+       :function (macher-agent-with-presentation-context (tasks)
+                   (funcall (get 'macher-agent-delegate-tasks-to-subagents-tool 'ptc-function)
+                            tasks context callback)
+                   nil)))
 
 (put 'macher-agent-delegate-tasks-to-subagents-tool 'ptc-function
      (lambda (tasks context callback)
        (let* ((tasks-vec (if (vectorp tasks) tasks (vconcat tasks)))
+              (known-presets (bound-and-true-p gptel--known-presets))
               (dispatch-payloads
                (cl-loop for task across tasks-vec
                         for instructions = (plist-get task :instructions)
+                        for presets = (or (plist-get task :presets) (plist-get task :preset))
                         do (when (or (null instructions)
                                      (and (stringp instructions)
                                           (string-empty-p (string-trim instructions))))
                              (error "ERROR: Instructions for delegated tasks cannot be empty."))
+                        do (when presets
+                             (let ((p-list (cond ((vectorp presets) (append presets nil))
+                                                 ((listp presets) presets)
+                                                 ((stringp presets) (list presets))
+                                                 (t nil))))
+                               (dolist (p p-list)
+                                 (let ((p-str (if (symbolp p) (symbol-name p) p)))
+                                   (unless (cl-loop for entry in known-presets
+                                                    for k = (car entry)
+                                                    for k-str = (if (symbolp k) (symbol-name k) (format "%s" k))
+                                                    thereis (equal k-str p-str))
+                                     (error "Preset '%s' does not exist." p-str))))))
                         collect
                         (macher-agent-make-a2a-payload
                          :schema-version (if (boundp 'macher-agent-a2a-schema-version)
@@ -43,7 +54,7 @@
                          :parent-context context
                          :payload (list :instructions instructions)
                          :metadata (list :buffer_name (plist-get task :buffer_name)
-                                         :presets (or (plist-get task :presets) (plist-get task :preset))
+                                         :presets presets
                                          :ephemeral (if (plist-member task :ephemeral)
                                                         (not (eq (plist-get task :ephemeral) :json-false))
                                                       t)
