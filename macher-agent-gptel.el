@@ -368,6 +368,7 @@ Side effects: None."
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--extract-redirect 30)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--inject-dynamic-context-tools 40)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--process-hidden-blocks 50)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--auto-enable-task-tool 55)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--init-core-directives 60)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--append-boot-directive 70)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--inject-skill-directive 87)
@@ -447,6 +448,23 @@ Side effects: None."
   "Strip out UI-specific or hidden metadata before the LLM sees it.
 Currently a STATE pass-through, but acts as a hook for sanitization."
   (cl-check-type state macher-agent-transmission-state)
+  state)
+
+(defun macher-agent-pipe--auto-enable-task-tool (state)
+  "Auto-enable `submit_task_result' when buffer holds an active task identifier."
+  (cl-check-type state macher-agent-transmission-state)
+  (let* ((target-buf (or (macher-agent-transmission-state-target-buffer state)
+                         (current-buffer)))
+         (task-id (when (and target-buf (buffer-live-p target-buf))
+                    (buffer-local-value 'macher-agent--current-task-id target-buf))))
+    (when (and task-id
+               (not (cl-some (lambda (tool)
+                               (equal (macher-agent-canonical-tool-name tool) "submit_task_result"))
+                             (macher-agent-transmission-state-tools state))))
+      (when-let* ((tool (and (fboundp 'gptel-get-tool)
+                             (gptel-get-tool "submit_task_result"))))
+        (setf (macher-agent-transmission-state-tools state)
+              (append (macher-agent-transmission-state-tools state) (list tool))))))
   state)
 
 (defun macher-agent-pipe--init-core-directives (state)
