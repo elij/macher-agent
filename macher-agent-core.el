@@ -247,13 +247,6 @@ execution context.
 Return list of active primitive symbols or names.
 Side effects: Buffer-local variable.")
 
-(defvar-local macher-agent--pending-instructions-queue nil
-  "Queue of ephemeral thoughts and instructions to inject on the next turn.
-
-Return list of pending instruction strings, or nil.
-
-Side effects: Buffer-local variable.")
-
 (defvar-local macher-agent--persistent-context nil
   "Store the buffer-local persistent context structure.
 
@@ -349,7 +342,6 @@ Side effects: Buffer-local variable.")
 ;; Permanent local puts
 
 (put 'macher-agent--active-fsm 'permanent-local t)
-(put 'macher-agent--pending-instructions-queue 'permanent-local t)
 (put 'macher-agent--current-task-id 'permanent-local t)
 (put 'macher-agent--is-background 'permanent-local t)
 (put 'macher-agent--is-ephemeral 'permanent-local t)

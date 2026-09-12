@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.3.7
+;; Version: 0.8.3.8
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -24,20 +24,6 @@
   "Agent tools within the macher edit context."
   :group 'gptel
   :prefix "macher-agent-")
-
-(defun macher-agent-inject-thought (instruction)
-  "Inject a user directive while the agent is processing a tool.
-
-INSTRUCTION is a string representing the user directive to inject into
-the pending queue.
-
-Side effects: Appends INSTRUCTION formatted as a user override to the
-pending instructions list for the current session.
-
-Return the result message string displayed in the echo area."
-  (interactive "sSteer the agent: ")
-  (macher-agent-add-pending-instruction (format "USER OVERRIDE: %s" instruction))
-  (message "Instruction queued! The agent will see this when its current tool finishes."))
 
 (define-minor-mode macher-agent-mode
   "Minor mode for macher-agent session management."

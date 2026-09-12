@@ -11,12 +11,6 @@
 (require 'macher-agent-core)
 (require 'macher-agent-gptel)
 
-;;; Customisation Variables
-
-(put 'macher-agent--pending-instructions-queue 'permanent-local t)
-
-;;; Execution Helpers
-
 ;;; Presentation Macro
 
 (defmacro macher-agent-with-presentation-context (args &rest body)
@@ -53,15 +47,6 @@ Extracts context from active FSM or falls back to persistent context for detache
                 (when (functionp callback)
                   (funcall callback err-msg)))
               err-msg)))))))
-
-;;; Instruction Queue
-
-(defun macher-agent-add-pending-instruction (instruction)
-  "Format dispatch queue targeting exclusive INSTRUCTION string parameter."
-  (cl-check-type instruction string)
-  (setq-local macher-agent--pending-instructions-queue
-              (append macher-agent--pending-instructions-queue
-                      (list (format "USER OVERRIDE DIRECTIVE:\n%s" instruction)))))
 
 (provide 'macher-agent-tools)
 ;;; macher-agent-tools.el ends here

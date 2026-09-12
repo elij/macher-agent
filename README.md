@@ -2,13 +2,13 @@
 
 https://github.com/user-attachments/assets/35908782-ee2b-4243-8b93-ad8381cfee5c
 
-The `macher-agent` package provides an Emacs-native artificial intelligence agent harness. It integrates deeply with `gptel` and `macher` to enable autonomous, multi-agent workflows directly within Emacs buffers.
+The `macher-agent` package provides an Emacs-native agent harness. It integrates with `gptel` and `macher` to enable autonomous, multi-agent workflows directly within Emacs buffers.
 
-The architecture operates entirely inside native Emacs buffers rather than external terminal interfaces. Tools and subagents operate as sentinels within dedicated buffers. Subagents coordinate through direct Emacs Lisp callbacks for point-to-point communication. Programmatic tool calling runs within a secure Emacs Lisp sandbox, allowing agents to chain operations and transform data in a single turn. Tools use `gptel-make-tool` and `macher-agent-with-presentation-context`, returning structured data first and presentation second, using Emacs as an extensible multiplexing environment.
+The architecture operates entirely inside native Emacs buffers rather than external terminal interfaces. Tools and subagents operate as sentinels within dedicated buffers. Subagents coordinate through direct Emacs Lisp callbacks for point-to-point communication. Programmatic tool calling runs within a secure Emacs Lisp sandbox, allowing agents to chain operations and transform data in a single turn.
 
 ## Subagent approach
 
-The harness is optimised to execute large numbers of concurrent agents inside a single Emacs session. Each subagent operates on an isolated Virtual File System (VFS) context cloned from its parent. The Virtual File System and the sandboxed evaluation runtime allow agents to resolve complex tasks without premature disk modification. Proposed file and buffer modifications are staged in memory and presented as unified diffs for review before applying changes to disk.
+The harness is optimised to execute large numbers of concurrent agents inside a single Emacs session. Each subagent operates on an isolated Virtual File System (VFS) context cloned from its parent. Agents operate non-destructive file modifications and sandboxed Elisp execution that generate a unified diff.
 
 ## Integration with gptel
 
@@ -24,7 +24,7 @@ The package integrates with `gptel` across several core boundaries:
 The package extends `macher` to provide workspace-level isolation and Virtual File System capabilities:
 
 - `macher` context persists until invalidated (clear, merge, or fail-fast out-of-band modification).
-- `macher` tools are wrapped to inject a persistent context. This prevents tool calls from executing against unhydrated contexts and ensures disk-based operations operate on in-memory buffers.
+- `macher` tools are wrapped to inject a persistent context.
 - File modifications and buffer edits stage directly in the Virtual File System context. Diffs are generated separately for buffer changes and file modifications, presenting unified diffs for user review before committing changes.
 - Active workspaces and persistent contexts register in `macher-agent-active-workspaces` by project root. Subagents receive isolated child contexts that merge back into the orchestrator context upon task submission.
 - The tool `search_in_workspace` uses direct file system traversal to ensure consistent performance and avoid garbage collection bottlenecks on large workspaces.

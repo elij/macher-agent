@@ -372,7 +372,6 @@ Side effects: None."
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--init-core-directives 60)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--append-boot-directive 70)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--inject-skill-directive 87)
-  (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--drain-thought-queue 90)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-pipe--compile-directives 100)
   (add-hook 'macher-agent-transmission-pipeline-functions
             #'macher-agent-pipe--inject-skill-directive 87))
@@ -563,18 +562,6 @@ Side effects: Injects an `<available_skills>` directive into
                   (if (and current (not (string-empty-p current)))
                       (concat current "\n\n" directive)
                     directive)))))))
-  state)
-
-(defun macher-agent-pipe--drain-thought-queue (state)
-  "Inject the pending instructions queue from target buffer into STATE.
-Retained across turns until task completion."
-  (cl-check-type state macher-agent-transmission-state)
-  (let* ((target-buf (or (macher-agent-transmission-state-target-buffer state)
-                         (current-buffer)))
-         (queue (when (and target-buf (buffer-live-p target-buf))
-                  (buffer-local-value 'macher-agent--pending-instructions-queue target-buf))))
-    (dolist (instruction queue)
-      (push instruction (macher-agent-transmission-state-directives state))))
   state)
 
 (defun macher-agent-pipe--compile-directives (state)
@@ -1331,8 +1318,7 @@ Side effects: Initiates gptel network request."
              (agent-ctx (when (macher-agent-valid-context-p raw-ctx) raw-ctx)))
         (when (buffer-live-p target-buf)
           (with-current-buffer target-buf
-            (setq-local macher-agent--active-fsm nil)
-            (setq-local macher-agent--pending-instructions-queue nil))
+            (setq-local macher-agent--active-fsm nil))
           (macher-agent-sweep-subagents (buffer-name target-buf) t))
         (when (and agent-ctx (fboundp 'macher-agent-run-task-flush-hook))
           (macher-agent-run-task-flush-hook agent-ctx))))))
