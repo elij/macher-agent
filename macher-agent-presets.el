@@ -526,12 +526,15 @@ and `gptel-directives'."
         (when (and (fboundp 'gptel-tool-p) (gptel-tool-p tool))
           (macher-agent--register-tool-in-gptel-tables tool (or (gptel-tool-category tool) "macher"))))
       (let ((preset-plist
-             (list :description (plist-get spec :description)
+             (list :name (or (plist-get spec :name) (symbol-name sym))
+                   :description (plist-get spec :description)
                    :system (plist-get spec :system)
+                   :body (or (plist-get spec :body) (plist-get spec :system))
                    :model (plist-get spec :model)
                    :boot-directive (plist-get spec :boot-directive)
                    :ptc-primitives (plist-get spec :ptc-primitives)
                    :exclusive (plist-get spec :exclusive)
+                   :is-command (plist-get spec :is-command)
                    :tools (when resolved-tools (list :append resolved-tools)))))
         (setf (alist-get sym gptel--known-presets) preset-plist)
         (when-let* ((sys (plist-get spec :system)))
@@ -551,6 +554,8 @@ Side effects: Updates skill association list and resolves skill tools."
   (cl-check-type parsed list)
   (cl-check-type skill-file string)
   (cl-check-type context macher-agent-context)
+  (when (string-match-p "/commands/" (expand-file-name skill-file))
+    (setq parsed (plist-put parsed :is-command t)))
   (let ((sym (plist-get parsed :name-sym))
         (body (plist-get parsed :body)))
     (when (and sym body)
@@ -561,6 +566,7 @@ Side effects: Updates skill association list and resolves skill tools."
              (exclusive (plist-get parsed :exclusive))
              (ptc-primitives (plist-get parsed :ptc-primitives))
              (has-tools (plist-get parsed :has-tools))
+             (is-command (plist-get parsed :is-command))
              (skill-base-dir (file-name-directory skill-file))
              (registry (macher-agent-workspace-tools-registry context))
              (resolved-tools
@@ -570,14 +576,17 @@ Side effects: Updates skill association list and resolves skill tools."
                                   tool-names))))
              (alist (macher-agent-context-skills context)))
         (setf (alist-get sym alist)
-              (list :system body
+              (list :name (or (plist-get parsed :name) (symbol-name sym))
+                    :system body
+                    :body body
                     :description desc
                     :model (when model (intern model))
                     :boot-directive boot-directive
                     :has-tools has-tools
                     :tools resolved-tools
                     :exclusive exclusive
-                    :ptc-primitives ptc-primitives))
+                    :ptc-primitives ptc-primitives
+                    :is-command is-command))
         (setf (macher-agent-context-skills context) alist)))))
 
 (defun macher-agent--load-skill-from-path (path context)
@@ -654,6 +663,42 @@ Side effects: Loads script files and registers skill metadata."
         (dolist (path (delete-dups candidate-files))
           (macher-agent--try-load-skill-from-path path context))))))
 
+(defun macher-agent-initialize-commands (context)
+  "Load flat markdown command files from commands directory into CONTEXT.
+
+CONTEXT is the active `macher-agent-context' struct.
+
+Return nil.
+Side effects: Loads command definitions and registers their metadata."
+  (cl-check-type context macher-agent-context)
+
+  (when-let* ((root (or (macher-agent-context-project-root context)
+                        (macher-agent-context-workspace-root context)))
+              (cmds-dir (expand-file-name "commands" root)))
+    (when (file-directory-p cmds-dir)
+      (dolist (file (directory-files cmds-dir t "\\.md$"))
+        (macher-agent--load-skill-from-path file context)))
+    (when-let* ((contents (macher-agent--get-context-contents context)))
+      (dolist (entry contents)
+        (when-let* ((path (macher-agent-vfs-entry-path entry))
+                    ((stringp path))
+                    (abs-path (if (file-name-absolute-p path)
+                                  path
+                                (expand-file-name path root)))
+                    ((string-prefix-p cmds-dir abs-path))
+                    ((string-match-p "\\.md$" abs-path)))
+          (macher-agent--load-skill-from-path abs-path context)))))
+
+  (when (boundp 'macher-agent-skill-directories)
+    (dolist (dir macher-agent-skill-directories)
+      (when (and dir (file-directory-p dir))
+        (let ((cmds-sibling (expand-file-name "../commands" dir))
+              (cmds-child (expand-file-name "commands" dir)))
+          (dolist (target-dir (list cmds-sibling cmds-child))
+            (when (file-directory-p target-dir)
+              (dolist (file (directory-files target-dir t "\\.md$"))
+                (macher-agent--load-skill-from-path file context)))))))))
+
 (defun macher-agent-initialize-skills (&optional context)
   "Load, register, and synchronise skills.
 
@@ -697,6 +742,7 @@ skills into a temporary sandbox and promoting them to global defaults."
         (dolist (dir macher-agent-skill-directories)
           (when (and dir (file-directory-p dir))
             (macher-agent-api-register-skills-in-directory dir context))))
+      (macher-agent-initialize-commands context)
       (let ((merged (macher-agent-workspace-skills-alist context)))
         (macher-agent--sync-gptel-known-presets merged)))))
 

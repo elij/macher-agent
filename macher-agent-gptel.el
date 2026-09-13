@@ -342,21 +342,20 @@ Side effects: None."
         (unless exclusive-found
           (push p acc))))))
 
-(defun macher-agent--transformer-detect-redirect
-    (inline-preset-used prompt-start inline-skills)
+(defun macher-agent--transformer-detect-redirect (inline-preset-used inline-skills known ctx)
   "Detect whether INLINE-PRESET-USED should redirect to a command prompt.
 
-Check if remaining prompt text starting from PROMPT-START contains no
-alphanumeric characters, that is, whitespace or empty.  INLINE-SKILLS is
-the list of inline skill symbols detected.
-
-Return redirected skill symbol if redirect condition is met, otherwise nil.
+Return redirected skill symbol if it is flagged as a command, otherwise nil.
 Side effects: None."
   (when-let* ((_ inline-preset-used)
-              (remaining (buffer-substring-no-properties prompt-start (point-max)))
-              ((not (string-match-p "[A-Za-z0-9]" remaining)))
               (skill (car inline-skills)))
-    skill))
+    (let* ((spec (or (when (and known (symbolp skill)) (alist-get skill known))
+                     (when (and ctx (macher-agent-valid-context-p ctx) (symbolp skill))
+                       (alist-get skill (macher-agent-context-skills ctx)))))
+           (is-command (or (and (listp skill) (plist-get skill :is-command))
+                           (and spec (plist-get spec :is-command)))))
+      (when is-command
+        skill))))
 
 (defvar macher-agent-transmission-pipeline-functions nil
   "Hook for transmission pipeline functions.")
@@ -577,49 +576,96 @@ to the base prompt for this single request frame."
       (setf (macher-agent-transmission-state-compiled-prompt state) sys)))
   state)
 
+(defun macher-agent--interpolate-command-body (body user-args)
+  "Interpolate USER-ARGS into command BODY replacing variables.
+
+Substitutes $arguments and $args placeholders with the full argument
+string.  Substitutes $1, $2, and subsequent positional variables with
+the parsed arguments, preserving quoted components.
+
+BODY is the template string containing interpolation markers.
+USER-ARGS is the argument string supplied by the user.
+
+Return the interpolated string with variables substituted.
+Side effects: None."
+  (let* ((args-str (string-trim (or user-args "")))
+         (args-list (or (ignore-errors (split-string-and-unquote args-str))
+                        (split-string args-str)))
+         (res (replace-regexp-in-string "\\$\\(arguments\\|args\\)\\b" args-str body t t)))
+    (cl-loop for arg in args-list
+             for i from 1
+             do (setq res (replace-regexp-in-string
+                           (format "\\$%d\\b" i) arg res t t)))
+    res))
+
 (defun macher-agent--compile-transmission-payload (orig-buf presets skills redirected-skill &optional context)
   "Compile payload strictly for live ORIG-BUF.
-Uses unary transmission pipeline steps."
+-Uses unary transmission pipeline steps."
   (cl-check-type orig-buf buffer)
-  (let ((initial-state (make-macher-agent-transmission-state
-                        :target-buffer orig-buf
-                        :presets presets
-                        :skills skills
-                        :redirected-skill redirected-skill
-                        :context (or context
-                                     (when (buffer-live-p orig-buf)
-                                       (buffer-local-value 'macher-agent--persistent-context orig-buf)))))
-        (all-steps (macher-agent-get-pipeline-steps 'transmission)))
-    (seq-reduce (lambda (state pipe-fn)
-                  (cl-check-type state macher-agent-transmission-state)
+  (let* ((active-context (or context
+                             (when (buffer-live-p orig-buf)
+                               (buffer-local-value 'macher-agent--persistent-context orig-buf))))
+         (initial-state (make-macher-agent-transmission-state
+                         :target-buffer orig-buf
+                         :presets presets
+                         :skills skills
+                         :redirected-skill redirected-skill
+                         :context active-context))
+         (all-steps (macher-agent-get-pipeline-steps 'transmission)))
+    (seq-reduce (lambda (st pipe-fn)
+                  (cl-check-type st macher-agent-transmission-state)
                   (if (functionp pipe-fn)
-                      (funcall pipe-fn state)
-                    state))
+                      (funcall pipe-fn st)
+                    st))
                 all-steps
                 initial-state)))
 
 (defun macher-agent-pipe--extract-redirect (state)
-  "Route redirected skill text in STATE and natively merge its tools."
+  "Route redirected skill text in STATE, merging tools and handling commands."
   (cl-check-type state macher-agent-transmission-state)
   (let ((redirected-skill (macher-agent-transmission-state-redirected-skill state))
-        (target-buf (or (macher-agent-transmission-state-target-buffer state)
-                        (current-buffer))))
+        (target-buf (macher-agent-transmission-state-target-buffer state)))
     (when redirected-skill
       (let* ((known (if (and target-buf (buffer-live-p target-buf))
                         (with-current-buffer target-buf (bound-and-true-p gptel--known-presets))
                       (macher-agent-transmission-state-known-presets state)))
-             (redirect-state (macher-agent-compose-payload (list :known-presets known)
-                                                           (list redirected-skill)))
-             (redirect-text (plist-get redirect-state :system))
-             (redirect-tools (plist-get redirect-state :tools)))
+             (is-plist (listp redirected-skill))
+             (ctx (macher-agent-transmission-state-context state))
+             (spec (unless is-plist
+                     (or (alist-get redirected-skill known)
+                         (when ctx (alist-get redirected-skill (macher-agent-context-skills ctx))))))
+             (redirect-state (unless is-plist
+                               (macher-agent-compose-payload (list :known-presets known)
+                                                             (list redirected-skill))))
+             (redirect-text (if is-plist
+                                (or (plist-get redirected-skill :body) (plist-get redirected-skill :system))
+                              (or (plist-get spec :body) (plist-get redirect-state :system))))
+             (redirect-tools (if is-plist
+                                 (plist-get redirected-skill :tools)
+                               (plist-get redirect-state :tools)))
+             (is-command (if is-plist
+                             (plist-get redirected-skill :is-command)
+                           (plist-get spec :is-command))))
 
         (when redirect-text
-          (setf (macher-agent-transmission-state-redirect-prompt state) redirect-text))
+          (if is-command
+              (let* ((raw-args (and ctx (macher-agent-context-prompt ctx)))
+                     (cmd-name (if is-plist (plist-get redirected-skill :name) (symbol-name redirected-skill)))
+                     (clean-args (if (and cmd-name raw-args)
+                                     (replace-regexp-in-string
+                                      (format "^[ \t]*@%s\\b[ \t]*" (regexp-quote cmd-name)) "" raw-args)
+                                   raw-args))
+                     (interpolated (macher-agent--interpolate-command-body redirect-text clean-args)))
+                (setf (macher-agent-transmission-state-redirect-prompt state) interpolated)
+                (setf (macher-agent-transmission-state-compiled-prompt state)
+                      (macher-agent-transmission-state-base-prompt state)))
+
+            (setf (macher-agent-transmission-state-redirect-prompt state) redirect-text)
+            (setf (macher-agent-transmission-state-compiled-prompt state) redirect-text)))
 
         (when redirect-tools
           (setf (macher-agent-transmission-state-tools state)
-                (macher-agent-normalize-tools
-                 (append (macher-agent-transmission-state-tools state) redirect-tools)))))))
+                (append redirect-tools (macher-agent-transmission-state-tools state)))))))
   state)
 
 (defun macher-agent-sync-prompt-transformer (async-fn fsm)
@@ -680,8 +726,9 @@ and transforms prompt."
 
            (transmission-skills (macher-agent--transformer-resolve-skills
                                  buffer-presets inline-skills known))
+           
            (redirected-skill (macher-agent--transformer-detect-redirect
-                              inline-preset-used prompt-start inline-skills))
+                              inline-preset-used inline-skills known context))
 
            (state (macher-agent--compile-transmission-payload
                    orig-buf buffer-presets transmission-skills redirected-skill context))
