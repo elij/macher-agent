@@ -926,5 +926,41 @@ Relies exclusively on live ORIG-BUF and KEYWORDS list."
   (remove-hook 'macher-agent-task-flush-hook #'macher-agent-memory--persist-interaction)
   (setq macher-agent-search-backend-function #'macher-agent-search-glob))
 
+
+;;;; interactice clear
+
+(defun macher-agent-clear-zero-mem (&optional target-buf)
+  "Clear Zero-Mem graph, entity mappings, and vector storage for TARGET-BUF.
+If TARGET-BUF is nil, defaults to `current-buffer'.
+Resets both buffer-local state and the `:zero-mem' plugin property in the context struct.
+Use when buffer manually edited/cleared"
+  (interactive)
+  (let ((buf (or target-buf (current-buffer))))
+    (when-let* (((buffer-live-p buf))
+                (context (buffer-local-value 'macher-agent--persistent-context buf))
+                ((macher-agent-valid-context-p context))
+                (plugins (copy-sequence (macher-agent-context-plugins context))))
+      (when-let* ((zero-mem-data (plist-get plugins :zero-mem))
+                  ((hash-table-p zero-mem-data)))
+        (clrhash zero-mem-data))
+      (setf (macher-agent-context-plugins context)
+            (plist-put plugins :zero-mem nil)))
+
+    (when-let* (((buffer-live-p buf)))
+      (with-current-buffer buf
+        (if-let* (((boundp 'macher-agent-memory-vector-storage))
+                  (storage macher-agent-memory-vector-storage))
+            (if (hash-table-p storage)
+                (clrhash storage)
+              (setq-local macher-agent-memory-vector-storage nil))
+          (when (boundp 'macher-agent-memory-vector-storage)
+            (setq-local macher-agent-memory-vector-storage nil)))
+        (when (boundp 'macher-agent-zero-mem--event-horizon)
+          (setq-local macher-agent-zero-mem--event-horizon nil))
+        (when (boundp 'macher-agent-zero-mem--graph)
+          (setq-local macher-agent-zero-mem--graph nil))))
+
+    (message "Macher-Agent: Zero-Mem graph and vector storage successfully cleared.")))
+
 (provide 'macher-agent-zero-mem)
 ;;; macher-agent-zero-mem.el ends here
