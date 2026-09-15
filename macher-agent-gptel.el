@@ -19,6 +19,7 @@
 (defvar gptel--context-dir nil)
 (defvar gptel--has-tools nil)
 (defvar gptel--exclusive nil)
+(defvar gptel--is-command nil)
 
 (declare-function project-current "project" (&optional maybe-prompt dir))
 (declare-function vc-root-dir "vc-hooks" ())
@@ -168,7 +169,10 @@ trampolines."
     (let* ((restored-ctx (bound-and-true-p macher-agent--persistent-context))
            (ctx restored-ctx))
       (when ctx
-        (macher-agent-initialize-skills ctx)))))
+        (macher-agent-initialize-skills ctx)))
+
+    (when (fboundp 'gptel--update-header-line)
+      (gptel--update-header-line))))
 
 (defun macher-agent--get-max-context-chars (&optional buf)
   "Resolve max context characters based on the model in the current buffer."
@@ -410,16 +414,21 @@ Side effects: None."
                                   :max-tokens (macher-agent-transmission-state-max-tokens state)
                                   :ptc-primitives (macher-agent-transmission-state-ptc-primitives state)))
              (composed (macher-agent-compose-payload payload-plist combined-modules)))
+
         (when (plist-get composed :system)
           (setf (macher-agent-transmission-state-base-prompt state) (plist-get composed :system)))
         (when (plist-get composed :model)
           (setf (macher-agent-transmission-state-model state) (plist-get composed :model)))
+
         (when (plist-get composed :temperature)
           (setf (macher-agent-transmission-state-temperature state) (plist-get composed :temperature)))
+
         (when (plist-get composed :max-tokens)
           (setf (macher-agent-transmission-state-max-tokens state) (plist-get composed :max-tokens)))
+
         (when (plist-get composed :tools)
           (setf (macher-agent-transmission-state-tools state) (plist-get composed :tools)))
+
         (when (plist-get composed :ptc-primitives)
           (setf (macher-agent-transmission-state-ptc-primitives state) (plist-get composed :ptc-primitives))))))
   state)
@@ -600,15 +609,26 @@ Side effects: None."
 
 (defun macher-agent--compile-transmission-payload (orig-buf presets skills redirected-skill &optional context)
   "Compile payload strictly for live ORIG-BUF.
--Uses unary transmission pipeline steps."
+Uses unary transmission pipeline steps."
   (cl-check-type orig-buf buffer)
   (let* ((active-context (or context
                              (when (buffer-live-p orig-buf)
                                (buffer-local-value 'macher-agent--persistent-context orig-buf))))
+         (known (when (buffer-live-p orig-buf)
+                  (buffer-local-value 'gptel--known-presets orig-buf)))
+
+         (clean-skills (seq-remove (lambda (s)
+                                     (let ((spec (if (listp s) s
+                                                   (or (alist-get s known)
+                                                       (when active-context
+                                                         (alist-get s (macher-agent-context-skills active-context)))))))
+                                       (plist-get spec :is-command)))
+                                   skills))
+
          (initial-state (make-macher-agent-transmission-state
                          :target-buffer orig-buf
                          :presets presets
-                         :skills skills
+                         :skills clean-skills
                          :redirected-skill redirected-skill
                          :context active-context))
          (all-steps (macher-agent-get-pipeline-steps 'transmission)))
@@ -638,8 +658,8 @@ Side effects: None."
                                (macher-agent-compose-payload (list :known-presets known)
                                                              (list redirected-skill))))
              (redirect-text (if is-plist
-                                (or (plist-get redirected-skill :body) (plist-get redirected-skill :system))
-                              (or (plist-get spec :body) (plist-get redirect-state :system))))
+                                (plist-get redirected-skill :system)
+                              (or (plist-get spec :system) (plist-get redirect-state :system))))
              (redirect-tools (if is-plist
                                  (plist-get redirected-skill :tools)
                                (plist-get redirect-state :tools)))
@@ -650,7 +670,9 @@ Side effects: None."
         (when redirect-text
           (if is-command
               (let* ((raw-args (and ctx (macher-agent-context-prompt ctx)))
-                     (cmd-name (if is-plist (plist-get redirected-skill :name) (symbol-name redirected-skill)))
+                     (cmd-name (if is-plist
+                                   (symbol-name (or (plist-get redirected-skill :name-sym) redirected-skill))
+                                 (symbol-name redirected-skill)))
                      (clean-args (if (and cmd-name raw-args)
                                      (replace-regexp-in-string
                                       (format "^[ \t]*@%s\\b[ \t]*" (regexp-quote cmd-name)) "" raw-args)
@@ -726,7 +748,7 @@ and transforms prompt."
 
            (transmission-skills (macher-agent--transformer-resolve-skills
                                  buffer-presets inline-skills known))
-           
+
            (redirected-skill (macher-agent--transformer-detect-redirect
                               inline-preset-used inline-skills known context))
 

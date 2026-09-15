@@ -197,7 +197,7 @@ Side effects: Moves point and initialises Org macro templates."
                             (if (listp raw)
                                 (mapcar (lambda (p) (if (symbolp p) p (intern p))) raw)
                               raw))
-          :body body)))
+          :system body)))
 
 (defun macher-agent--eval-forms-sequence (forms)
   "Evaluate FORMS sequentially and return evaluation result of last form.
@@ -510,6 +510,9 @@ and `gptel-directives'."
   (cl-check-type skills-alist list)
   (unless (boundp 'gptel--known-presets)
     (setq gptel--known-presets nil))
+  (unless (boundp 'gptel-directives)
+    (setq gptel-directives nil))
+
   (dolist (entry skills-alist)
     (let* ((sym (car entry))
            (spec (cdr entry))
@@ -522,23 +525,34 @@ and `gptel-directives'."
                                  ((symbolp item) (or (ignore-errors (gptel-get-tool (symbol-name item))) item))
                                  (t item))
                      when tool collect tool)))
+
       (dolist (tool resolved-tools)
         (when (and (fboundp 'gptel-tool-p) (gptel-tool-p tool))
           (macher-agent--register-tool-in-gptel-tables tool (or (gptel-tool-category tool) "macher"))))
-      (let ((preset-plist
-             (list :name (or (plist-get spec :name) (symbol-name sym))
-                   :description (plist-get spec :description)
-                   :system (plist-get spec :system)
-                   :body (or (plist-get spec :body) (plist-get spec :system))
-                   :model (plist-get spec :model)
-                   :boot-directive (plist-get spec :boot-directive)
-                   :ptc-primitives (plist-get spec :ptc-primitives)
-                   :exclusive (plist-get spec :exclusive)
-                   :is-command (plist-get spec :is-command)
-                   :tools (when resolved-tools (list :append resolved-tools)))))
+
+      (let* ((sys-text (plist-get spec :system))
+             (preset-plist (list :system sys-text)))
+
+        (when-let* ((desc (plist-get spec :description)))
+          (setq preset-plist (plist-put preset-plist :description desc)))
+        (when-let* ((mod (plist-get spec :model)))
+          (setq preset-plist (plist-put preset-plist :model mod)))
+        (when-let* ((boot (plist-get spec :boot-directive)))
+          (setq preset-plist (plist-put preset-plist :boot-directive boot)))
+        (when-let* ((ptc (plist-get spec :ptc-primitives)))
+          (setq preset-plist (plist-put preset-plist :ptc-primitives ptc)))
+        (when-let* ((excl (plist-get spec :exclusive)))
+          (setq preset-plist (plist-put preset-plist :exclusive excl)))
+        (when-let* ((cmd (plist-get spec :is-command)))
+          (setq preset-plist (plist-put preset-plist :is-command cmd)))
+        (when resolved-tools
+          (setq preset-plist (plist-put preset-plist :tools (list :append resolved-tools))))
+
         (setf (alist-get sym gptel--known-presets) preset-plist)
-        (when-let* ((sys (plist-get spec :system)))
-          (setf (alist-get sym gptel-directives) sys)))))
+
+        (when sys-text
+          (setf (alist-get sym gptel-directives) sys-text)))))
+
   (when (fboundp 'gptel--setup-directive-menu)
     (gptel--setup-directive-menu 'gptel-system-prompt "Agent Profile")))
 
@@ -557,7 +571,7 @@ Side effects: Updates skill association list and resolves skill tools."
   (when (string-match-p "/commands/" (expand-file-name skill-file))
     (setq parsed (plist-put parsed :is-command t)))
   (let ((sym (plist-get parsed :name-sym))
-        (body (plist-get parsed :body)))
+        (body (plist-get parsed :system)))
     (when (and sym body)
       (let* ((desc (plist-get parsed :description))
              (model (plist-get parsed :model))
@@ -576,9 +590,7 @@ Side effects: Updates skill association list and resolves skill tools."
                                   tool-names))))
              (alist (macher-agent-context-skills context)))
         (setf (alist-get sym alist)
-              (list :name (or (plist-get parsed :name) (symbol-name sym))
-                    :system body
-                    :body body
+              (list :system body
                     :description desc
                     :model (when model (intern model))
                     :boot-directive boot-directive
@@ -723,7 +735,8 @@ skills into a temporary sandbox and promoting them to global defaults."
         (setq-default gptel-directives (copy-alist gptel-directives)))
 
     (cl-check-type context macher-agent-context)
-    (let* ((ws-root (macher-agent-context-workspace-root context))
+    (let* ((ws-root (or (macher-agent-context-project-root context)
+                        (macher-agent-context-workspace-root context)))
            (bundled (or (bound-and-true-p macher-agent--bundled-skills-dir)
                         (bound-and-true-p macher-agent-bundled-skills-directory))))
       (when (and bundled (file-directory-p bundled))
