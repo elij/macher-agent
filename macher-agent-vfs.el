@@ -697,6 +697,8 @@ Return a cons cell (SYNCED . IS-DIRTY)."
   "Commit updated string CONTENT against PATH string linked to CONTEXT struct."
   (cl-check-type context macher-agent-context)
   (cl-check-type path string)
+  (when content
+    (cl-check-type content string))
   (let* ((norm-path (macher-agent--normalize-path-key path context))
          (contents (macher-agent--get-context-contents context))
          (workspace-root (macher-agent-context-root context))
@@ -710,15 +712,26 @@ Return a cons cell (SYNCED . IS-DIRTY)."
                  (let ((e-norm (macher-agent--normalize-path-key (macher-agent-vfs-entry-path e) context)))
                    (and e-norm (equal e-norm norm-path))))
                contents))))
-    (if (and mtime-ht (hash-table-p mtime-ht))
-        (progn
-          (macher-agent-vfs-write norm-path content mtime-ht vfs-ht)
-          (unless (equal path norm-path)
-            (macher-agent-vfs-write path content mtime-ht vfs-ht)))
+    (if content
+        (if (and mtime-ht (hash-table-p mtime-ht))
+            (progn
+              (macher-agent-vfs-write norm-path content mtime-ht vfs-ht)
+              (unless (equal path norm-path)
+                (macher-agent-vfs-write path content mtime-ht vfs-ht)))
+          (when (and vfs-ht (hash-table-p vfs-ht))
+            (puthash norm-path content vfs-ht)
+            (unless (equal path norm-path)
+              (puthash path content vfs-ht))))
       (when (and vfs-ht (hash-table-p vfs-ht))
-        (puthash norm-path content vfs-ht)
+        (remhash norm-path vfs-ht)
         (unless (equal path norm-path)
-          (puthash path content vfs-ht))))
+          (remhash path vfs-ht)))
+      (when (and mtime-ht (hash-table-p mtime-ht))
+        (remhash norm-path mtime-ht)
+        (remhash (expand-file-name norm-path) mtime-ht)
+        (unless (equal path norm-path)
+          (remhash path mtime-ht)
+          (remhash (expand-file-name path) mtime-ht))))
     (if entry
         (setf (macher-agent-vfs-entry-curr entry) content)
       (let* ((is-buffer (eq (macher-agent--classify-file-path norm-path workspace-root) 'buffer))
