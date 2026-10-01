@@ -213,6 +213,8 @@ Install and configure `macher-agent` using `use-package`:
   (macher-agent-install))
 ```
 
+**NB**: Ensure `(macher-install)` and `(macher-enable)` are executed before macher-agent.
+
 ## Getting started
 
 1. Initialise a Git repository in your project directory:
