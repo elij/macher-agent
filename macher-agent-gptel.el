@@ -1574,6 +1574,17 @@ Side effects: Mutates function slot of TOOL and updates
                            (after-contents (append buffer-entries after-files)))
 
                       (macher-agent--set-context-contents agent-ctx after-contents)
+
+                      (dolist (entry after-files)
+                        (let* ((path (macher-agent-vfs-entry-path entry))
+                               (orig (macher-agent-vfs-entry-orig entry))
+                               (new (macher-agent-vfs-entry-curr entry))
+                               (prev (cl-find path file-entries :key #'macher-agent-vfs-entry-path :test #'equal))
+                               (p-curr (when prev (macher-agent-vfs-entry-curr prev))))
+                          (when (or (and (not (equal orig new)) (not (equal new p-curr)))
+                                    (and (null prev) (not (equal orig new))))
+                            (macher-agent--update-context-file agent-ctx path new))))
+                      
                       (unless (equal before-contents after-contents)
                         (macher-agent--set-context-dirty-p agent-ctx t))
                       res)))))
