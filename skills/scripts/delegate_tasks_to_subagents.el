@@ -1,85 +1,89 @@
-;;; delegate_tasks_to_subagents.el --- Delegate tasks to subagents -*- lexical-binding: t; -*-
+;;; delegate_tasks_to_subagents.el --- Delegate tasks to subagents tool -*- lexical-binding: t; -*-
 
 (setq macher-agent-delegate-tasks-to-subagents-tool
       (gptel-make-tool
        :name "delegate_tasks_to_subagents"
-       :description "Delegate tasks concurrently to sub-agents."
-       :category "collaboration"
-       :args '((:name "tasks" :type "array"
+       :description "Spawn or address multiple sub-agents concurrently, delegating structured tasks and awaiting their aggregated results."
+       :category "orchestration"
+       :args '((:name "tasks"
+                      :type "array"
+                      :description "A vector of task plists containing buffer_name, presets, and instructions."
                       :items (:type "object"
-                                    :properties (:buffer_name (:type "string")
-                                                              :instructions (:type "string")
-                                                              :presets (:type "array" :items (:type "string"))
-                                                              :ephemeral (:type "boolean"))
-                                    :required ["buffer_name" "instructions"])
-                      :description "List of tasks to delegate. Set ephemeral to true unless subagents are to be reused."))
+                                    :properties (:buffer_name (:type "string"
+                                                                     :description "The name of the target sub-agent buffer.")
+                                                              :presets (:type "array"
+                                                                              :items (:type "string")
+                                                                              :description "Optional vector of skill or preset names to apply.")
+                                                              :instructions (:type "string"
+                                                                                   :description "The task instructions to send to the sub-agent."))
+                                    :required ["buffer_name" "instructions"])))
        :async t
-       :function (macher-agent-with-presentation-context (tasks)
-                   (funcall (get 'macher-agent-delegate-tasks-to-subagents-tool 'ptc-function)
-                            tasks context callback)
-                   nil)))
+       :function (lambda (callback tasks)
+                   (let ((thunk (funcall (get 'macher-agent-delegate-tasks-to-subagents-tool 'ptc-function)
+                                         tasks)))
+                     (funcall thunk
+                              (lambda (res)
+                                (funcall callback
+                                         (if (sequencep res)
+                                             (if (stringp res)
+                                                 res
+                                               (string-join (append res nil) "\n\n"))
+                                           (format "%s" res)))))))))
 
 (put 'macher-agent-delegate-tasks-to-subagents-tool 'ptc-function
-     (lambda (tasks context callback)
-       (let* ((tasks-vec (if (vectorp tasks) tasks (vconcat tasks)))
-              (known-presets (bound-and-true-p gptel--known-presets))
-              (dispatch-payloads
-               (cl-loop for task across tasks-vec
-                        for instructions = (plist-get task :instructions)
-                        for presets = (or (plist-get task :presets) (plist-get task :preset))
-                        do (when (or (null instructions)
-                                     (and (stringp instructions)
-                                          (string-empty-p (string-trim instructions))))
-                             (error "ERROR: Instructions for delegated tasks cannot be empty."))
-                        do (when presets
-                             (let ((p-list (cond ((vectorp presets) (append presets nil))
-                                                 ((listp presets) presets)
-                                                 ((stringp presets) (list presets))
-                                                 (t nil))))
-                               (dolist (p p-list)
-                                 (let ((p-str (if (symbolp p) (symbol-name p) p)))
-                                   (unless (cl-loop for entry in known-presets
-                                                    for k = (car entry)
-                                                    for k-str = (if (symbolp k) (symbol-name k) (format "%s" k))
-                                                    thereis (equal k-str p-str))
-                                     (error "Preset '%s' does not exist." p-str))))))
-                        collect
-                        (macher-agent-make-a2a-payload
-                         :schema-version (if (boundp 'macher-agent-a2a-schema-version)
-                                             macher-agent-a2a-schema-version
-                                           :a2a-v1)
-                         :transit-type :root-to-subagent
-                         :type 'SEND_MESSAGE
-                         :task-id (macher-agent--generate-uuid)
-                         :parent-context context
-                         :payload (list :instructions instructions)
-                         :metadata (list :buffer_name (plist-get task :buffer_name)
-                                         :presets presets
-                                         :ephemeral (if (plist-member task :ephemeral)
-                                                        (not (eq (plist-get task :ephemeral) :json-false))
-                                                      t)
-                                         :suppress-patch t)))))
-         (macher-agent-a2a-dispatch
-          dispatch-payloads
-          (lambda (results)
-            (let ((formatted-results
-                   (cl-loop for task across tasks-vec
-                            for res across results
-                            for agent-name = (plist-get task :buffer_name)
-                            for unwrapped = (cond
-                                             ((and (fboundp 'macher-agent-transit-payload-p)
-                                                   (macher-agent-transit-payload-p res))
-                                              (let ((pl (macher-agent-transit-payload-payload res)))
-                                                (if (listp pl)
-                                                    (or (plist-get pl :payload) (plist-get pl :message) pl)
-                                                  pl)))
-                                             ((listp res)
-                                              (or (plist-get res :payload) (plist-get res :data) (plist-get res :error) res))
-                                             (t res))
-                            for text-val = (if (stringp unwrapped) unwrapped (prin1-to-string unwrapped))
-                            collect (format "=== Response from %s ===\n%s\n" agent-name text-val))))
-              (when (functionp callback)
-                (funcall callback
-                         (format "All sub-agents completed:\n\n%s"
-                                 (string-join formatted-results "\n"))))))
-          context))))
+     (lambda (tasks &optional context)
+       (let ((ctx (or (macher-agent-resolve-context context)
+                      (macher-agent-resolve-context (current-buffer)))))
+         (lambda (resolve-fn)
+           (if (not (vectorp tasks))
+               (funcall resolve-fn "ERROR: Tasks parameter must be a vector of task specifications.")
+             (let ((payloads
+                    (cl-loop for t-spec across tasks
+                             for raw-buf = (plist-get t-spec :buffer_name)
+                             for buf-name = (cond ((stringp raw-buf) raw-buf)
+                                                  ((symbolp raw-buf) (symbol-name raw-buf))
+                                                  (t (format "%s" raw-buf)))
+                             for presets = (or (plist-get t-spec :presets)
+                                               (plist-get t-spec :skill))
+                             for instructions = (or (plist-get t-spec :instructions)
+                                                    (plist-get t-spec :prompt))
+                             for task-id = (if (fboundp 'macher-agent--generate-uuid)
+                                               (macher-agent--generate-uuid)
+                                             "task-default")
+                             collect
+                             (macher-agent-make-a2a-payload
+                              :transit-type :root-to-subagent
+                              :type 'TASK_DELEGATION
+                              :task-id task-id
+                              :target-buffer buf-name
+                              :target-context ctx
+                              :parent-context ctx
+                              :child-context ctx
+                              :payload (list :instructions instructions)
+                              :metadata (list :buffer_name buf-name
+                                              :presets presets
+                                              :ephemeral t
+                                              :suppress-patch t)))))
+               (macher-agent-a2a-dispatch
+                payloads
+                (lambda (results)
+                  (let ((extracted
+                         (mapcar (lambda (r)
+                                   (cond
+                                    ((stringp r) r)
+                                    ((and (listp r) (plist-get r :error))
+                                     (format "ERROR: %s" (plist-get r :error)))
+                                    ((and (listp r) (plist-get r :payload))
+                                     (let ((p (plist-get r :payload)))
+                                       (if (and (listp p) (plist-get p :payload))
+                                           (format "%s" (plist-get p :payload))
+                                         (format "%s" p))))
+                                    ((and (listp r) (plist-get r :data))
+                                     (format "%s" (plist-get r :data)))
+                                    (t (format "%s" r))))
+                                 (append results nil))))
+                    (funcall resolve-fn
+                             (if macher-agent--active-ptc-execution
+                                 extracted
+                               (string-join extracted "\n\n")))))
+                ctx)))))))

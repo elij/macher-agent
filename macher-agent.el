@@ -1,7 +1,7 @@
 ;;; macher-agent.el --- Sandboxed, Language-Agnostic AI Workflows -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.3.12
+;; Version: 0.8.3.56
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2"))
 ;; Keywords: convenience, gptel, llm, macher
 ;; URL: https://github.com/elij/macher-agent
@@ -42,23 +42,15 @@
       (remove-hook 'gptel-prompt-transform-functions transformer t))
     (remove-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope t)))
 
-(defun macher-agent-install ()
-  "Explicitly install macher-agent global hooks, tools, and FSM integrations."
+(defun macher-agent-force-enable ()
+  "Force Macher Agent to treat current directory as a workspace root."
   (interactive)
-  (macher-agent-context-resolution-install)
-  (macher-agent-sandbox-install)
-  (macher-agent-zero-mem-install)
-  (macher-agent-vfs-install)
-  (macher-agent-transmission-install)
-
-  (add-hook 'gptel-prompt-transform-functions #'macher-agent--fsm-hijack-transform)
-  (add-hook 'hack-local-variables-hook #'macher-agent--restore-local-state)
-  (add-hook 'gptel-pre-tool-call-functions #'macher-agent--log-gptel-pre-tool)
-  (add-hook 'macher-agent-context-mutated-hook #'macher-agent--mutation-dispatcher)
-
-  (with-eval-after-load 'gptel-transient
-    (ignore-errors
-      (transient-suffix-put 'gptel-menu 'gptel--infix-tools :save-history nil))))
+  (setq-local macher-agent--is-workspace nil)
+  (macher-agent--init-workspace-state
+   (file-name-as-directory (expand-file-name default-directory)))
+  (setq-local macher-agent--is-workspace t)
+  (macher-agent-mode 1)
+  (message "Macher-Agent manually forced on for: %s" default-directory))
 
 (provide 'macher-agent)
 ;;; macher-agent.el ends here

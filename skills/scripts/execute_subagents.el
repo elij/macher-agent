@@ -3,53 +3,108 @@
 (setq macher-agent-execute-subagents-tool
       (gptel-make-tool
        :name "execute_subagents"
-       :description "Execute tasks across multiple sub-agents in parallel in a fire-and-forget, non-blocking manner using A2A payloads. You must supply at least one preset."
-       :category "collaboration"
-       :args '((:name "tasks" :type "array"
-                      :description "An array of task objects to execute in parallel in the background."
+       :description "Execute background subagent tasks asynchronously without blocking current flow."
+       :category "orchestration"
+       :args '((:name "tasks"
+                      :type "array"
+                      :description "A vector of background task specifications."
                       :items (:type "object"
-                                    :properties (:buffer_name (:type "string")
-                                                              :instructions (:type "string")
-                                                              :presets (:type "array" :items (:type "string")))
+                                    :properties (:buffer_name (:type "string"
+                                                                     :description "The name of the target sub-agent buffer.")
+                                                              :presets (:type "array"
+                                                                              :items (:type "string")
+                                                                              :description "Optional vector of skill or preset names to apply.")
+                                                              :instructions (:type "string"
+                                                                                   :description "The task instructions to send to the sub-agent."))
                                     :required ["buffer_name" "instructions"])))
        :async t
-       :function (macher-agent-with-presentation-context (tasks)
-                   (let* ((native-fn (get 'macher-agent-execute-subagents-tool 'ptc-function))
-                          (buffer-names (funcall native-fn tasks context)))
-                     (format "SUCCESS: Dispatched %d sub-agents in the background. They are executing independently and asynchronously. Your current buffer remains unblocked and you can proceed with other tasks immediately."
-                             (length buffer-names))))))
+       :function (lambda (callback tasks)
+                   (let ((thunk (funcall (get 'macher-agent-execute-subagents-tool 'ptc-function)
+                                         tasks)))
+                     (funcall thunk
+                              (lambda (res)
+                                (funcall callback
+                                         (if (sequencep res)
+                                             (if (stringp res)
+                                                 res
+                                               (string-join (append res nil) "\n\n"))
+                                           (format "%s" res)))))))))
 
 (put 'macher-agent-execute-subagents-tool 'ptc-function
      (lambda (tasks &optional context)
-       (let* ((tasks-vec (if (vectorp tasks) tasks (vconcat tasks)))
-              (a2a-payloads
-               (cl-loop for task-obj across tasks-vec
-                        collect
-                        (let ((task-id (macher-agent--generate-uuid)))
-                          (macher-agent-make-a2a-payload
-                           :schema-version (if (boundp 'macher-agent-a2a-schema-version)
-                                               macher-agent-a2a-schema-version
-                                             :a2a-v1)
-                           :transit-type :root-to-subagent
-                           :type 'SEND_MESSAGE
-                           :task-id task-id
-                           :parent-context context
-                           :payload (list :instructions (plist-get task-obj :instructions))
-                           :metadata (list :buffer_name (plist-get task-obj :buffer_name)
-                                           :presets (append (plist-get task-obj :presets) nil)
-                                           :background t
-                                           :suppress-patch t))))))
-         (dolist (a2a-payload a2a-payloads)
-           (macher-agent-a2a-dispatch
-            (list a2a-payload)
-            (lambda (a2a-results)
-              (let* ((res (aref (if (vectorp a2a-results) a2a-results (vconcat a2a-results)) 0))
-                     (meta (macher-agent-transit-payload-metadata a2a-payload))
-                     (buf-name (plist-get meta :buffer_name)))
-                (if (eq (plist-get res :status) 'error)
-                    (message "Background subagent %s task failed: %s" buf-name (plist-get res :error))
-                  (message "Background subagent %s task execution completed successfully." buf-name))))
-            context))
-         (mapcar (lambda (p)
-                   (plist-get (macher-agent-transit-payload-metadata p) :buffer_name))
-                 a2a-payloads))))
+       (let ((ctx (or (macher-agent-resolve-context context)
+                      (macher-agent-resolve-context (current-buffer)))))
+         (lambda (resolve-fn)
+           (if (not (vectorp tasks))
+               (funcall resolve-fn "ERROR: Tasks parameter must be a vector of task specifications.")
+             (let* ((dispatched-names nil)
+                    (resolved nil)
+                    (payloads
+                     (cl-loop for t-spec across tasks
+                              for raw-buf = (plist-get t-spec :buffer_name)
+                              for buf-name = (cond ((stringp raw-buf) raw-buf)
+                                                   ((symbolp raw-buf) (symbol-name raw-buf))
+                                                   (t (format "%s" raw-buf)))
+                              for presets = (or (plist-get t-spec :presets)
+                                                (plist-get t-spec :skill))
+                              for instructions = (or (plist-get t-spec :instructions)
+                                                     (plist-get t-spec :prompt))
+                              for task-id = (if (fboundp 'macher-agent--generate-uuid)
+                                                (macher-agent--generate-uuid)
+                                              "task-bg")
+                              do (push buf-name dispatched-names)
+                              collect
+                              (macher-agent-make-a2a-payload
+                               :transit-type :root-to-subagent
+                               :type 'TASK_DELEGATION
+                               :task-id task-id
+                               :target-buffer buf-name
+                               :target-context ctx
+                               :parent-context ctx
+                               :child-context ctx
+                               :payload (list :instructions instructions)
+                               :metadata (list :buffer_name buf-name
+                                               :presets presets
+                                               :background t
+                                               :ephemeral t
+                                               :suppress-patch t)))))
+               (setq dispatched-names (nreverse dispatched-names))
+               (macher-agent-a2a-dispatch
+                payloads
+                (lambda (results)
+                  (let ((extracted
+                         (mapcar (lambda (r)
+                                   (cond
+                                    ((stringp r) r)
+                                    ((and (listp r) (plist-get r :error))
+                                     (format "ERROR: %s" (plist-get r :error)))
+                                    ((and (listp r) (plist-get r :payload))
+                                     (let ((p (plist-get r :payload)))
+                                       (if (and (listp p) (plist-get p :payload))
+                                           (format "%s" (plist-get p :payload))
+                                         (format "%s" p))))
+                                    ((and (listp r) (plist-get r :data))
+                                     (format "%s" (plist-get r :data)))
+                                    (t (format "%s" r))))
+                                 (append results nil))))
+                    (if (not resolved)
+                        (progn
+                          (setq resolved t)
+                          (funcall resolve-fn
+                                   (if macher-agent--active-ptc-execution
+                                       extracted
+                                     (string-join extracted "\n\n"))))
+                      (dolist (msg extracted)
+                        (when (string-prefix-p "ERROR:" msg)
+                          (message "Macher-Agent background task error: %s" msg))))))
+                ctx)
+               (unless resolved
+                 (setq resolved t)
+                 (let ((launch-msgs
+                        (mapcar (lambda (name)
+                                  (format "SUCCESS: Background sub-agent '%s' dispatched." name))
+                                dispatched-names)))
+                   (funcall resolve-fn
+                            (if macher-agent--active-ptc-execution
+                                launch-msgs
+                              (string-join launch-msgs "\n")))))))))))
