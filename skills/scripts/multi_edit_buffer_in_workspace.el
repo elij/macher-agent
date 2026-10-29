@@ -3,25 +3,26 @@
 (setq macher-agent-multi-edit-buffer-in-workspace-tool
       (gptel-make-tool
        :name "multi_edit_buffer_in_workspace"
-       :description "Apply 1-to-many replacements to one scoped buffer in your workspace sequentially. All edits use exact text matching (whitespace, newlines, indentation). Use actual content - NO line numbers.\n\nEdits apply in array order. If ANY edit fails, ALL changes are rolled back."
+       :description "Apply 1-to-many replacements to one scoped buffer in your workspace sequentially."
        :category "execution"
        :args '((:name "buffer_name" :type "string" :description "The name of the target buffer")
-               (:name "edits" :type "array" :description "Array of edit operations to apply in sequence"
+               (:name "edits" :type "array" :description "Array of edit operations"
                       :items (:type "object"
-                                    :properties (:old_text (:type "string" :description "Exact text to find and replace.")
-                                                           :new_text (:type "string" :description "Text to replace the old_text with")
-                                                           :replace_all (:type "boolean" :description "If true, replace all occurrences."))
+                                    :properties (:old_text (:type "string")
+                                                           :new_text (:type "string")
+                                                           :replace_all (:type "boolean"))
                                     :required ["old_text" "new_text"])))
        :async t
        :function (macher-agent-with-presentation-context (buffer-name edits)
-                   (let* ((native-fn (get 'macher-agent-multi-edit-buffer-in-workspace-tool 'ptc-function))
-                          (res (funcall native-fn buffer-name edits context)))
-                     (format "SUCCESS: Virtual multi-edit recorded for buffer '%s'. A patch will be generated at the end of the turn."
-                             (cdr (assoc 'buffer res)))))))
+                                                         (let* ((native-fn (get 'macher-agent-multi-edit-buffer-in-workspace-tool 'ptc-function))
+                                                                (res (funcall native-fn buffer-name edits context)))
+                                                           (format "SUCCESS: Virtual multi-edit recorded for buffer '%s'." (cdr (assoc 'buffer res)))))))
 
 (put 'macher-agent-multi-edit-buffer-in-workspace-tool 'ptc-function
      (lambda (buffer-name edits context)
        (let* ((actual-name (macher-agent--resolve-buffer-name buffer-name))
+              (_ (when (macher-agent-valid-context-p context)
+                   (macher-agent--ensure-access context actual-name)))
               (norm-key (macher-agent--normalize-path-key actual-name context))
               (contents (when (macher-agent-valid-context-p context)
                           (macher-agent--get-context-contents context)))
@@ -39,7 +40,7 @@
                   (replace-all-bool (and replace-all (not (eq replace-all :json-false)))))
              (unless (and old-text new-text)
                (error "Each edit must contain old_text and new_text properties"))
-             (setq content (macher-agent--edit-string-fast content old-text new-text replace-all-bool))))
+             (setq content (macher-agent--edit-string-fast old-text new-text content replace-all-bool))))
          (when (macher-agent-valid-context-p context)
            (macher-agent--update-context-file context norm-key content))
          `((status . "success") (buffer . ,actual-name) (edits-applied . ,(length edits-list))))))

@@ -1,4 +1,4 @@
-;;; macher-agent-sandbox.el --- Sandboxed Lisp evaluator for macher-agent  -*- lexical-binding: t; -*-
+;;; macher-agent-sandbox.el --- Sandboxed Lisp evaluator for macher-agent -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
 ;; Keywords: convenience, gptel, llm, macher
@@ -14,12 +14,15 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'seq)
 (require 'generator)
 (require 'byte-opt)
 (require 'gptel)
-(require 'help-fns)
 (require 'macher-agent-core)
+(require 'macher-agent-presets)
+(require 'macher-agent-gptel)
 (require 'macher-agent-tools)
+(require 'macher-agent-orchestration)
 
 (declare-function cps-internal-yield "generator")
 (declare-function gptel-tool-p "gptel" (tool))
@@ -30,6 +33,7 @@
 (declare-function gptel-tool-async "gptel" (tool))
 (declare-function gptel-get-tool "gptel" (name))
 (declare-function gptel--update-status "gptel" (status))
+(declare-function gptel--update-tool-call "gptel" (fsm))
 (declare-function gptel-markdown-cycle-block "gptel" ())
 (declare-function org-cycle "org" (&optional arg))
 
@@ -38,7 +42,6 @@
 (defvar gptel-pre-tool-call-functions)
 (defvar gptel-post-tool-call-functions)
 (defvar gptel-include-tool-results)
-(defvar macher-agent-allowed-tools)
 (defvar macher-agent-ptc-execution-tool nil)
 
 ;;;; Plugin State Accessors
@@ -56,16 +59,7 @@
   state)
 
 (defun macher-agent--ptc-primitive-p (sym)
-  "Check whether SYM is an active Programmatic Tool Calling primitive.
-
-Matches both direct symbol equivalence and dynamic translation between
-hyphens and underscores for SYM.
-
-SYM is the symbol to test.
-
-Return t if SYM is an active primitive, otherwise nil.
-
-Side effects: None."
+  "Check whether SYM is an active Programmatic Tool Calling primitive."
   (let* ((sym-name (symbol-name sym))
          (norm-sym (replace-regexp-in-string "_" "-" sym-name))
          (active (bound-and-true-p macher-agent--active-ptc-primitives))
@@ -100,17 +94,14 @@ Side effects: None."
   "Mark unbound variables in the sandbox environment.")
 
 (defun macher-agent-sandbox--populate-pure-primitives (&optional primitives)
-  "Populate PRIMITIVES table with pure host operations.
-
-Including a number of hardcoded defaults."
+  "Populate PRIMITIVES table with pure host operations."
   (let ((table (or primitives macher-agent-sandbox--primitives)))
     (dolist
         (sym '(not null eq eql equal = + - * / < > <= >= max min
-                   length list cons car cdr nth reverse split-string
-                   plist-get string= string-match-p format))
+                   length list vector vconcat aref cons car cdr nth reverse
+                   split-string plist-get string= string-match-p format))
       (when (fboundp sym)
         (puthash sym sym table)))
-
     (mapatoms
      (lambda (sym)
        (when (and (fboundp sym)
@@ -139,58 +130,56 @@ Including a number of hardcoded defaults."
           (puthash op op macher-agent-sandbox--primitives))))))
 
 (iter-defun macher-agent-sandbox--eval-args-iter (args env)
-            "Evaluate a list of ARGS in ENV using the generator evaluator."
-            (let ((evaled nil))
-              (dolist (arg args (nreverse evaled))
-                (push (iter-yield-from (macher-agent-sandbox--eval-iter arg env)) evaled))))
+  "Evaluate a list of ARGS in ENV using the generator evaluator."
+  (let ((evaled nil))
+    (dolist (arg args (nreverse evaled))
+      (push (iter-yield-from (macher-agent-sandbox--eval-iter arg env)) evaled))))
 
 (iter-defun macher-agent-sandbox--apply-closure-iter (closure arguments)
-            "Execute CLOSURE with ARGUMENTS as a generator."
-            (let ((new-env (cadddr closure))
-                  (params (cadr closure))
-                  (result nil))
-              (while params
-                (let ((param (pop params)))
-                  (cond
-                   ((eq param '&rest)
-                    (push (cons (pop params) arguments) new-env)
-                    (setq arguments nil))
-                   ((eq param '&optional)
-                    nil)
-                   (t
-                    (push (cons param (pop arguments)) new-env)))))
-              (dolist (form (caddr closure) result)
-                (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
+  "Execute CLOSURE with ARGUMENTS as a generator."
+  (let ((new-env (cadddr closure))
+        (params (cadr closure))
+        (result nil))
+    (while params
+      (let ((param (pop params)))
+        (cond
+         ((eq param '&rest)
+          (push (cons (pop params) arguments) new-env)
+          (setq arguments nil))
+         ((eq param '&optional)
+          nil)
+         (t
+          (push (cons param (pop arguments)) new-env)))))
+    (dolist (form (caddr closure) result)
+      (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
 
 (iter-defun macher-agent-sandbox--funcall-symbol-iter (func eval-args)
-            "Execute function symbol FUNC with EVAL-ARGS in the sandbox."
-            (let ((prim (and
-                         macher-agent-sandbox--primitives
-                         (gethash func macher-agent-sandbox--primitives)))
-                  (closure (and
-                            macher-agent-sandbox--functions
-                            (gethash func macher-agent-sandbox--functions))))
-              (cond
-               ((macher-agent--ptc-primitive-p func)
-                (iter-yield (make-macher-agent-tool-call
-                             :name func
-                             :args (macher-agent-sandbox--normalize-args-to-plist eval-args))))
-               (prim (apply prim eval-args))
-               (closure (iter-yield-from (macher-agent-sandbox--apply-closure-iter closure eval-args)))
-               (t (error "Void or forbidden function: %s" func)))))
+  "Execute function symbol FUNC with EVAL-ARGS in the sandbox."
+  (let ((prim (and macher-agent-sandbox--primitives
+                   (gethash func macher-agent-sandbox--primitives)))
+        (closure (and macher-agent-sandbox--functions
+                      (gethash func macher-agent-sandbox--functions))))
+    (cond
+     ((macher-agent--ptc-primitive-p func)
+      (iter-yield (make-macher-agent-tool-call
+                   :name func
+                   :args (macher-agent-sandbox--normalize-args-to-plist eval-args))))
+     (prim (apply prim eval-args))
+     (closure (iter-yield-from (macher-agent-sandbox--apply-closure-iter closure eval-args)))
+     (t (error "Void or forbidden function: %s" func)))))
 
 (iter-defun macher-agent-sandbox--funcall-iter (func eval-args)
-            "Execute function FUNC with EVAL-ARGS in the sandbox."
-            (cond
-             ((and (consp func) (eq (car func) 'lambda))
-              (iter-yield-from
-               (macher-agent-sandbox--apply-closure-iter
-                (list 'closure (cadr func) (cddr func) nil) eval-args)))
-             ((and (consp func) (eq (car func) 'closure))
-              (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))
-             ((symbolp func)
-              (iter-yield-from (macher-agent-sandbox--funcall-symbol-iter func eval-args)))
-             (t (error "Invalid function target: %s" func))))
+  "Execute function FUNC with EVAL-ARGS in the sandbox."
+  (cond
+   ((and (consp func) (eq (car func) 'lambda))
+    (iter-yield-from
+     (macher-agent-sandbox--apply-closure-iter
+      (list 'closure (cadr func) (cddr func) nil) eval-args)))
+   ((and (consp func) (eq (car func) 'closure))
+    (iter-yield-from (macher-agent-sandbox--apply-closure-iter func eval-args)))
+   ((symbolp func)
+    (iter-yield-from (macher-agent-sandbox--funcall-symbol-iter func eval-args)))
+   (t (error "Invalid function target: %s" func))))
 
 (defun macher-agent-sandbox--normalize-args-to-plist (args)
   "Format explicit ARGS list to property sequence."
@@ -201,9 +190,9 @@ Including a number of hardcoded defaults."
     (let (result)
       (dolist (pair args)
         (let* ((sym-name (symbol-name (car pair)))
-               (key (if
-                        (string-prefix-p ":" sym-name)
-                        (car pair) (intern (concat ":" sym-name))))
+               (key (if (string-prefix-p ":" sym-name)
+                        (car pair)
+                      (intern (concat ":" sym-name))))
                (val (cdr pair)))
           (push key result)
           (push val result)))
@@ -214,7 +203,8 @@ Including a number of hardcoded defaults."
       (dolist (pair (car args))
         (let* ((sym-name (symbol-name (car pair)))
                (key (if (string-prefix-p ":" sym-name)
-                        (car pair) (intern (concat ":" sym-name))))
+                        (car pair)
+                      (intern (concat ":" sym-name))))
                (val (cdr pair)))
           (push key result)
           (push val result)))
@@ -222,74 +212,67 @@ Including a number of hardcoded defaults."
    (t args)))
 
 (iter-defun macher-agent-sandbox--eval-single-binding-iter (binding eval-env)
-            "Evaluate a single BINDING specification in EVAL-ENV."
-            (let ((var (if (consp binding) (car binding) binding))
-                  (val (when (consp binding)
-                         (iter-yield-from (macher-agent-sandbox--eval-iter (cadr binding) eval-env)))))
-              (cons var val)))
+  "Evaluate a single BINDING specification in EVAL-ENV."
+  (let ((var (if (consp binding) (car binding) binding))
+        (val (when (consp binding)
+               (iter-yield-from (macher-agent-sandbox--eval-iter (cadr binding) eval-env)))))
+    (cons var val)))
 
 (iter-defun macher-agent-sandbox--bind-iter (bindings env is-star)
-            "Process BINDINGS to extend lexical environment ENV.
-
-If IS-STAR is non-nil, evaluate each binding in the updated environment."
-            (let ((new-env env))
-              (dolist (binding bindings new-env)
-                (let*
-                    ((eval-env (if is-star new-env env))
-                     (pair
-                      (iter-yield-from
-                       (macher-agent-sandbox--eval-single-binding-iter binding eval-env))))
-                  (setq new-env (cons pair new-env))))))
+  "Process BINDINGS to extend lexical environment ENV."
+  (let ((new-env env))
+    (dolist (binding bindings new-env)
+      (let* ((eval-env (if is-star new-env env))
+             (pair (iter-yield-from
+                    (macher-agent-sandbox--eval-single-binding-iter binding eval-env))))
+        (setq new-env (cons pair new-env))))))
 
 (iter-defun macher-agent-sandbox--eval-and-or-iter (args env is-or)
-            "Evaluate boolean logic forms ARGS in ENV.
-
-If IS-OR is non-nil, evaluate as `or', otherwise evaluate as `and'."
-            (let ((result (not is-or)))
-              (while (and args (if is-or (not result) result))
-                (setq result (iter-yield-from (macher-agent-sandbox--eval-iter (pop args) env))))
-              result))
+  "Evaluate boolean logic forms ARGS in ENV."
+  (let ((result (not is-or)))
+    (while (and args (if is-or (not result) result))
+      (setq result (iter-yield-from (macher-agent-sandbox--eval-iter (pop args) env))))
+    result))
 
 (iter-defun macher-agent-sandbox--eval-let-iter (args env is-star)
-            "Evaluate let or let* form ARGS in ENV.
-
-If IS-STAR is non-nil, evaluate as `let*', otherwise evaluate as `let'."
-            (let ((new-env (iter-yield-from (macher-agent-sandbox--bind-iter (car args) env is-star)))
-                  (result nil))
-              (dolist (form (cdr args) result)
-                (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
+  "Evaluate let or let* form ARGS in ENV."
+  (let ((new-env (iter-yield-from (macher-agent-sandbox--bind-iter (car args) env is-star)))
+        (result nil))
+    (dolist (form (cdr args) result)
+      (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env))))))
 
 (iter-defun macher-agent-sandbox--eval-setq-iter (args env)
-            "Evaluate setq form ARGS in ENV."
-            (let ((val nil))
-              (while args
-                (let* ((var (pop args))
-                       (rhs (pop args))
-                       (evaled (iter-yield-from (macher-agent-sandbox--eval-iter rhs env)))
-                       (binding (assoc var env)))
-                  (setq val evaled)
-                  (if binding
-                      (setcdr binding val)
-                    (puthash var val macher-agent-sandbox--globals))))
-              val))
+  "Evaluate setq form ARGS in ENV."
+  (let ((val nil))
+    (while args
+      (let* ((var (pop args))
+             (rhs (pop args))
+             (evaled (iter-yield-from (macher-agent-sandbox--eval-iter rhs env)))
+             (binding (assoc var env)))
+        (setq val evaled)
+        (if binding
+            (setcdr binding val)
+          (puthash var val macher-agent-sandbox--globals))))
+    val))
 
 (iter-defun macher-agent-sandbox--eval-mapcar-iter (args env)
-            "Evaluate mapcar form ARGS in ENV."
-            (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
-                  (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env)))
-                  (result nil))
-              (unless (listp seq) (error "Execution error (mapcar): Wrong type argument: listp, %s" seq))
-              (dolist (item seq (nreverse result))
-                (push (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))) result))))
+  "Evaluate mapcar form ARGS in ENV over any sequence."
+  (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
+        (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env)))
+        (result nil))
+    (unless (sequencep seq)
+      (error "Execution error (mapcar): Wrong type argument: sequencep, %s" seq))
+    (dolist (item (append seq nil) (nreverse result))
+      (push (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))) result))))
 
 (iter-defun macher-agent-sandbox--eval-mapc-iter (args env)
-            "Evaluate mapc form ARGS in ENV."
-            (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
-                  (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env))))
-              (unless (listp seq)
-                (error "Execution error (mapc): Wrong type argument: listp, %s" seq))
-              (dolist (item seq seq)
-                (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))))))
+  "Evaluate mapc form ARGS in ENV over any sequence."
+  (let ((func (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
+        (seq (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env))))
+    (unless (sequencep seq)
+      (error "Execution error (mapc): Wrong type argument: sequencep, %s" seq))
+    (dolist (item (append seq nil) seq)
+      (iter-yield-from (macher-agent-sandbox--funcall-iter func (list item))))))
 
 (defvar macher-agent-sandbox--special-forms nil
   "Store mapping of special form symbols to handler functions.")
@@ -298,240 +281,238 @@ If IS-STAR is non-nil, evaluate as `let*', otherwise evaluate as `let'."
  macher-agent-sandbox--special-forms
  `((quote . ,(iter-lambda (args _env) (car args)))
    (mapcar . ,(iter-lambda (args env)
-                           (iter-yield-from (macher-agent-sandbox--eval-mapcar-iter args env))))
+                (iter-yield-from (macher-agent-sandbox--eval-mapcar-iter args env))))
    (mapc . ,(iter-lambda (args env)
-                         (iter-yield-from (macher-agent-sandbox--eval-mapc-iter args env))))
+              (iter-yield-from (macher-agent-sandbox--eval-mapc-iter args env))))
    (function . ,(iter-lambda (args env)
-                             (let ((fn-target (car args)))
-                               (if (symbolp fn-target)
-                                   fn-target
-                                 (iter-yield-from (macher-agent-sandbox--eval-iter fn-target env))))))
+                  (let ((fn-target (car args)))
+                    (if (symbolp fn-target)
+                        fn-target
+                      (iter-yield-from (macher-agent-sandbox--eval-iter fn-target env))))))
    (lambda . ,(iter-lambda (args env)
-                           (list 'closure (car args) (cdr args) env)))
+                (list 'closure (car args) (cdr args) env)))
    (progn . ,(iter-lambda (args env)
-                          (let ((result nil))
-                            (dolist (form args result)
-                              (setq result (iter-yield-from
-                                            (macher-agent-sandbox--eval-iter form env)))))))
+               (let ((result nil))
+                 (dolist (form args result)
+                   (setq result (iter-yield-from
+                                 (macher-agent-sandbox--eval-iter form env)))))))
    (if . ,(iter-lambda (args env)
-                       (if (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
-                           (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env))
-                         (iter-yield-from (macher-agent-sandbox--eval-iter (caddr args) env)))))
+            (if (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
+                (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env))
+              (iter-yield-from (macher-agent-sandbox--eval-iter (caddr args) env)))))
    (and . ,(iter-lambda (args env)
-                        (iter-yield-from (macher-agent-sandbox--eval-and-or-iter args env nil))))
+             (iter-yield-from (macher-agent-sandbox--eval-and-or-iter args env nil))))
    (or . ,(iter-lambda (args env)
-                       (iter-yield-from (macher-agent-sandbox--eval-and-or-iter args env t))))
+            (iter-yield-from (macher-agent-sandbox--eval-and-or-iter args env t))))
    (cond . ,(iter-lambda (args env)
-                         (let ((result nil)
-                               (matched nil))
-                           (while (and args (not matched))
-                             (let* ((clause (pop args))
-                                    (cond-val
-                                     (iter-yield-from
-                                      (macher-agent-sandbox--eval-iter (car clause) env))))
-                               (when cond-val
-                                 (setq matched t)
-                                 (if (cdr clause)
-                                     (dolist (form (cdr clause))
-                                       (setq result (iter-yield-from
-                                                     (macher-agent-sandbox--eval-iter form env))))
-                                   (setq result cond-val)))))
-                           result)))
+              (let ((result nil)
+                    (matched nil))
+                (while (and args (not matched))
+                  (let* ((clause (pop args))
+                         (cond-val (iter-yield-from
+                                    (macher-agent-sandbox--eval-iter (car clause) env))))
+                    (when cond-val
+                      (setq matched t)
+                      (if (cdr clause)
+                          (dolist (form (cdr clause))
+                            (setq result (iter-yield-from
+                                          (macher-agent-sandbox--eval-iter form env))))
+                        (setq result cond-val)))))
+                result)))
    (setq . ,(iter-lambda (args env)
-                         (iter-yield-from (macher-agent-sandbox--eval-setq-iter args env))))
+              (iter-yield-from (macher-agent-sandbox--eval-setq-iter args env))))
    (while . ,(iter-lambda (args env)
-                          (while (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
-                            (dolist (form (cdr args))
-                              (iter-yield-from (macher-agent-sandbox--eval-iter form env))))
-                          nil))
+               (while (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
+                 (dolist (form (cdr args))
+                   (iter-yield-from (macher-agent-sandbox--eval-iter form env))))
+               nil))
    (let . ,(iter-lambda (args env)
-                        (iter-yield-from (macher-agent-sandbox--eval-let-iter args env nil))))
+             (iter-yield-from (macher-agent-sandbox--eval-let-iter args env nil))))
    (let* . ,(iter-lambda (args env)
-                         (iter-yield-from (macher-agent-sandbox--eval-let-iter args env t))))
+              (iter-yield-from (macher-agent-sandbox--eval-let-iter args env t))))
    (defalias . ,(iter-lambda (args env)
-                             (let ((func-name (iter-yield-from
-                                               (macher-agent-sandbox--eval-iter (car args) env)))
-                                   (func-body (iter-yield-from
-                                               (macher-agent-sandbox--eval-iter (cadr args) env))))
-                               (puthash func-name func-body macher-agent-sandbox--functions)
-                               func-name)))
+                  (let ((func-name (iter-yield-from
+                                    (macher-agent-sandbox--eval-iter (car args) env)))
+                        (func-body (iter-yield-from
+                                    (macher-agent-sandbox--eval-iter (cadr args) env))))
+                    (puthash func-name func-body macher-agent-sandbox--functions)
+                    func-name)))
    (funcall . ,(iter-lambda (args env)
-                            (let ((func (iter-yield-from
-                                         (macher-agent-sandbox--eval-iter (car args) env)))
-                                  (eval-args
-                                   (iter-yield-from
-                                    (macher-agent-sandbox--eval-args-iter (cdr args) env))))
-                              (iter-yield-from (macher-agent-sandbox--funcall-iter func eval-args)))))
+                 (let ((func (iter-yield-from
+                              (macher-agent-sandbox--eval-iter (car args) env)))
+                       (eval-args (iter-yield-from
+                                   (macher-agent-sandbox--eval-args-iter (cdr args) env))))
+                   (iter-yield-from (macher-agent-sandbox--funcall-iter func eval-args)))))
    (apply . ,(iter-lambda (args env)
-                          (let* ((func (iter-yield-from
-                                        (macher-agent-sandbox--eval-iter (car args) env)))
-                                 (eval-args
-                                  (iter-yield-from
-                                   (macher-agent-sandbox--eval-args-iter (cdr args) env)))
-                                 (final-args (append (butlast eval-args) (car (last eval-args)))))
-                            (iter-yield-from (macher-agent-sandbox--funcall-iter func final-args)))))
+               (let* ((func (iter-yield-from
+                             (macher-agent-sandbox--eval-iter (car args) env)))
+                      (eval-args (iter-yield-from
+                                  (macher-agent-sandbox--eval-args-iter (cdr args) env)))
+                      (final-args (append (butlast eval-args) (car (last eval-args)))))
+                 (iter-yield-from (macher-agent-sandbox--funcall-iter func final-args)))))
    (condition-case . ,(iter-lambda (args env)
-                                   (let ((var (car args))
-                                         (bodyform (cadr args))
-                                         (handlers (cddr args)))
-                                     (condition-case err
-                                         (iter-yield-from (macher-agent-sandbox--eval-iter bodyform env))
-                                       (error
-                                        (let* ((err-sym (car err))
-                                               (err-conditions (get err-sym 'error-conditions))
-                                               (matched-handler nil))
-                                          (dolist (handler handlers)
-                                            (let ((cond-spec (car handler)))
-                                              (when (or (eq cond-spec t)
-                                                        (memq cond-spec err-conditions)
-                                                        (and (listp cond-spec)
-                                                             (cl-intersection cond-spec err-conditions)))
-                                                (setq matched-handler handler))))
-                                          (if matched-handler
-                                              (let ((new-env (if var (cons (cons var err) env) env))
-                                                    (result nil))
-                                                (dolist (form (cdr matched-handler) result)
-                                                  (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env)))))
-                                            (signal (car err) (cdr err)))))))))
+                        (let ((var (car args))
+                              (bodyform (cadr args))
+                              (handlers (cddr args)))
+                          (condition-case err
+                              (iter-yield-from (macher-agent-sandbox--eval-iter bodyform env))
+                            (error
+                             (let* ((err-sym (car err))
+                                    (err-conditions (get err-sym 'error-conditions))
+                                    (matched-handler nil))
+                               (dolist (handler handlers)
+                                 (let ((cond-spec (car handler)))
+                                   (when (or (eq cond-spec t)
+                                             (memq cond-spec err-conditions)
+                                             (and (listp cond-spec)
+                                                  (cl-intersection cond-spec err-conditions)))
+                                     (setq matched-handler handler))))
+                               (if matched-handler
+                                   (let ((new-env (if var (cons (cons var err) env) env))
+                                         (result nil))
+                                     (dolist (form (cdr matched-handler) result)
+                                       (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form new-env)))))
+                                 (signal (car err) (cdr err)))))))))
    (unwind-protect . ,(iter-lambda (args env)
-                                   (let ((body-result nil))
-                                     (unwind-protect
-                                         (setq body-result (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
-                                       (dolist (form (cdr args))
-                                         (let ((iter (macher-agent-sandbox--eval-iter form env)))
-                                           (condition-case nil
-                                               (while t
-                                                 (iter-next iter nil))
-                                             (iter-end-of-sequence nil)))))
-                                     body-result)))
+                        (let ((body-result nil))
+                          (unwind-protect
+                              (setq body-result (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env)))
+                            (dolist (form (cdr args))
+                              (let ((iter (macher-agent-sandbox--eval-iter form env)))
+                                (condition-case nil
+                                    (while t
+                                      (iter-next iter nil))
+                                  (iter-end-of-sequence nil)))))
+                          body-result)))
    (catch . ,(iter-lambda (args env)
-                          (catch (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
-                            (let ((result nil))
-                              (dolist (form (cdr args) result)
-                                (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form env))))))))
+               (catch (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
+                 (let ((result nil))
+                   (dolist (form (cdr args) result)
+                     (setq result (iter-yield-from (macher-agent-sandbox--eval-iter form env))))))))
    (throw . ,(iter-lambda (args env)
-                          (throw (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
-                                 (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env)))))
+               (throw (iter-yield-from (macher-agent-sandbox--eval-iter (car args) env))
+                      (iter-yield-from (macher-agent-sandbox--eval-iter (cadr args) env)))))
    (fboundp . ,(iter-lambda (args env)
-                            (let ((sym (iter-yield-from
-                                        (macher-agent-sandbox--eval-iter (car args) env))))
-                              (when (symbolp sym)
-                                (if (or (gethash sym macher-agent-sandbox--primitives)
-                                        (gethash sym macher-agent-sandbox--functions)
-                                        (macher-agent--ptc-primitive-p sym)
-                                        (assoc sym macher-agent-sandbox--special-forms))
-                                    t nil)))))
+                 (let ((sym (iter-yield-from
+                             (macher-agent-sandbox--eval-iter (car args) env))))
+                   (when (symbolp sym)
+                     (if (or (gethash sym macher-agent-sandbox--primitives)
+                             (gethash sym macher-agent-sandbox--functions)
+                             (macher-agent--ptc-primitive-p sym)
+                             (assoc sym macher-agent-sandbox--special-forms))
+                         t nil)))))
    (boundp . ,(iter-lambda (args env)
-                           (let ((sym (iter-yield-from
-                                       (macher-agent-sandbox--eval-iter (car args) env))))
-                             (when (symbolp sym)
-                               (if
-                                   (or (assoc sym env)
-                                       (not (eq
-                                             (gethash sym macher-agent-sandbox--globals
-                                                      macher-agent-sandbox--unbound)
-                                             macher-agent-sandbox--unbound)))
-                                   t nil)))))
+                (let ((sym (iter-yield-from
+                            (macher-agent-sandbox--eval-iter (car args) env))))
+                  (when (symbolp sym)
+                    (if (or (assoc sym env)
+                            (not (eq (gethash sym macher-agent-sandbox--globals
+                                              macher-agent-sandbox--unbound)
+                                     macher-agent-sandbox--unbound)))
+                        t nil)))))
    (macroexpand . ,(iter-lambda (args env)
-                                (let* ((form (iter-yield-from
-                                              (macher-agent-sandbox--eval-iter (car args) env)))
-                                       (macro-def
-                                        (when (and (consp form) (symbolp (car form)))
-                                          (gethash (car form)
-                                                   macher-agent-sandbox--functions))))
-                                  (if (and (consp macro-def) (eq (car macro-def) 'macro))
-                                      (iter-yield-from
-                                       (macher-agent-sandbox--funcall-iter (cdr macro-def) (cdr form)))
-                                    form))))
+                     (let* ((form (iter-yield-from
+                                   (macher-agent-sandbox--eval-iter (car args) env)))
+                            (macro-def (when (and (consp form) (symbolp (car form)))
+                                         (gethash (car form)
+                                                  macher-agent-sandbox--functions))))
+                       (if (and (consp macro-def) (eq (car macro-def) 'macro))
+                           (iter-yield-from
+                            (macher-agent-sandbox--funcall-iter (cdr macro-def) (cdr form)))
+                         form))))
    (functionp . ,(iter-lambda (args env)
-                              (let ((val (iter-yield-from
-                                          (macher-agent-sandbox--eval-iter (car args) env))))
-                                (or (and (consp val) (memq (car val) '(closure lambda macro)))
-                                    (and (symbolp val)
-                                         (or (gethash val macher-agent-sandbox--primitives)
-                                             (gethash val macher-agent-sandbox--functions)
-                                             (macher-agent--ptc-primitive-p val)))
-                                    (functionp val)))))))
+                   (let ((val (iter-yield-from
+                               (macher-agent-sandbox--eval-iter (car args) env))))
+                     (or (and (consp val) (memq (car val) '(closure lambda macro)))
+                         (and (symbolp val)
+                              (or (gethash val macher-agent-sandbox--primitives)
+                                  (gethash val macher-agent-sandbox--functions)
+                                  (macher-agent--ptc-primitive-p val)))
+                         (functionp val)))))))
 
 (defun macher-agent-sandbox--eval-symbol (expression &optional environment)
-  "Evaluate explicit EXPRESSION keyword against sandbox symbols."
+  "Evaluate symbol EXPRESSION against lexical ENVIRONMENT and sandbox globals."
   (if (keywordp expression)
-      (progn
-        (cl-check-type expression keyword)
-        expression)
+      expression
     (let ((binding (assoc expression environment)))
-      (cond
-       (binding (cdr binding))
-       (t
+      (if binding
+          (cdr binding)
         (let ((val (gethash expression macher-agent-sandbox--globals macher-agent-sandbox--unbound)))
           (when (eq val macher-agent-sandbox--unbound)
             (error "Unbound variable: %s" expression))
-          val))))))
+          val)))))
 
 (iter-defun macher-agent-sandbox--eval-compound-iter (expression environment)
-            "Evaluate compound form EXPRESSION in ENVIRONMENT."
-            (let* ((operator (car expression))
-                   (arguments (cdr expression))
-                   (special-handler (and (symbolp operator)
-                                         (cdr (assoc operator macher-agent-sandbox--special-forms))))
-                   (macro-def (and (symbolp operator)
-                                   (gethash operator macher-agent-sandbox--functions))))
-              (cond
-               ((and (symbolp operator)
-                     (macher-agent--ptc-primitive-p operator))
-                (let
-                    ((evaled-args (iter-yield-from
-                                   (macher-agent-sandbox--eval-args-iter arguments environment))))
-                  (iter-yield
-                   (make-macher-agent-tool-call
-                    :name operator
-                    :args (macher-agent-sandbox--normalize-args-to-plist evaled-args)))))
-               (special-handler
-                (iter-yield-from (funcall special-handler arguments environment)))
-               ((and (consp macro-def) (eq (car macro-def) 'macro))
-                (let* ((macro-fn (cdr macro-def))
-                       (expanded-form (iter-yield-from
-                                       (macher-agent-sandbox--funcall-iter macro-fn arguments))))
-                  (iter-yield-from (macher-agent-sandbox--eval-iter expanded-form environment))))
-               (t
-                (let ((evaled-args (iter-yield-from
-                                    (macher-agent-sandbox--eval-args-iter arguments environment))))
-                  (iter-yield-from (macher-agent-sandbox--funcall-iter operator evaled-args)))))))
+  "Evaluate compound form EXPRESSION in ENVIRONMENT."
+  (let* ((operator (car expression))
+         (arguments (cdr expression))
+         (special-handler (and (symbolp operator)
+                               (cdr (assoc operator macher-agent-sandbox--special-forms))))
+         (macro-def (and (symbolp operator)
+                         (gethash operator macher-agent-sandbox--functions))))
+    (cond
+     ((and (symbolp operator)
+           (macher-agent--ptc-primitive-p operator))
+      (let ((evaled-args (iter-yield-from
+                          (macher-agent-sandbox--eval-args-iter arguments environment))))
+        (iter-yield
+         (make-macher-agent-tool-call
+          :name operator
+          :args (macher-agent-sandbox--normalize-args-to-plist evaled-args)))))
+     (special-handler
+      (iter-yield-from (funcall special-handler arguments environment)))
+     ((and (consp macro-def) (eq (car macro-def) 'macro))
+      (let* ((macro-fn (cdr macro-def))
+             (expanded-form (iter-yield-from
+                             (macher-agent-sandbox--funcall-iter macro-fn arguments))))
+        (iter-yield-from (macher-agent-sandbox--eval-iter expanded-form environment))))
+     (t
+      (let ((evaled-args (iter-yield-from
+                          (macher-agent-sandbox--eval-args-iter arguments environment))))
+        (iter-yield-from (macher-agent-sandbox--funcall-iter operator evaled-args)))))))
 
 (iter-defun macher-agent-sandbox--eval-iter (expression environment)
-            "Evaluate EXPRESSION in ENVIRONMENT yielding on PTC tool calls."
-            (cond
-             ((or (numberp expression) (stringp expression) (memq expression '(t nil)))
-              expression)
-             ((symbolp expression)
-              (macher-agent-sandbox--eval-symbol expression environment))
-             ((consp expression)
-              (iter-yield-from (macher-agent-sandbox--eval-compound-iter expression environment)))))
+  "Evaluate EXPRESSION in ENVIRONMENT yielding on PTC tool calls."
+  (cond
+   ((or (numberp expression) (stringp expression) (vectorp expression) (memq expression '(t nil)))
+    expression)
+   ((symbolp expression)
+    (macher-agent-sandbox--eval-symbol expression environment))
+   ((consp expression)
+    (iter-yield-from (macher-agent-sandbox--eval-compound-iter expression environment)))))
 
 (defun macher-agent-ptc--inject-tool (state)
-  "Inject execution tool into STATE plist if PTC primitives are active."
+  "Extract PTC primitives from composed presets and inject `ptc_execution' into STATE."
   (cl-check-type state list)
+  (dolist (item (plist-get state :resolved-items))
+    (pcase item
+      ((or `(preset ,_sym ,spec)
+           `(exclusive-reset ,_sym ,spec))
+       (when (plist-get spec :exclusive)
+         (setq state (plist-put state :ptc-primitives nil)))
+       (when-let* ((ptc-spec (plist-get spec :ptc-primitives)))
+         (let ((current-ptc (plist-get state :ptc-primitives))
+               (ptc-list (if (listp ptc-spec) ptc-spec (list ptc-spec))))
+           (setq state (plist-put state :ptc-primitives
+                                  (cl-delete-duplicates (append current-ptc ptc-list)
+                                                        :test #'equal))))))))
   (let* ((state-prims (plist-get state :ptc-primitives))
          (active-prims (or state-prims (bound-and-true-p macher-agent--active-ptc-primitives))))
+    (when (and state-prims (bound-and-true-p macher-agent--persistent-context)
+               (macher-agent-valid-context-p macher-agent--persistent-context))
+      (let ((sb (copy-sequence (macher-agent-sandbox-get-state macher-agent--persistent-context))))
+        (macher-agent-sandbox-set-state macher-agent--persistent-context
+                                        (plist-put sb :ptc-primitives state-prims))))
     (when active-prims
       (let* ((tools (plist-get state :tools))
              (ptc-tool (or (when (boundp 'macher-agent-ptc-execution-tool)
                              (symbol-value 'macher-agent-ptc-execution-tool))
-                           (when (fboundp 'macher-agent-resolve-tool)
-                             (ignore-errors (macher-agent-resolve-tool "ptc_execution" nil)))
+                           (ignore-errors (macher-agent-resolve-tool "ptc_execution" nil))
                            (when (fboundp 'gptel-get-tool)
                              (ignore-errors (gptel-get-tool "ptc_execution")))
                            'ptc_execution))
              (already-present (cl-some (lambda (tl)
-                                         (let ((name (cond
-                                                      ((symbolp tl) (symbol-name tl))
-                                                      ((stringp tl) tl)
-                                                      ((and (fboundp 'gptel-tool-p)
-                                                            (gptel-tool-p tl)
-                                                            (fboundp 'gptel-tool-name))
-                                                       (gptel-tool-name tl))
-                                                      ((consp tl) (plist-get tl :name))
-                                                      (t nil))))
+                                         (let ((name (macher-agent-canonical-tool-name tl)))
                                            (and name (member name '("ptc_execution" "ptc-execution")))))
                                        tools)))
         (unless already-present
@@ -541,14 +522,7 @@ If IS-STAR is non-nil, evaluate as `let*', otherwise evaluate as `let'."
 ;;; Programmatic Tool Calling (PTC) Prompt Generation
 
 (defun macher-agent--build-tool-arg-type-spec (arg lisp-name lisp-arg-name)
-  "Build type spec and optional deftype string for ARG.
-
-Construct type spec and optional deftype definition for tool parameter ARG.
-LISP-NAME is the Lisp function symbol for the tool.
-LISP-ARG-NAME is the string name of the argument.
-
-Return a cons cell (TYPE-SPEC . DEFTYPE-STR).
-Side effects: None."
+  "Build type spec and optional deftype string for ARG."
   (let* ((arg-type (plist-get arg :type))
          (items (plist-get arg :items))
          (props (when items (plist-get items :properties))))
@@ -564,20 +538,17 @@ Side effects: None."
                                     ((or 'string "string") 'string)
                                     ((or 'number "number") 'number)
                                     ((or 'boolean "boolean") 'boolean)
-                                    ((or 'array "array") '(or null (list string)))
+                                    ((or 'array "array") '(or null (vector string)))
                                     (_ 't)))
                           prop-strs))
-        (cons (list 'list type-name)
+        (cons (list 'vector type-name)
               (format "(cl-deftype %s () \n  \"Property list for %s.\"\n  '(plist %s))"
                       type-name lisp-arg-name
                       (string-join (nreverse prop-strs) " ")))))
-
      ((member arg-type '(array "array"))
-      (cons '(or null (list string)) nil))
-
+      (cons '(or null (vector string)) nil))
      ((member arg-type '(object "object"))
       (cons 'plist nil))
-
      (t
       (cons (pcase arg-type
               ((or 'string "string") 'string)
@@ -596,7 +567,6 @@ Side effects: None."
   (cl-check-type return-type (or symbol list))
   (cl-check-type dummy-return (or string null))
   (cl-check-type deftypes list)
-
   (let* ((formatted-arg-types (mapcar (lambda (t-spec)
                                         (if (symbolp t-spec)
                                             (symbol-name t-spec)
@@ -619,13 +589,7 @@ Side effects: None."
       defun-str)))
 
 (defun macher-agent--format-tool-lisp-docstring (tool-obj)
-  "Infer declarative Lisp signature for TOOL-OBJ.
-
-Extract schema and metadata from TOOL-OBJ to construct a declarative
-Lisp signature string with type hints.
-
-Return formatted tool Lisp signature string.
-Side effects: None."
+  "Infer declarative Lisp signature for TOOL-OBJ."
   (let* ((name (gptel-tool-name tool-obj))
          (lisp-name (intern (replace-regexp-in-string "_" "-" name)))
          (desc (gptel-tool-description tool-obj))
@@ -636,7 +600,6 @@ Side effects: None."
          (is-delegate (string-match-p "delegate" name))
          (return-type (if is-delegate '(list string) 'string))
          (dummy-return (if is-delegate "(list \"\")" "\"\"")))
-
     (dolist (arg args)
       (let* ((raw-name (if (symbolp (plist-get arg :name))
                            (symbol-name (plist-get arg :name))
@@ -649,30 +612,22 @@ Side effects: None."
         (when deftype-str
           (push deftype-str deftypes))
         (push type-spec arg-types)))
-
     (macher-agent--format-tool-defun
      name lisp-name desc arg-names arg-types return-type dummy-return deftypes)))
 
 (defun macher-agent--filter-ptc-matching-tools (tools active)
-  "Filter TOOLS matching any active primitive in ACTIVE.
-
-Iterate through TOOLS list and collect tool objects matching active
-primitive symbols or names present in ACTIVE.
-
-Return list of matching gptel tool objects.
-Side effects: None."
+  "Filter TOOLS matching any active primitive in ACTIVE."
   (cl-loop for t-obj in tools
-           when
-           (and (gptel-tool-p t-obj)
-                (cl-some
-                 (lambda (prim)
-                   (string=
-                    (replace-regexp-in-string "_" "-"
-                                              (if (symbolp prim)
-                                                  (symbol-name prim)
-                                                prim))
-                    (replace-regexp-in-string "_" "-" (gptel-tool-name t-obj))))
-                 active))
+           when (and (gptel-tool-p t-obj)
+                     (cl-some
+                      (lambda (prim)
+                        (string=
+                         (replace-regexp-in-string "_" "-"
+                                                   (if (symbolp prim)
+                                                       (symbol-name prim)
+                                                     prim))
+                         (replace-regexp-in-string "_" "-" (gptel-tool-name t-obj))))
+                      active))
            collect t-obj))
 
 (defun macher-agent--tools-require-complex-types-p (tools)
@@ -684,17 +639,8 @@ Side effects: None."
                       (gptel-tool-args tool)))
            tools))
 
-(defun macher-agent--inject-ptc-prompt
-    (existing-prompt &optional active-primitives available-tools)
-  "Append Programmatic Tool Calling instructions to EXISTING-PROMPT.
-
-Dynamically append Programmatic Tool Calling instructions with compiler hints
-to EXISTING-PROMPT.
-ACTIVE-PRIMITIVES is an optional list of active primitive symbols or names.
-AVAILABLE-TOOLS is an optional list of gptel tool objects.
-
-Return modified prompt string with PTC instructions, or EXISTING-PROMPT.
-Side effects: None."
+(defun macher-agent--inject-ptc-prompt (existing-prompt &optional active-primitives available-tools)
+  "Append Programmatic Tool Calling instructions to EXISTING-PROMPT."
   (let* ((active (or active-primitives (bound-and-true-p macher-agent--active-ptc-primitives)))
          (tools (or available-tools (bound-and-true-p gptel-tools)))
          (matching-tools (macher-agent--filter-ptc-matching-tools tools active)))
@@ -710,20 +656,44 @@ Side effects: None."
        (string-join
         (mapcar #'macher-agent--format-tool-lisp-docstring matching-tools) "\n\n")
        (if (macher-agent--tools-require-complex-types-p matching-tools)
-           "\n\n;; JSON TO EMACS LISP MAPPING RULES:\n;; 1. JSON Objects MUST translate to flat property lists using keywords (for example, `(:key \"value\")`). DO NOT use alists or dotted pairs.\n;; 2. JSON Arrays MUST translate to standard Lisp lists. Construct them using the `list` function rather than quoting.\n;; Syntax example for complex arguments: `(tool-name (list (list :buffer_name \"agent\" :instructions \"Task\")))`"
+           "\n\n;; JSON TO EMACS LISP MAPPING RULES:\n;; 1. JSON Objects MUST translate to flat property lists using keywords (for example, `(:key \"value\")`). DO NOT use alists or dotted pairs.\n;; 2. JSON Arrays MUST translate to Lisp vectors using the `vector` function.\n;; Syntax example for complex arguments: `(tool-name (vector (list :buffer_name \"agent\" :instructions \"Task\")))`"
          "")
        "\n\n;; EXPECTED SCRIPT RETURN TYPE:\n"
        "Keep everything within a let*. Return the output object without formatting.\n"))))
 
 ;;; PTC Execution Handlers
 
+(defun macher-agent-sandbox--spoof-tool-ui (target-buf tool-name)
+  "Simulate tool UI execution for TOOL-NAME symbol in TARGET-BUF."
+  (cl-check-type target-buf buffer)
+  (cl-check-type tool-name symbol)
+  (let ((name-str (replace-regexp-in-string "_" "-" (symbol-name tool-name))))
+    (when (buffer-live-p target-buf)
+      (with-current-buffer target-buf
+        (let ((fsm (or (macher-agent-get-active-fsm)
+                       (bound-and-true-p macher-agent--active-fsm)
+                       (bound-and-true-p gptel--fsm-last))))
+          (if (and fsm (fboundp 'gptel-fsm-info) (fboundp 'gptel--update-tool-call))
+              (let* ((info (gptel-fsm-info fsm))
+                     (mock-info (copy-sequence info))
+                     (spoofed-calls (list (list :name (format "PTC: %s" name-str)))))
+                (setq mock-info (plist-put mock-info :tool-use spoofed-calls))
+                (setq mock-info (plist-put mock-info :buffer target-buf))
+                (unwind-protect
+                    (progn
+                      (macher-agent--set-fsm-info fsm mock-info)
+                      (gptel--update-tool-call fsm))
+                  (macher-agent--set-fsm-info fsm info)))
+            (when (fboundp 'gptel--update-status)
+              (gptel--update-status
+               (concat
+                (propertize " Calling tool (" 'face 'mode-line-emphasis)
+                (propertize (format "PTC: %s" name-str) 'face 'font-lock-keyword-face)
+                (propertize ")" 'face 'mode-line-emphasis))))))
+        t))))
+
 (defun macher-agent--display-ptc-tool-execution (target-buf tool-name args &optional context)
-  "Update tool execution UI explicitly on live TARGET-BUF."
-  (when (and (not (bufferp target-buf)) (bufferp tool-name))
-    (let ((tb tool-name)
-          (tn target-buf))
-      (setq target-buf tb
-            tool-name tn)))
+  "Update tool execution UI on live TARGET-BUF for TOOL-NAME."
   (cl-check-type target-buf buffer)
   (let* ((target-lisp-name (if (symbolp tool-name) (symbol-name tool-name) (format "%s" tool-name)))
          (original-name-str (replace-regexp-in-string "-" "_" target-lisp-name))
@@ -731,15 +701,12 @@ Side effects: None."
          (tool-var (intern-soft (format "macher-agent-%s-tool" hyphen-name)))
          (resolved-tool (or (when (and tool-var (boundp tool-var) (macher-tool-valid-p (symbol-value tool-var)))
                               (symbol-value tool-var))
-                            (if (fboundp 'macher-agent-resolve-tool)
-                                (or (macher-agent-resolve-tool original-name-str nil nil context)
-                                    (macher-agent-resolve-tool hyphen-name nil nil context))
-                              (when (and (boundp 'macher-agent-tools-registry)
-                                         (hash-table-p macher-agent-tools-registry))
-                                (or (gethash original-name-str macher-agent-tools-registry)
-                                    (gethash hyphen-name macher-agent-tools-registry))))))
+                            (let ((r1 (macher-agent-resolve-tool original-name-str nil nil context)))
+                              (if (macher-tool-valid-p r1)
+                                  r1
+                                (let ((r2 (macher-agent-resolve-tool hyphen-name nil nil context)))
+                                  (when (macher-tool-valid-p r2) r2))))))
          (block-reason nil))
-
     (when (bound-and-true-p gptel-pre-tool-call-functions)
       (run-hook-wrapped
        'gptel-pre-tool-call-functions
@@ -751,23 +718,14 @@ Side effects: None."
            (when (and res (listp res) (plist-get res :block))
              (setq block-reason (plist-get res :block))
              t)))))
-
     (if block-reason
         (error "%s" block-reason)
       (message "PTC Executing: %s" original-name-str)
-      (when (fboundp 'macher-agent-gptel-spoof-tool-ui)
-        (macher-agent-gptel-spoof-tool-ui target-buf (intern hyphen-name)))
+      (macher-agent-sandbox--spoof-tool-ui target-buf (intern hyphen-name))
       (cons original-name-str resolved-tool))))
 
 (defun macher-agent--format-ptc-result-block (truncated-call call-str str-res)
-  "Format PTC result block string for display in buffer.
-
-TRUNCATED-CALL is the truncated call header string.
-CALL-STR is the full call string representation.
-STR-RES is the formatted string response payload.
-
-Return formatted result block string matching mode syntax.
-Side effects: None."
+  "Format PTC result block string for display in buffer."
   (if (derived-mode-p 'org-mode)
       (format "\n#+begin_tool %s\n%s\n\n%s\n#+end_tool\n"
               truncated-call call-str str-res)
@@ -775,10 +733,7 @@ Side effects: None."
             truncated-call call-str str-res)))
 
 (defun macher-agent--cycle-ptc-result-block ()
-  "Cycle visibility of the PTC result block at point.
-
-Return result of cycling command evaluation or nil on error.
-Side effects: Toggles block visibility in Org mode or Markdown mode."
+  "Cycle visibility of the PTC result block at point."
   (ignore-errors
     (if (derived-mode-p 'org-mode)
         (org-cycle)
@@ -807,8 +762,38 @@ Side effects: Toggles block visibility in Org mode or Markdown mode."
           (forward-line 1)
           (macher-agent--cycle-ptc-result-block))))))
 
+(defun macher-agent-sandbox--coerce-arg-for-spec (val arg-spec)
+  "Coerce VAL to a vector when ARG-SPEC declares `:type \"array\"', matching `gptel'."
+  (let ((arg-type (plist-get arg-spec :type)))
+    (if (and (member arg-type '(array "array"))
+             (listp val)
+             (not (null val)))
+        (vconcat val)
+      val)))
+
+(defun macher-agent-sandbox--resolve-positional-args (resolved-tool user-args)
+  "Convert USER-ARGS into positional arguments ordered and typed by RESOLVED-TOOL `:args'."
+  (let ((arg-specs (gptel-tool-args resolved-tool)))
+    (if (and (consp user-args) (keywordp (car user-args)))
+        (let ((mapped
+               (mapcar (lambda (arg-spec)
+                         (let* ((raw-name (plist-get arg-spec :name))
+                                (name-str (if (symbolp raw-name) (symbol-name raw-name) raw-name))
+                                (under-kw (intern (concat ":" (replace-regexp-in-string "-" "_" name-str))))
+                                (hyphen-kw (intern (concat ":" (replace-regexp-in-string "_" "-" name-str))))
+                                (raw-val (if (plist-member user-args under-kw)
+                                             (plist-get user-args under-kw)
+                                           (plist-get user-args hyphen-kw))))
+                           (macher-agent-sandbox--coerce-arg-for-spec raw-val arg-spec)))
+                       arg-specs)))
+          (reverse (seq-drop-while #'null (reverse mapped))))
+      (cl-loop for val in user-args
+               for tail on arg-specs
+               collect (macher-agent-sandbox--coerce-arg-for-spec val (car tail)) into coerced
+               finally return (append coerced (nthcdr (length coerced) user-args))))))
+
 (defun macher-agent--dispatch-ptc-primitive (context target-buf tool-lisp-sym resolved-tool user-args ptc-callback &optional on-error stop-iter-fn)
-  "Dispatch primitive bound by strict contexts and valid structs."
+  "Dispatch PTC primitive returning raw Elisp types via `ptc-function' or `gptel-tool'."
   (cl-check-type context macher-agent-context)
   (cl-check-type target-buf buffer)
   (cl-check-type tool-lisp-sym symbol)
@@ -824,50 +809,28 @@ Side effects: Toggles block visibility in Org mode or Markdown mode."
                      (when tool-var-under (get tool-var-under 'ptc-function))
                      (get (intern-soft clean-name) 'ptc-function)
                      (when (intern-soft hyphen-name) (get (intern-soft hyphen-name) 'ptc-function))
-                     (when (intern-soft under-name) (get (intern-soft under-name) 'ptc-function))
-                     (get (intern-soft (gptel-tool-name resolved-tool)) 'ptc-function)
-                     (get (intern-soft (replace-regexp-in-string "_" "-" (gptel-tool-name resolved-tool))) 'ptc-function)))
+                     (when (intern-soft under-name) (get (intern-soft under-name) 'ptc-function))))
+         (pos-args (macher-agent-sandbox--resolve-positional-args resolved-tool user-args))
          (run-in-target
           (lambda (fn)
             (with-current-buffer target-buf
               (setq-local macher-agent--persistent-context context)
               (funcall fn)))))
+    (macher-agent-log-tool-intent context "ptc" clean-name user-args)
     (cond
      (ptc-fn
       (funcall run-in-target
                (lambda ()
                  (condition-case cmd-err
-                     (let* ((arglist (ignore-errors (help-function-arglist ptc-fn)))
-                            (clean-args (when (listp arglist)
-                                          (cl-remove-if (lambda (x) (memq x '(&optional &rest &key))) arglist)))
-                            (args (copy-sequence user-args))
-                            (final-args nil)
-                            (takes-cb nil))
-                       (if (listp arglist)
-                           (progn
-                             (dolist (sym clean-args)
-                               (cond
-                                ((eq sym 'context) (push context final-args))
-                                ((eq sym 'callback)
-                                 (setq takes-cb t)
-                                 (push ptc-callback final-args))
-                                (t (push (pop args) final-args))))
-                             (setq final-args (nreverse final-args))
-                             (when args (setq final-args (append final-args args))))
-                         (setq takes-cb nil)
-                         (setq final-args (append user-args (list context))))
-
-                       (let ((res (apply ptc-fn final-args)))
-                         (unless takes-cb
-                           (if (functionp res)
-                               (funcall res ptc-callback)
-                             (funcall ptc-callback res)))))
+                     (let ((res (apply ptc-fn pos-args)))
+                       (if (functionp res)
+                           (funcall res ptc-callback)
+                         (funcall ptc-callback res)))
                    (error
                     (if stop-iter-fn
                         (funcall stop-iter-fn (error-message-string cmd-err))
                       (when (functionp on-error)
                         (funcall on-error (list :status 'error :error (error-message-string cmd-err))))))))))
-
      ((gptel-tool-function resolved-tool)
       (funcall run-in-target
                (lambda ()
@@ -877,10 +840,12 @@ Side effects: Toggles block visibility in Org mode or Markdown mode."
                             (call-args (if is-async
                                            (cons (lambda (res &optional err)
                                                    (if err
-                                                       (if stop-iter-fn (funcall stop-iter-fn err) (when (functionp on-error) (funcall on-error err)))
+                                                       (if stop-iter-fn
+                                                           (funcall stop-iter-fn err)
+                                                         (when (functionp on-error) (funcall on-error err)))
                                                      (funcall ptc-callback res)))
-                                                 user-args)
-                                         user-args)))
+                                                 pos-args)
+                                         pos-args)))
                        (if is-async
                            (apply fn call-args)
                          (funcall ptc-callback (apply fn call-args))))
@@ -888,16 +853,17 @@ Side effects: Toggles block visibility in Org mode or Markdown mode."
                     (let* ((fn (gptel-tool-function resolved-tool))
                            (call-args (cons (lambda (res &optional err)
                                               (if err
-                                                  (if stop-iter-fn (funcall stop-iter-fn err) (when (functionp on-error) (funcall on-error err)))
+                                                  (if stop-iter-fn
+                                                      (funcall stop-iter-fn err)
+                                                    (when (functionp on-error) (funcall on-error err)))
                                                 (funcall ptc-callback res)))
-                                            user-args)))
+                                            pos-args)))
                       (apply fn context call-args)))
                    (error
                     (if stop-iter-fn
                         (funcall stop-iter-fn (error-message-string tool-err))
                       (when (functionp on-error)
                         (funcall on-error (list :status 'error :error (error-message-string tool-err))))))))))
-
      (t
       (when stop-iter-fn (funcall stop-iter-fn "Tool not accessible"))
       (when (functionp on-error)
@@ -938,118 +904,189 @@ Side effects: Toggles block visibility in Org mode or Markdown mode."
       (when (functionp on-error)
         (funcall on-error (list :status 'error :error reason))))))
 
+(defun macher-agent--ptc-resume-step (iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn input)
+  "Advance PTC ITERATOR by one step with INPUT, keeping `macher-agent--active-ptc-execution' bound."
+  (let ((macher-agent--active-ptc-execution t))
+    (condition-case iter-err
+        (let ((step (with-current-buffer resolved-buf (iter-next iterator input)))
+              (resume-cb (lambda (next-input)
+                           (macher-agent--ptc-resume-step
+                            iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn next-input))))
+          (if (macher-agent-tool-call-p step)
+              (macher-agent--ptc-handle-yielded-value
+               step resolved-ctx resolved-buf resume-cb on-error stop-iter-fn)
+            (funcall resume-cb step)))
+      (iter-end-of-sequence
+       (when (functionp on-success)
+         (if (buffer-live-p resolved-buf)
+             (with-current-buffer resolved-buf
+               (funcall on-success (cdr iter-err)))
+           (funcall on-success (cdr iter-err)))))
+      (error
+       (when (functionp on-error)
+         (if (buffer-live-p resolved-buf)
+             (with-current-buffer resolved-buf
+               (funcall on-error (list :status 'error :error (error-message-string iter-err))))
+           (funcall on-error (list :status 'error :error (error-message-string iter-err)))))))))
+
+(defun macher-agent--ptc-resume-loop-start (iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn)
+  "Start the PTC iterator execution loop."
+  (macher-agent--ptc-resume-step iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn nil))
+
 (defun macher-agent-execute-ptc-script (script context target-buf on-success on-error &optional extra-operations)
-  "Execute Programmatic Tool Calling SCRIPT using CONTEXT in TARGET-BUF.
-
-SCRIPT is the string containing Lisp code to evaluate.
-CONTEXT is the active context structure.
-TARGET-BUF is the target buffer for execution.
-ON-SUCCESS is the callback function invoked with success result.
-ON-ERROR is the callback function invoked with error result.
-EXTRA-OPERATIONS is an optional list of allowed primitive host functions.
-
-Return nil.
-Side effects: Evaluates Lisp code in a sandboxed environment."
+  "Execute Programmatic Tool Calling SCRIPT using CONTEXT in TARGET-BUF."
   (cl-check-type script string)
-  (cl-check-type context macher-agent-context)
   (cl-check-type target-buf (or buffer string null))
   (cl-check-type on-success (or function null))
   (cl-check-type on-error (or function null))
   (cl-check-type extra-operations (or hash-table list null))
-  (let* ((prims (append
+  (let* ((caller-prims (bound-and-true-p macher-agent--active-ptc-primitives))
+         (resolved-buf (cond
+                        ((bufferp target-buf) target-buf)
+                        ((stringp target-buf) (get-buffer-create target-buf))
+                        (t (current-buffer))))
+         (resolved-ctx (or (macher-agent-resolve-context context)
+                           (macher-agent-resolve-context resolved-buf)
+                           (macher-agent--make-context
+                            :id "ptc-ctx"
+                            :project-root (macher-agent-root default-directory)
+                            :origin-buffer resolved-buf
+                            :tools (make-hash-table :test 'equal))))
+         (ctx-prims (let ((sb (macher-agent-sandbox-get-state resolved-ctx)))
+                      (when (listp sb) (plist-get sb :ptc-primitives))))
+         (prims (append
                  '(nreverse sort delete delq nconc plist-put aset puthash remhash error signal message random emacs-version)
                  extra-operations))
          (active-ptc-prims
           (delete-dups (append extra-operations
-                               (bound-and-true-p macher-agent--active-ptc-primitives))))
+                               ctx-prims
+                               (with-current-buffer resolved-buf
+                                 (bound-and-true-p macher-agent--active-ptc-primitives))
+                               caller-prims)))
          (macher-agent--active-ptc-execution t))
+    (cl-check-type resolved-ctx macher-agent-context)
     (condition-case err
         (progn
-          (with-current-buffer target-buf
-            (setq macher-agent--persistent-context context)
+          (with-current-buffer resolved-buf
+            (setq-local macher-agent--persistent-context resolved-ctx)
             (setq-local macher-agent--active-ptc-primitives active-ptc-prims)
-            (when (boundp 'macher-agent-sandbox--globals)
-              (setq macher-agent-sandbox--globals (make-hash-table :test 'eq)))
-            (when (boundp 'macher-agent-sandbox--primitives)
-              (setq macher-agent-sandbox--primitives (make-hash-table :test 'eq)))
-            (when (boundp 'macher-agent-sandbox--functions)
-              (setq macher-agent-sandbox--functions (make-hash-table :test 'eq)))
+            (setq macher-agent-sandbox--globals (make-hash-table :test 'eq)
+                  macher-agent-sandbox--primitives (make-hash-table :test 'eq)
+                  macher-agent-sandbox--functions (make-hash-table :test 'eq))
             (macher-agent-sandbox--init prims))
           (let* ((ast (macroexpand-all (read (format "(progn\n%s\n)" script))))
-                 (iterator (with-current-buffer target-buf
+                 (iterator (with-current-buffer resolved-buf
                              (macher-agent-sandbox--eval-iter ast nil)))
                  (stop-iter-fn (lambda (reason)
-                                 (funcall on-error (list :status 'error :error reason)))))
-            (letrec
-                ((ptc-resume-loop
-                  (lambda (input)
-                    (condition-case iter-err
-                        (let ((step (with-current-buffer target-buf (iter-next iterator input))))
-                          (if (macher-agent-tool-call-p step)
-                              (macher-agent--ptc-handle-yielded-value
-                               step context target-buf ptc-resume-loop on-error stop-iter-fn)
-                            (funcall ptc-resume-loop step)))
-                      (iter-end-of-sequence
-                       (funcall on-success (cdr iter-err)))
-                      (error
-                       (funcall on-error (list :status 'error :error (error-message-string iter-err))))))))
-              (funcall ptc-resume-loop nil))))
+                                 (when (functionp on-error)
+                                   (funcall on-error (list :status 'error :error reason))))))
+            (macher-agent--ptc-resume-loop-start
+             iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn)))
       (error
-       (funcall on-error (list :status 'error :error (error-message-string err)))))))
+       (when (functionp on-error)
+         (funcall on-error (list :status 'error :error (error-message-string err))))))))
 
 (defun macher-agent-sandbox-run (expression extra-operations context target-buf)
-  "Execute Lisp EXPRESSION in a sandboxed environment with EXTRA-OPERATIONS.
-
-EXPRESSION is the Lisp expression form to evaluate inside sandbox.
-EXTRA-OPERATIONS is a list of host function symbols allowed in sandbox.
-CONTEXT is the active agent context structure to use for logging tool intent.
-TARGET-BUF is the target buffer of the execution.
-
-Return the result of evaluating EXPRESSION.
-
-Side effects: Evaluates sandboxed Lisp expression."
-  (declare (ftype (function (t list t t) t)))
-  (let ((run-eval
-         (lambda ()
-           (let ((macher-agent-sandbox--primitives (make-hash-table :test 'eq))
-                 (macher-agent-sandbox--functions (make-hash-table :test 'eq))
-                 (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
-             (macher-agent-sandbox--init extra-operations)
-             (let* ((iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
-                    (yield-val nil)
-                    (next-yield nil))
-               (if (null iterator)
-                   (error "macher-agent-sandbox--eval-iter is unmapped")
-                 (condition-case err
-                     (while t
-                       (setq next-yield (iter-next iterator yield-val))
-                       (let ((tc (cond
-                                  ((macher-agent-tool-call-p next-yield) next-yield)
-                                  ((and (listp next-yield)
-                                        (or (eq (plist-get next-yield :interrupt) 'tool-call)
-                                            (plist-get next-yield :name)))
-                                   (make-macher-agent-tool-call
-                                    :name (or (plist-get next-yield :name) (plist-get next-yield :target))
-                                    :args (or (plist-get next-yield :args) (plist-get next-yield :payload))))
-                                  (t nil))))
-                         (when (and tc (macher-agent-tool-call-name tc))
-                           (let ((target (macher-agent-tool-call-name tc))
-                                 (args (macher-agent-tool-call-args tc)))
-                             (when (and context target)
-                               (when (fboundp 'macher-agent-log-tool-intent)
-                                 (macher-agent-log-tool-intent context "ptc" target args))))))
-                       (setq yield-val next-yield))
-                   (iter-end-of-sequence (cdr err)))))))))
+  "Execute Lisp EXPRESSION in a sandboxed environment with EXTRA-OPERATIONS."
+  (let* ((caller-prims (or (when (macher-agent-valid-context-p context)
+                             (let ((sb (macher-agent-sandbox-get-state context)))
+                               (when (listp sb) (plist-get sb :ptc-primitives))))
+                           (bound-and-true-p macher-agent--active-ptc-primitives)))
+         (run-eval
+          (lambda ()
+            (let ((macher-agent--active-ptc-primitives
+                   (or (bound-and-true-p macher-agent--active-ptc-primitives)
+                       caller-prims))
+                  (macher-agent-sandbox--primitives (make-hash-table :test 'eq))
+                  (macher-agent-sandbox--functions (make-hash-table :test 'eq))
+                  (macher-agent-sandbox--globals (make-hash-table :test 'eq)))
+              (macher-agent-sandbox--init extra-operations)
+              (let* ((iterator (macher-agent-sandbox--eval-iter (macroexpand-all expression) nil))
+                     (yield-val nil)
+                     (next-yield nil))
+                (condition-case err
+                    (while t
+                      (setq next-yield (iter-next iterator yield-val))
+                      (let ((tc (cond
+                                 ((macher-agent-tool-call-p next-yield) next-yield)
+                                 ((and (listp next-yield)
+                                       (or (eq (plist-get next-yield :interrupt) 'tool-call)
+                                           (plist-get next-yield :name)))
+                                  (make-macher-agent-tool-call
+                                   :name (or (plist-get next-yield :name) (plist-get next-yield :target))
+                                   :args (or (plist-get next-yield :args) (plist-get next-yield :payload))))
+                                 (t nil))))
+                        (when (and tc (macher-agent-tool-call-name tc))
+                          (let ((target (macher-agent-tool-call-name tc))
+                                (args (macher-agent-tool-call-args tc)))
+                            (when (and context target)
+                              (macher-agent-log-tool-intent context "ptc" target args)))))
+                      (setq yield-val next-yield))
+                  (iter-end-of-sequence (cdr err))))))))
     (if (and (bufferp target-buf) (buffer-live-p target-buf))
         (with-current-buffer target-buf
           (funcall run-eval))
       (funcall run-eval))))
 
+(defun macher-agent-sandbox--resolve-transmission-prims (state)
+  "Resolve active PTC primitives from STATE, target buffer, skills, or context."
+  (let* ((target-buf (macher-agent-transmission-state-target-buffer state))
+         (ctx (or (macher-agent-transmission-state-context state)
+                  (macher-agent-resolve-context target-buf)))
+         (known (macher-agent-transmission-state-known-presets state))
+         (skills (macher-agent-transmission-state-skills state))
+         (tx-plugins (macher-agent-transmission-state-plugins state))
+         (tx-prims (or (macher-agent-transmission-state-ptc-primitives state)
+                       (when (listp tx-plugins)
+                         (plist-get (plist-get tx-plugins :sandbox) :ptc-primitives))))
+         (buf-prims (when (and target-buf (buffer-live-p target-buf))
+                      (with-current-buffer target-buf
+                        (bound-and-true-p macher-agent--active-ptc-primitives))))
+         (ctx-prims (when (macher-agent-valid-context-p ctx)
+                      (let ((sb (macher-agent-sandbox-get-state ctx)))
+                        (when (listp sb) (plist-get sb :ptc-primitives)))))
+         (skill-prims nil))
+    (dolist (s skills)
+      (let* ((spec (if (listp s) s
+                     (or (alist-get s known)
+                         (when (macher-agent-valid-context-p ctx)
+                           (alist-get s (macher-agent-context-skills ctx))))))
+             (p (plist-get spec :ptc-primitives)))
+        (when (plist-get spec :exclusive)
+          (setq buf-prims nil
+                ctx-prims nil
+                skill-prims nil))
+        (when p
+          (setq skill-prims (append skill-prims (if (listp p) p (list p)))))))
+    (cl-delete-duplicates
+     (append tx-prims
+             skill-prims
+             buf-prims
+             ctx-prims)
+     :test #'equal)))
+
 (defun macher-agent-sandbox-append-ptc-to-transmission (state)
-  "Append PTC instructions explicitly to a transmission STATE struct."
+  "Hydrate PTC primitives and append PTC instructions to transmission STATE struct."
   (cl-check-type state macher-agent-transmission-state)
-  (let ((prims (macher-agent-transmission-state-ptc-primitives state)))
+  (let ((prims (macher-agent-sandbox--resolve-transmission-prims state))
+        (target-buf (macher-agent-transmission-state-target-buffer state))
+        (ctx (or (macher-agent-transmission-state-context state)
+                 (macher-agent-resolve-context (macher-agent-transmission-state-target-buffer state)))))
     (when prims
+      (setf (macher-agent-transmission-state-ptc-primitives state) prims)
+      (let ((tx-plugins (copy-sequence (macher-agent-transmission-state-plugins state))))
+        (setf (macher-agent-transmission-state-plugins state)
+              (plist-put tx-plugins :sandbox (list :ptc-primitives prims))))
+      (when (and target-buf (buffer-live-p target-buf))
+        (with-current-buffer target-buf
+          (setq-local macher-agent--active-ptc-primitives prims)))
+      (when (macher-agent-valid-context-p ctx)
+        (let ((sb (copy-sequence (macher-agent-sandbox-get-state ctx))))
+          (macher-agent-sandbox-set-state ctx (plist-put sb :ptc-primitives prims))))
+      (when-let* ((fsm (macher-agent-get-active-fsm)))
+        (when (fboundp 'gptel-fsm-info)
+          (let ((info (copy-sequence (gptel-fsm-info fsm))))
+            (macher-agent--set-fsm-info fsm (plist-put info :ptc-primitives prims)))))
       (let* ((tools (macher-agent-transmission-state-tools state))
              (compiled-ptc-block (macher-agent--inject-ptc-prompt "" prims tools)))
         (unless (string-empty-p compiled-ptc-block)
@@ -1057,18 +1094,74 @@ Side effects: Evaluates sandboxed Lisp expression."
                 (macher-agent-transmission-state-directives state))))))
   state)
 
-(defun macher-agent-sandbox-append-ptc-to-plist (state)
-  "Append PTC instructions explicitly to a STATE property list."
-  (cl-check-type state list)
-  (let ((prims (plist-get state :ptc-primitives)))
-    (when prims
-      (let* ((tools (plist-get state :tools))
-             (compiled-ptc-block (macher-agent--inject-ptc-prompt "" prims tools)))
-        (unless (string-empty-p compiled-ptc-block)
-          (setq state (plist-put state :directives
-                                 (cons (string-trim compiled-ptc-block)
-                                       (plist-get state :directives))))))))
-  state)
+;;;###autoload
+(cl-defmacro macher-agent-execute-detached-ptc ((&key (buffer-name "*workspace-root*")
+                                                      (reap t)
+                                                      primitives
+                                                      presets
+                                                      on-success
+                                                      on-error)
+                                                &rest script-body)
+  "Execute SCRIPT-BODY as a sandboxed PTC script in a detached workspace buffer.
+BUFFER-NAME is the target workspace buffer (default \"*workspace-root*\").
+When REAP is non-nil (default t), kill the buffer after completion.
+PRIMITIVES is an explicit list of allowed tool names, or nil to inherit from PRESETS.
+PRESETS is a preset or list of presets to apply to the detached buffer.
+ON-SUCCESS and ON-ERROR are single-argument callbacks."
+  (declare (indent 1) (debug t))
+  `(let ((root-buf (get-buffer-create ,buffer-name))
+         (allowed-primitives ,primitives)
+         (active-presets ,presets)
+         (reap-p ,reap)
+         (caller-buf (current-buffer)))
+     (with-current-buffer root-buf
+       (if (fboundp 'markdown-mode)
+           (unless (eq major-mode 'markdown-mode)
+             (markdown-mode))
+         (unless (eq major-mode 'text-mode)
+           (text-mode)))
+       (unless (bound-and-true-p macher-agent--persistent-context)
+         (setq-local macher-agent--persistent-context
+                     (or (macher-agent-context-from-buffer caller-buf)
+                         (macher-agent--make-context
+                          :id (format "detached-%s" (macher-agent-generate-uuid))
+                          :project-root default-directory))))
+       (when (fboundp 'gptel-mode)
+         (unless (bound-and-true-p gptel-mode)
+           (gptel-mode 1)))
+       (when (buffer-live-p caller-buf)
+         (dolist (var '(gptel-model gptel-backend gptel-temperature
+                        gptel-max-tokens gptel--known-presets gptel-directives))
+           (when (boundp var)
+             (set (make-local-variable var)
+                  (buffer-local-value var caller-buf)))))
+       (macher-agent-initialize-skills macher-agent--persistent-context)
+       (when active-presets
+         (setq-local macher-agent-presets (ensure-list active-presets))
+         (macher-agent--apply-preset macher-agent-presets))
+       (when allowed-primitives
+         (setq-local macher-agent--active-ptc-primitives allowed-primitives))
+       (let ((script-str (prin1-to-string ',(if (> (length script-body) 1)
+                                                `(progn ,@script-body)
+                                              (car script-body))))
+             (success-fn (or ,on-success (lambda (res) (message "PTC Success: %s" res))))
+             (error-fn (or ,on-error (lambda (err) (message "PTC Error: %s" err))))
+             (cleanup-fn (lambda ()
+                           (when (and reap-p (buffer-live-p root-buf))
+                             (macher-agent--reap-buffer root-buf)))))
+         (macher-agent-execute-ptc-script
+          script-str
+          macher-agent--persistent-context
+          root-buf
+          (lambda (res)
+            (unwind-protect
+                (funcall success-fn res)
+              (funcall cleanup-fn)))
+          (lambda (err)
+            (unwind-protect
+                (funcall error-fn err)
+              (funcall cleanup-fn)))
+          nil)))))
 
 (defun macher-agent-sandbox-install ()
   "Install sandbox execution capabilities and pipeline steps."
@@ -1079,6 +1172,8 @@ Side effects: Evaluates sandboxed Lisp expression."
   "Uninstall sandbox execution capabilities and pipeline steps."
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-sandbox-append-ptc-to-transmission)
   (macher-agent-unregister-pipeline-step 'preset-composition #'macher-agent-ptc--inject-tool))
+
+(macher-agent-sandbox-install)
 
 (provide 'macher-agent-sandbox)
 ;;; macher-agent-sandbox.el ends here

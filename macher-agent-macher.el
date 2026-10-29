@@ -1,24 +1,31 @@
-;;; macher-agent-macher.el --- Bridge to Macher Core  -*- lexical-binding: t; -*-
+;;; macher-agent-macher.el --- Bridge to Macher Core -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
-;; Bridge implementation for Macher Agent to interact with Macher Core.
+;; Tier 4 bridge implementation for Macher Agent VFS to interact with Macher Core.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'subr-x)
+(eval-and-compile
+  (let* ((root (file-name-directory (or load-file-name buffer-file-name default-directory)))
+         (macher-dir (expand-file-name "macher" root))
+         (gptel-dir (expand-file-name "gptel" root)))
+    (when (file-directory-p macher-dir)
+      (add-to-list 'load-path macher-dir))
+    (when (file-directory-p gptel-dir)
+      (add-to-list 'load-path gptel-dir))))
 (require 'macher)
 (require 'macher-agent-core)
 
-(defvar gptel-directives)
 (defvar macher-workspace-types-alist)
 (defvar macher-workspace-functions)
 (defvar macher--workspace)
-(defvar macher-agent-global-skills-alist)
-(defvar macher-agent-tools-registry)
+(defvar macher-agent--is-workspace)
 
-(declare-function project-root "project" (project))
+(defvar macher-agent-macher-entry-converter-function nil
+  "Function called with (ENTRY ROOT) to convert an entry into a Macher cell.")
 
 (defun macher-agent-macher-safe-workspace-hash (context)
   "Generate a safe 16-character hash strictly from the CONTEXT struct."
@@ -33,67 +40,13 @@
         (setq result (concat result (substring chars idx (1+ idx))))))
     result))
 
-(defun macher-agent-macher-workspace-hash (workspace &optional length)
-  "Generate a standard hash for a wrapped WORKSPACE list."
-  (cl-check-type workspace list)
-  (let* ((len (or length 16))
-         (str (or (when (fboundp 'macher--workspace-hash)
-                    (condition-case nil
-                        (let ((res (macher--workspace-hash workspace len)))
-                          (if (stringp res)
-                              (substring res 0 (min (length res) len))
-                            res))
-                      (error nil)))
-                  (md5 (format "%s" workspace)))))
-    (if (> len 0)
-        (substring str 0 (min (length str) len))
-      str)))
-
 (defun macher-agent-macher-workspace-name (context)
   "Extract a concise project name strictly from the CONTEXT struct."
   (cl-check-type context macher-agent-context)
-  (let ((root (or (when (fboundp 'macher-agent-context-project-root)
-                    (macher-agent-context-project-root context))
-                  (when (fboundp 'macher-agent-context-root)
-                    (macher-agent-context-root context))
-                  (when (fboundp 'macher-agent-context-workspace-root)
-                    (macher-agent-context-workspace-root context)))))
+  (let ((root (macher-agent-context-project-root context)))
     (if root
         (file-name-nondirectory (directory-file-name root))
       "workspace")))
-
-(defun macher-agent-vfs-entry-to-macher-entry (entry &optional root)
-  "Convert VFS ENTRY to a Macher content cell (rel-path . (orig . curr))."
-  (cond
-   ((and (fboundp 'macher-agent-vfs-entry-p) (macher-agent-vfs-entry-p entry))
-    (let* ((path (macher-agent-vfs-entry-path entry))
-           (orig (macher-agent-vfs-entry-orig entry))
-           (curr (macher-agent-vfs-entry-curr entry))
-           (rel-path (if (and (stringp path) root)
-                         (file-relative-name (file-truename (expand-file-name path root))
-                                             (file-name-as-directory root))
-                       path)))
-      (cons rel-path (cons orig curr))))
-   ((consp entry)
-    (let* ((path (car entry))
-           (rest (cdr entry))
-           (rel-path (if (and (stringp path) root)
-                         (file-relative-name (file-truename (expand-file-name path root))
-                                             (file-name-as-directory root))
-                       path)))
-      (cons rel-path rest)))
-   (t entry)))
-
-(defun macher-agent-vfs-modified-files (vfs)
-  "Return list of modified files in VFS."
-  (cond
-   ((and (fboundp 'macher-agent-context-p) (macher-agent-context-p vfs))
-    (macher-agent--get-context-contents vfs))
-   ((listp vfs)
-    (if (plist-member vfs :contents)
-        (plist-get vfs :contents)
-      vfs))
-   (t nil)))
 
 (defun macher-agent-macher-patch-buffer (ws-cons)
   "Return the patch buffer for upstream WS-CONS."
@@ -103,23 +56,18 @@
     (get-buffer "*macher-patch*")))
 
 (defun macher-agent-macher-build-patch (ctx prompt &optional files)
-  "Build patch buffer via upstream macher using CTX."
+  "Build patch buffer via upstream macher using CTX, PROMPT, and FILES."
   (cl-check-type ctx macher-agent-context)
-  (let* ((raw-root (or (when (fboundp 'macher-agent-context-project-root)
-                         (macher-agent-context-project-root ctx))
-                       (when (fboundp 'macher-agent-context-root)
-                         (macher-agent-context-root ctx))
-                       (when (fboundp 'macher-agent-context-workspace-root)
-                         (macher-agent-context-workspace-root ctx))))
+  (let* ((raw-root (macher-agent-context-project-root ctx))
          (canonical-root (when raw-root
                            (file-truename (expand-file-name raw-root))))
          (ws (cons 'project canonical-root))
-         (vfs-entries (if (fboundp 'macher-agent--gather-vfs-entries)
-                          (macher-agent--gather-vfs-entries ctx files)
-                        (or files (macher-agent-vfs-modified-files ctx))))
-         (mapped-contents (mapcar (lambda (entry)
-                                    (macher-agent-vfs-entry-to-macher-entry entry canonical-root))
-                                  vfs-entries))
+         (mapped-contents
+          (mapcar (lambda (entry)
+                    (if (functionp macher-agent-macher-entry-converter-function)
+                        (funcall macher-agent-macher-entry-converter-function entry canonical-root)
+                      entry))
+                  files))
          (ephemeral-ctx (when (fboundp 'macher--make-context)
                           (funcall 'macher--make-context
                                    :contents mapped-contents
@@ -131,24 +79,56 @@
                                                       (file-name-as-directory canonical-root)
                                                     default-directory)))
                            (macher--build-patch ephemeral-ctx nil)))))
-    (or patch-result
-        (macher-agent-macher-patch-buffer ws))))
+    (if (buffer-live-p patch-result)
+        patch-result
+      (macher-agent-macher-patch-buffer ws))))
 
-(defun macher-agent-macher-install ()
+(defun macher-agent-macher-validate-path (path workspace)
+  "Validate that PATH belongs to WORKSPACE."
+  (when (and (stringp path) (stringp workspace) (not (string-empty-p workspace)))
+    (let* ((canonical-ws (file-name-as-directory (file-truename workspace)))
+           (resolved (expand-file-name path canonical-ws))
+           (truename (file-truename resolved)))
+      (unless (string-prefix-p canonical-ws truename)
+        (error "SECURITY ERROR: Access denied. '%s' is outside the workspace '%s' and has not been explicitly added to the agent's scope"
+               path canonical-ws))
+      t)))
+
+(defun macher-agent-macher-run-with-proxy-context (orphaned-context ws marshalled-files prompt target-buf orig-fn callback args)
+  "Execute upstream tool ORIG-FN in TARGET-BUF using a proxy Macher context.
+Validates ORPHANED-CONTEXT, constructs a proxy with WS, MARSHALLED-FILES, and
+PROMPT, invokes ORIG-FN with CALLBACK and ARGS, and returns (RESULT . FILES)."
+  (unless (and (fboundp 'macher-context-p) (macher-context-p orphaned-context))
+    (error "Macher Agent: Tool called without an upstream context"))
+  (let* ((effective-ws (or ws
+                           (when (fboundp 'macher-context-workspace)
+                             (ignore-errors (macher-context-workspace orphaned-context)))))
+         (proxy (when (fboundp 'macher--make-context)
+                  (let ((macher-agent--persistent-context nil))
+                    (macher--make-context
+                     :workspace effective-ws
+                     :contents marshalled-files
+                     :prompt prompt)))))
+    (unless proxy
+      (error "Macher Agent: Failed to construct upstream proxy context"))
+    (let* ((res (with-current-buffer target-buf
+                  (apply orig-fn proxy callback args)))
+           (raw-after-files (if (fboundp 'macher-context-contents)
+                                (with-no-warnings (macher-context-contents proxy))
+                              marshalled-files)))
+      (cons res raw-after-files))))
+
+(defun macher-agent-macher-install (&optional get-files-fn)
   "Install Macher Core integration and workspace hooks idempotently.
-
-Registers base agent workspace handlers in `macher-workspace-types-alist',
-and registers `macher-agent-workspace-agent' in `macher-workspace-functions'.
-
-Side effects: Modifies global Macher tables and hooks."
+Optional GET-FILES-FN provides the `:get-files' workspace callback."
   (let ((register-fn
          (lambda ()
            (when (boundp 'macher-workspace-types-alist)
              (let ((merged (copy-sequence (alist-get 'agent macher-workspace-types-alist))))
                (setq merged (plist-put merged :get-root 'macher-agent-workspace-project-root))
                (setq merged (plist-put merged :get-name 'macher-agent--get-name))
-               (unless (plist-get merged :get-files)
-                 (setq merged (plist-put merged :get-files 'macher-agent--collect-raw-files)))
+               (when (and get-files-fn (not (plist-get merged :get-files)))
+                 (setq merged (plist-put merged :get-files get-files-fn)))
                (setf (alist-get 'agent macher-workspace-types-alist) merged)))
            (when (boundp 'macher-workspace-functions)
              (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent)))))
@@ -157,18 +137,11 @@ Side effects: Modifies global Macher tables and hooks."
       (funcall register-fn))))
 
 (defun macher-agent--get-active-workspace ()
-  "Retrieve the globally active workspace.
-
-Return the workspace structure, or nil if unbound."
+  "Retrieve globally active workspace."
   (bound-and-true-p macher--workspace))
 
 (defun macher-agent-trigger-patch (&optional ctx)
-  "Retrieve the underlying patch buffer for CTX.
-
-Resolve the patch buffer associated with the workspace of CTX,
-falling back to the globally active workspace if CTX is nil.
-
-Return the live patch buffer, or nil."
+  "Retrieve underlying patch buffer for CTX."
   (let* ((ws (if ctx
                  (macher-agent-context-workspace ctx)
                (macher-agent--get-active-workspace)))
@@ -177,276 +150,17 @@ Return the live patch buffer, or nil."
                          (macher-patch-buffer ws))))
     patch-buf))
 
-(defun macher-agent--resolve-context-lazy-init ()
-  "Attempt lazy initialisation of context for current directory.
-
-Return non-nil if initialisation succeeded, or signals an error if not allowed.
-Side effects: May initialise workspace state for current directory."
-  (unless (bound-and-true-p macher-agent--allow-lazy-init)
-    (error "Macher-Agent: Not in a recognised project workspace; running standard gptel"))
-  (save-excursion
-    (when-let* ((current-root (macher-agent-root default-directory)))
-      (macher-agent--init-workspace-state current-root)
-      (macher-agent-context-from-buffer (current-buffer)))))
-
-(defun macher-agent--register-active-workspace-root (root context)
-  "Map active ROOT string to CONTEXT struct in the global registry."
-  (cl-check-type root string)
-  (cl-check-type context macher-agent-context)
-  (when (and (boundp 'macher-agent-active-workspaces) (hash-table-p macher-agent-active-workspaces))
-    (let ((expanded (expand-file-name root)))
-      (puthash expanded context macher-agent-active-workspaces)
-      (puthash (file-name-as-directory expanded) context macher-agent-active-workspaces)
-      (puthash (directory-file-name expanded) context macher-agent-active-workspaces)))
-  context)
-
-(defmacro macher-agent--with-unresolved-ctx-pipe (state &rest body)
-  "Execute BODY unless STATE is already resolved."
-  (declare (indent 1) (debug t))
-  (let ((st-sym (make-symbol "state-val")))
-    `(let ((,st-sym ,state))
-       (if (and (macher-agent--plist-p ,st-sym) (plist-get ,st-sym :resolved))
-           ,st-sym
-         ,@body))))
-
-(defun macher-agent-ctx-pipe--explicit (state)
-  "Extract explicit context from STATE plist."
-  (cl-check-type state list)
-  (macher-agent--with-unresolved-ctx-pipe state
-                                          (let ((input (plist-get state :input)))
-                                            (if (macher-agent-valid-context-p input)
-                                                (plist-put state :resolved input)
-                                              state))))
-
-(defun macher-agent-ctx-pipe--buffer (state)
-  "Extract buffer context from STATE plist."
-  (cl-check-type state list)
-  (macher-agent--with-unresolved-ctx-pipe state
-                                          (let ((input (plist-get state :input)))
-                                            (if (and (bufferp input) (buffer-live-p input))
-                                                (let ((ctx (buffer-local-value 'macher-agent--persistent-context input)))
-                                                  (if (macher-agent-valid-context-p ctx)
-                                                      (plist-put state :resolved ctx)
-                                                    state))
-                                              state))))
-
-(defun macher-agent-ctx-pipe--lazy-init (state)
-  "Context pipeline step: Resolve context via lazy initialisation in STATE.
-
-If `:resolved' in STATE is nil, attempt lazy workspace initialisation.
-
-STATE is the context resolution state plist (:input ... :resolved ...).
-
-Return the updated STATE plist.
-Side effects: May initialise workspace state for current directory."
-  (macher-agent--with-unresolved-ctx-pipe state
-                                          (if-let* ((ctx (condition-case nil
-                                                             (macher-agent--resolve-context-lazy-init)
-                                                           (error nil)))
-                                                    ((macher-agent-valid-context-p ctx)))
-                                              (let ((target-buf (if (bufferp (plist-get state :input))
-                                                                    (plist-get state :input)
-                                                                  (current-buffer))))
-                                                (when (buffer-live-p target-buf)
-                                                  (with-current-buffer target-buf
-                                                    (unless (bound-and-true-p macher-agent--persistent-context)
-                                                      (setq-local macher-agent--persistent-context ctx))))
-                                                (plist-put state :resolved ctx))
-                                            state)))
-
-(defun macher-agent-context-resolution-install ()
-  "Install context resolution pipeline steps."
-  (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--explicit 10)
-  (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--buffer 15)
-  (macher-agent-register-pipeline-step 'context-resolution #'macher-agent-ctx-pipe--lazy-init 80))
-
-(cl-defun make-macher-agent-workspace (&key project-root &allow-other-keys)
-  "Construct a standard workspace cons cell `(project . PROJECT-ROOT)`.
-
-PROJECT-ROOT is the root directory path.
-
-Return a workspace cons cell."
-  (cons 'project (and project-root (expand-file-name project-root))))
-
-(defun copy-macher-agent-workspace (ws)
-  "Create a copy of workspace WS.
-
-WS is the workspace structure to copy.
-
-Return the copied workspace."
-  (if (consp ws) (copy-tree ws) ws))
-
-(defun macher-agent-context-lookup (ws-or-id)
-  "Retrieve active context mapped to WS-OR-ID string."
-  (cl-check-type ws-or-id string)
-  (or (macher-agent-context-from-buffer ws-or-id)
-      (when (and (boundp 'macher-agent-active-workspaces)
-                 (hash-table-p macher-agent-active-workspaces))
-        (let ((exp (expand-file-name ws-or-id))
-              (true-exp (file-truename (expand-file-name ws-or-id))))
-          (or (gethash exp macher-agent-active-workspaces)
-              (gethash (file-name-as-directory exp) macher-agent-active-workspaces)
-              (gethash (directory-file-name exp) macher-agent-active-workspaces)
-              (gethash true-exp macher-agent-active-workspaces)
-              (gethash (file-name-as-directory true-exp) macher-agent-active-workspaces)
-              (gethash (directory-file-name true-exp) macher-agent-active-workspaces))))))
-
-(defun macher-agent--workspace-get-hash-table (ctx table-key)
-  "Extract hash table explicitly from CTX struct."
-  (cl-check-type ctx macher-agent-context)
-  (let ((plugins (macher-agent-context-plugins ctx)))
-    (or (when (macher-agent--plist-p plugins)
-          (plist-get plugins table-key))
-        (let ((ht (make-hash-table :test 'equal)))
-          (setf (macher-agent-context-plugins ctx)
-                (plist-put (copy-sequence plugins) table-key ht))
-          ht))))
-
-(defun macher-agent-workspace-vfs-buffers (ctx)
-  "Retrieve the VFS buffers hash-table for CTX."
-  (cl-check-type ctx macher-agent-context)
-  (macher-agent--workspace-get-hash-table ctx :vfs-buffers))
-
-(defun macher-agent-workspace-mtime-tracker (ctx)
-  "Retrieve the mtime tracker hash-table for CTX."
-  (cl-check-type ctx macher-agent-context)
-  (macher-agent--workspace-get-hash-table ctx :mtime-tracker))
-
-(defun macher-agent-workspace-tools-registry (ctx)
-  "Extract combined tools registry for CTX.
-Overlays workspace tools on global tools."
-  (cl-check-type ctx macher-agent-context)
-  (let ((local-table (or (macher-agent-context-tools ctx)
-                         (let ((plugins (macher-agent-context-plugins ctx)))
-                           (when (macher-agent--plist-p plugins)
-                             (plist-get plugins :tools)))))
-        (global-table macher-agent-tools-registry)
-        (merged-table (make-hash-table :test 'equal)))
-    (when (hash-table-p global-table)
-      (maphash (lambda (k v) (puthash k v merged-table)) global-table))
-    (when (hash-table-p local-table)
-      (maphash (lambda (k v) (puthash k v merged-table)) local-table))
-    merged-table))
-
-(defun macher-agent-workspace-skills-alist (ctx)
-  "Extract skills alist for CTX.
-Merges local workspace skills over global skills."
-  (cl-check-type ctx macher-agent-context)
-  (let ((local-skills (or (macher-agent-context-skills ctx)
-                          (let ((plugins (macher-agent-context-plugins ctx)))
-                            (when (macher-agent--plist-p plugins)
-                              (plist-get plugins :skills)))))
-        (global-skills (bound-and-true-p macher-agent-global-skills-alist)))
-    (cl-remove-duplicates (append local-skills global-skills)
-                          :key #'car :test #'eq)))
-
 (defun macher-agent-workspace-agent ()
-  "Identify if the current buffer is a workspace and return the workspace.
-Return the workspace struct, or nil."
+  "Identify if current buffer is a workspace and return workspace."
   (when (bound-and-true-p macher-agent--is-workspace)
     (bound-and-true-p macher--workspace)))
 
-(defun macher-agent-workspace-active-subagents (ctx)
-  "Extract active subagents list directly via CTX struct."
-  (cl-check-type ctx macher-agent-context)
-  (or (macher-agent-context-subagents ctx)
-      (let ((plugins (macher-agent-context-plugins ctx)))
-        (when (macher-agent--plist-p plugins)
-          (plist-get plugins :active-subagents)))))
-
-(defun macher-agent--set-workspace-skills-alist (ctx alist)
-  "Update skills ALIST mapped to CTX struct."
-  (cl-check-type alist list)
-  (if ctx
-      (progn
-        (cl-check-type ctx macher-agent-context)
-        (setf (macher-agent-context-skills ctx) alist))
-    (setq macher-agent-global-skills-alist alist))
-  alist)
-
-(gv-define-setter macher-agent-workspace-skills-alist (val ws-or-ctx)
-  `(macher-agent--set-workspace-skills-alist ,ws-or-ctx ,val))
-
-(defun macher-agent--set-workspace-tools-registry (ctx registry)
-  "Update tools REGISTRY mapped to CTX struct."
-  (cl-check-type registry hash-table)
-  (if ctx
-      (progn
-        (cl-check-type ctx macher-agent-context)
-        (setf (macher-agent-context-tools ctx) registry))
-    (setq macher-agent-tools-registry registry))
-  registry)
-
-(gv-define-setter macher-agent-workspace-tools-registry (val ws-or-ctx)
-  `(macher-agent--set-workspace-tools-registry ,ws-or-ctx ,val))
-
-(defun macher-agent--set-workspace-active-subagents (ctx subagents)
-  "Update SUBAGENTS list mapped to CTX struct."
-  (cl-check-type subagents list)
-  (when ctx
-    (cl-check-type ctx macher-agent-context)
-    (setf (macher-agent-context-subagents ctx) subagents))
-  subagents)
-
-(gv-define-setter macher-agent-workspace-active-subagents (val ws-or-ctx)
-  `(macher-agent--set-workspace-active-subagents ,ws-or-ctx ,val))
-
-(defun macher-agent--copy-context-hash-tables (data)
-  "Copy hash tables in DATA plist for context cloning.
-
-DATA is the property list containing context data.
-
-Return a copied property list with cloned hash-tables."
-  (when data
-    (let ((res (copy-sequence data)))
-      (when-let* ((vfs-ht (plist-get res :vfs-buffers)))
-        (setq res (plist-put res :vfs-buffers (copy-hash-table vfs-ht))))
-      (when-let* ((mtime-ht (plist-get res :mtime-tracker)))
-        (setq res (plist-put res :mtime-tracker (copy-hash-table mtime-ht))))
-      res)))
-
-(defun macher-agent--clone-context (ctx)
-  "Deep clone CTX struct, bypassing polymorphic buffer/string checks."
-  (cl-check-type ctx macher-agent-context)
-  (let* ((new-ctx (macher-agent--copy-context ctx))
-         (orig-plugins (macher-agent-context-plugins ctx))
-         (new-plugins (macher-agent--copy-context-hash-tables orig-plugins)))
-    (setf (macher-agent-context-plugins new-ctx) (copy-tree new-plugins))
-    (when-let* ((tools (macher-agent-context-tools ctx)))
-      (setf (macher-agent-context-tools new-ctx)
-            (if (hash-table-p tools) (copy-hash-table tools) (copy-tree tools))))
-    (when-let* ((skills (macher-agent-context-skills ctx)))
-      (setf (macher-agent-context-skills new-ctx) (copy-tree skills)))
-    (when-let* ((subs (macher-agent-context-subagents ctx)))
-      (setf (macher-agent-context-subagents new-ctx) (copy-tree subs)))
-    new-ctx))
-
-(defun macher-agent--inject-context-state (context &optional directives)
-  "Inject the active CONTEXT and optional DIRECTIVES into the buffer.
-
-CONTEXT is the active context structure.
-DIRECTIVES is the optional directives alist.
-
-Return nil.
-Side effects: Sets buffer-local variables
-`macher-agent--persistent-context` and `gptel-directives`."
-  (when context
-    (setq-local macher-agent--persistent-context context)
-    (when directives
-      (if (boundp 'gptel-directives)
-          (setq gptel-directives directives)
-        (setq-local gptel-directives directives)))))
-
 (defun macher-agent-apply-patch ()
-  "Apply the active patch from `diff-mode' context back to physical files.
-
-Return nil.
-Side effects: Invokes external process (`git` or `patch`) to apply patch."
+  "Apply active patch from `diff-mode' context back to physical files."
   (interactive)
   (unless (derived-mode-p 'diff-mode) (user-error "Not in a patch/diff buffer"))
   (let* ((patch-content (buffer-substring-no-properties (point-min) (point-max)))
-         (ctx (or (macher-agent-context-from-buffer (current-buffer))
-                  (bound-and-true-p macher-agent--persistent-context)))
+         (ctx (macher-agent-resolve-context (current-buffer)))
          (root (if ctx
                    (macher-agent-context-project-root ctx)
                  (or (locate-dominating-file default-directory ".git") default-directory)))

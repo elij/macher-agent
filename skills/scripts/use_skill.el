@@ -42,6 +42,10 @@
                  (when (local-variable-p 'macher-agent--cached-presets target-buf)
                    (setq-local macher-agent-presets orig))
                  (macher-agent-clear-cached-presets target-buf)
+                 (when (bound-and-true-p macher-agent--cached-boot-directive-set)
+                   (setq-local macher-agent--boot-directive macher-agent--cached-boot-directive)
+                   (setq-local macher-agent--cached-boot-directive nil)
+                   (setq-local macher-agent--cached-boot-directive-set nil))
                  (if orig
                      (format "Restored original presets: %S" orig)
                    "Restored original presets."))
@@ -57,7 +61,16 @@
                  (error "ERROR: skill_name must be provided to activate a skill, or set done to true"))
                (unless (local-variable-p 'macher-agent--cached-presets target-buf)
                  (setq-local macher-agent--cached-presets (copy-sequence macher-agent-presets)))
+               (unless (bound-and-true-p macher-agent--cached-boot-directive-set)
+                 (setq-local macher-agent--cached-boot-directive (bound-and-true-p macher-agent--boot-directive))
+                 (setq-local macher-agent--cached-boot-directive-set t))
                (setq-local macher-agent-presets raw-skill)
+               (let* ((skill-sym (car raw-skill))
+                      (spec (when (fboundp 'gptel-get-preset)
+                              (gptel-get-preset skill-sym)))
+                      (bd (and spec (plist-get spec :boot-directive))))
+                 (when bd
+                   (setq-local macher-agent--boot-directive bd)))
                (format "Activated skill '%s'. Presets updated." (car raw-skill))))))))
 
 (put 'use_skill 'ptc-function (get 'macher-agent-use-skill-tool 'ptc-function))
