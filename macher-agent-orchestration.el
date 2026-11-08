@@ -46,14 +46,6 @@
         gen)
     raw-task-id))
 
-(defun macher-agent--resolve-buffer-name (buffer-or-name)
-  "Resolve BUFFER-OR-NAME into a canonical buffer name string."
-  (cond
-   ((stringp buffer-or-name) buffer-or-name)
-   ((bufferp buffer-or-name) (buffer-name buffer-or-name))
-   ((symbolp buffer-or-name) (symbol-name buffer-or-name))
-   (t (signal 'wrong-type-argument (list '(or string buffer symbol) buffer-or-name)))))
-
 (defun macher-agent-a2a--extract-parent-buffer (shared)
   "Extract parent buffer from SHARED state structure."
   (when shared (plist-get shared :parent-buffer)))

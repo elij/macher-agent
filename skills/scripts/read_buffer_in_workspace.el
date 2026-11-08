@@ -16,35 +16,31 @@
 
 (put 'macher-agent-read-buffer-in-workspace-tool 'ptc-function
      (lambda (buffer-name &optional offset limit show-line-numbers context)
-       (let* ((actual-name (macher-agent--resolve-buffer-name buffer-name))
+       (let* ((ctx (or (macher-agent-resolve-context context)
+                       (macher-agent-resolve-context (current-buffer))
+                       (macher-agent-resolve-context nil)))
+              (actual-name (macher-agent--resolve-buffer-name buffer-name))
               (parsed-offset (if (numberp offset) (round offset) 1))
               (parsed-limit (if (numberp limit) (round limit) -1))
               (show-nums (and show-line-numbers (not (eq show-line-numbers :json-false)))))
-         (when (macher-agent-valid-context-p context)
-           (macher-agent--ensure-access context actual-name))
-         (let* ((norm-key (if (macher-agent-valid-context-p context)
-                              (macher-agent--normalize-path-key actual-name context)
+         (when (macher-agent-valid-context-p ctx)
+           (macher-agent--ensure-access ctx actual-name))
+         (let* ((norm-key (if (macher-agent-valid-context-p ctx)
+                              (macher-agent--normalize-path-key actual-name ctx)
                             actual-name))
-                (contents (when (macher-agent-valid-context-p context)
-                            (macher-agent--get-context-contents context)))
-                (entry (or (cl-find norm-key contents :key #'macher-agent-vfs-entry-path :test #'equal)
-                           (cl-find actual-name contents :key #'macher-agent-vfs-entry-path :test #'equal)))
+                (vfs-ht (when (macher-agent-valid-context-p ctx)
+                          (macher-agent-workspace-vfs-buffers ctx)))
+                (raw (and (hash-table-p vfs-ht)
+                          (or (gethash norm-key vfs-ht) (gethash actual-name vfs-ht))))
+                (entry (when (macher-agent-vfs-entry-p raw) raw))
                 (content
-                 (if entry
-                     (progn
-                       (when (macher-agent-valid-context-p context)
-                         (let ((mtime-ht (ignore-errors (macher-agent-workspace-mtime-tracker context)))
-                               (ctx-root (macher-agent-context-project-root context)))
-                           (macher-agent--sync-context-entry entry ctx-root mtime-ht)))
-                       (macher-agent-vfs-entry-curr entry))
-                   (let ((raw-str (or (macher-agent--read-content-from-disk-or-buffer actual-name) "")))
-                     (when (macher-agent-valid-context-p context)
-                       (let ((old-contents (macher-agent--get-context-contents context)))
-                         (unless (or (cl-find norm-key old-contents :key #'macher-agent-vfs-entry-path :test #'equal)
-                                     (cl-find actual-name old-contents :key #'macher-agent-vfs-entry-path :test #'equal))
-                           (macher-agent--set-context-contents
-                            context
-                            (cons (macher-agent-vfs-make-entry norm-key raw-str raw-str)
-                                  old-contents)))))
-                     raw-str))))
+                 (cond
+                  (entry
+                   (when (macher-agent-valid-context-p ctx)
+                     (let ((ctx-root (or (macher-agent-context-project-root ctx) default-directory)))
+                       (macher-agent--sync-context-entry entry ctx-root ctx)))
+                   (macher-agent-vfs-entry-curr entry))
+                  ((stringp raw) raw)
+                  (t
+                   (or (macher-agent--read-content-from-disk-or-buffer actual-name) "")))))
            (macher-agent--read-string parsed-offset parsed-limit content show-nums)))))

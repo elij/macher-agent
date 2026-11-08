@@ -189,6 +189,14 @@
   "Ensure directory string PATH ends with a trailing slash."
   (file-name-as-directory path))
 
+(defun macher-agent--resolve-buffer-name (buffer-or-name)
+  "Resolve BUFFER-OR-NAME into a canonical buffer name string."
+  (cond
+   ((stringp buffer-or-name) buffer-or-name)
+   ((bufferp buffer-or-name) (buffer-name buffer-or-name))
+   ((symbolp buffer-or-name) (symbol-name buffer-or-name))
+   (t (signal 'wrong-type-argument (list '(or string buffer symbol) buffer-or-name)))))
+
 (defun macher-agent--truncate-string (output &optional max-chars)
   "Truncate OUTPUT when it exceeds MAX-CHARS, preserving head and tail halves."
   (let* ((limit (or max-chars macher-agent-max-tool-output-chars 30000))
