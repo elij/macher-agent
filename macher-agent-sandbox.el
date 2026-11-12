@@ -219,7 +219,7 @@
     (cons var val)))
 
 (iter-defun macher-agent-sandbox--bind-iter (bindings env is-star)
-  "Process BINDINGS to extend lexical environment ENV."
+  "Process BINDINGS to extend ENV sequentially when IS-STAR is non-nil."
   (let ((new-env env))
     (dolist (binding bindings new-env)
       (let* ((eval-env (if is-star new-env env))
@@ -228,14 +228,14 @@
         (setq new-env (cons pair new-env))))))
 
 (iter-defun macher-agent-sandbox--eval-and-or-iter (args env is-or)
-  "Evaluate boolean logic forms ARGS in ENV."
+  "Evaluate boolean ARGS in ENV, treating as `or' when IS-OR is non-nil."
   (let ((result (not is-or)))
     (while (and args (if is-or (not result) result))
       (setq result (iter-yield-from (macher-agent-sandbox--eval-iter (pop args) env))))
     result))
 
 (iter-defun macher-agent-sandbox--eval-let-iter (args env is-star)
-  "Evaluate let or let* form ARGS in ENV."
+  "Evaluate let or let* ARGS in ENV, sequential when IS-STAR is non-nil."
   (let ((new-env (iter-yield-from (macher-agent-sandbox--bind-iter (car args) env is-star)))
         (result nil))
     (dolist (form (cdr args) result)
@@ -481,8 +481,16 @@
    ((consp expression)
     (iter-yield-from (macher-agent-sandbox--eval-compound-iter expression environment)))))
 
+(defun macher-agent--resolve-ptc-execution-tool (&optional ctx)
+  "Resolve the `ptc_execution' tool struct using optional CTX."
+  (or (when (boundp 'macher-agent-ptc-execution-tool)
+        (symbol-value 'macher-agent-ptc-execution-tool))
+      (ignore-errors (macher-agent-resolve-tool "ptc_execution" nil nil ctx))
+      (when (fboundp 'gptel-get-tool)
+        (ignore-errors (gptel-get-tool "ptc_execution")))))
+
 (defun macher-agent-ptc--inject-tool (state)
-  "Extract PTC primitives from composed presets and inject `ptc_execution' into STATE."
+  "Extract PTC primitives from STATE presets and inject `ptc_execution'."
   (cl-check-type state list)
   (dolist (item (plist-get state :resolved-items))
     (pcase item
@@ -497,20 +505,12 @@
                                   (cl-delete-duplicates (append current-ptc ptc-list)
                                                         :test #'equal))))))))
   (let* ((state-prims (plist-get state :ptc-primitives))
-         (active-prims (or state-prims (bound-and-true-p macher-agent--active-ptc-primitives))))
-    (when (and state-prims (bound-and-true-p macher-agent--persistent-context)
-               (macher-agent-valid-context-p macher-agent--persistent-context))
-      (let ((sb (copy-sequence (macher-agent-sandbox-get-state macher-agent--persistent-context))))
-        (macher-agent-sandbox-set-state macher-agent--persistent-context
-                                        (plist-put sb :ptc-primitives state-prims))))
+         (active-prims (if (plist-member state :ptc-primitives)
+                           state-prims
+                         (bound-and-true-p macher-agent--active-ptc-primitives))))
     (when active-prims
       (let* ((tools (plist-get state :tools))
-             (ptc-tool (or (when (boundp 'macher-agent-ptc-execution-tool)
-                             (symbol-value 'macher-agent-ptc-execution-tool))
-                           (ignore-errors (macher-agent-resolve-tool "ptc_execution" nil))
-                           (when (fboundp 'gptel-get-tool)
-                             (ignore-errors (gptel-get-tool "ptc_execution")))
-                           'ptc_execution))
+             (ptc-tool (or (macher-agent--resolve-ptc-execution-tool) 'ptc_execution))
              (already-present (cl-some (lambda (tl)
                                          (let ((name (macher-agent-canonical-tool-name tl)))
                                            (and name (member name '("ptc_execution" "ptc-execution")))))
@@ -522,7 +522,8 @@
 ;;; Programmatic Tool Calling (PTC) Prompt Generation
 
 (defun macher-agent--build-tool-arg-type-spec (arg lisp-name lisp-arg-name)
-  "Build type spec and optional deftype string for ARG."
+  "Build type spec and deftype string for ARG.
+Uses LISP-NAME and LISP-ARG-NAME to name the generated type."
   (let* ((arg-type (plist-get arg :type))
          (items (plist-get arg :items))
          (props (when items (plist-get items :properties))))
@@ -558,7 +559,9 @@
             nil)))))
 
 (defun macher-agent--format-tool-defun (name lisp-name desc arg-names arg-types return-type dummy-return deftypes)
-  "Format defun explicitly with strict positional arguments."
+  "Format tool defun string for NAME as LISP-NAME.
+Includes DESC, ARG-NAMES, ARG-TYPES, RETURN-TYPE, DUMMY-RETURN, and
+optional DEFTYPES."
   (cl-check-type name string)
   (cl-check-type lisp-name symbol)
   (cl-check-type desc (or string null))
@@ -640,7 +643,8 @@
            tools))
 
 (defun macher-agent--inject-ptc-prompt (existing-prompt &optional active-primitives available-tools)
-  "Append Programmatic Tool Calling instructions to EXISTING-PROMPT."
+  "Append Programmatic Tool Calling instructions to EXISTING-PROMPT.
+Uses ACTIVE-PRIMITIVES and AVAILABLE-TOOLS when non-nil."
   (let* ((active (or active-primitives (bound-and-true-p macher-agent--active-ptc-primitives)))
          (tools (or available-tools (bound-and-true-p gptel-tools)))
          (matching-tools (macher-agent--filter-ptc-matching-tools tools active)))
@@ -693,19 +697,29 @@
         t))))
 
 (defun macher-agent--display-ptc-tool-execution (target-buf tool-name args &optional context)
-  "Update tool execution UI on live TARGET-BUF for TOOL-NAME."
+  "Update tool execution UI on live TARGET-BUF for TOOL-NAME.
+Runs pre-tool hooks with ARGS and optional CONTEXT."
   (cl-check-type target-buf buffer)
   (let* ((target-lisp-name (if (symbolp tool-name) (symbol-name tool-name) (format "%s" tool-name)))
          (original-name-str (replace-regexp-in-string "-" "_" target-lisp-name))
          (hyphen-name (replace-regexp-in-string "_" "-" target-lisp-name))
+         (ctx (or (and (macher-agent-valid-context-p context) context)
+                  (macher-agent-resolve-context target-buf)))
          (tool-var (intern-soft (format "macher-agent-%s-tool" hyphen-name)))
-         (resolved-tool (or (when (and tool-var (boundp tool-var) (macher-tool-valid-p (symbol-value tool-var)))
-                              (symbol-value tool-var))
-                            (let ((r1 (macher-agent-resolve-tool original-name-str nil nil context)))
-                              (if (macher-tool-valid-p r1)
-                                  r1
-                                (let ((r2 (macher-agent-resolve-tool hyphen-name nil nil context)))
-                                  (when (macher-tool-valid-p r2) r2))))))
+         (resolved-tool (or (let ((r1 (macher-agent-resolve-tool original-name-str nil nil ctx)))
+                              (when (macher-tool-valid-p r1) r1))
+                            (let ((r2 (macher-agent-resolve-tool hyphen-name nil nil ctx)))
+                              (when (macher-tool-valid-p r2) r2))
+                            (when (buffer-live-p target-buf)
+                              (cl-find-if
+                               (lambda (tl)
+                                 (and (macher-tool-valid-p tl)
+                                      (member (gptel-tool-name tl)
+                                              (list original-name-str hyphen-name target-lisp-name))))
+                               (buffer-local-value 'gptel-tools target-buf)))
+                            (when (and tool-var (boundp tool-var)
+                                       (macher-tool-valid-p (symbol-value tool-var)))
+                              (symbol-value tool-var))))
          (block-reason nil))
     (when (bound-and-true-p gptel-pre-tool-call-functions)
       (run-hook-wrapped
@@ -725,7 +739,8 @@
       (cons original-name-str resolved-tool))))
 
 (defun macher-agent--format-ptc-result-block (truncated-call call-str str-res)
-  "Format PTC result block string for display in buffer."
+  "Format PTC result block for display in buffer.
+Includes TRUNCATED-CALL header, CALL-STR, and STR-RES output."
   (if (derived-mode-p 'org-mode)
       (format "\n#+begin_tool %s\n%s\n\n%s\n#+end_tool\n"
               truncated-call call-str str-res)
@@ -741,7 +756,7 @@
         (gptel-markdown-cycle-block)))))
 
 (defun macher-agent--insert-ptc-tool-result (target-buf call-str res-data original-name-str)
-  "Insert RES-DATA string into TARGET-BUF."
+  "Insert RES-DATA for CALL-STR and ORIGINAL-NAME-STR into TARGET-BUF."
   (cl-check-type res-data string)
   (when (bound-and-true-p gptel-post-tool-call-functions)
     (run-hook-wrapped
@@ -763,7 +778,7 @@
           (macher-agent--cycle-ptc-result-block))))))
 
 (defun macher-agent-sandbox--coerce-arg-for-spec (val arg-spec)
-  "Coerce VAL to a vector when ARG-SPEC declares `:type \"array\"', matching `gptel'."
+  "Coerce VAL to a vector when ARG-SPEC declares `:type \"array\"'."
   (let ((arg-type (plist-get arg-spec :type)))
     (if (and (member arg-type '(array "array"))
              (listp val)
@@ -772,7 +787,7 @@
       val)))
 
 (defun macher-agent-sandbox--resolve-positional-args (resolved-tool user-args)
-  "Convert USER-ARGS into positional arguments ordered and typed by RESOLVED-TOOL `:args'."
+  "Convert USER-ARGS into positional arguments using RESOLVED-TOOL `:args'."
   (let ((arg-specs (gptel-tool-args resolved-tool)))
     (if (and (consp user-args) (keywordp (car user-args)))
         (let ((mapped
@@ -793,7 +808,10 @@
                finally return (append coerced (nthcdr (length coerced) user-args))))))
 
 (defun macher-agent--dispatch-ptc-primitive (context target-buf tool-lisp-sym resolved-tool user-args ptc-callback &optional on-error stop-iter-fn)
-  "Dispatch PTC primitive returning raw Elisp types via `ptc-function' or `gptel-tool'."
+  "Dispatch PTC primitive TOOL-LISP-SYM in CONTEXT and TARGET-BUF.
+Calls RESOLVED-TOOL with USER-ARGS via `ptc-function' or `gptel-tool',
+passing the result to PTC-CALLBACK, or reporting errors via ON-ERROR and
+STOP-ITER-FN."
   (cl-check-type context macher-agent-context)
   (cl-check-type target-buf buffer)
   (cl-check-type tool-lisp-sym symbol)
@@ -803,13 +821,18 @@
          (under-name (replace-regexp-in-string "-" "_" clean-name))
          (tool-var-hyphen (intern-soft (format "macher-agent-%s-tool" hyphen-name)))
          (tool-var-under (intern-soft (format "macher-agent-%s-tool" under-name)))
-         (ptc-fn (or (get tool-lisp-sym 'ptc-function)
-                     (get tool-lisp-sym 'command-fn)
-                     (when tool-var-hyphen (get tool-var-hyphen 'ptc-function))
-                     (when tool-var-under (get tool-var-under 'ptc-function))
-                     (get (intern-soft clean-name) 'ptc-function)
-                     (when (intern-soft hyphen-name) (get (intern-soft hyphen-name) 'ptc-function))
-                     (when (intern-soft under-name) (get (intern-soft under-name) 'ptc-function))))
+         (ws-override-entry (and (boundp 'macher-agent--workspace-tool-overrides)
+                                 (hash-table-p macher-agent--workspace-tool-overrides)
+                                 (gethash resolved-tool macher-agent--workspace-tool-overrides)))
+         (ptc-fn (if ws-override-entry
+                     (when (functionp ws-override-entry) ws-override-entry)
+                   (or (get tool-lisp-sym 'ptc-function)
+                       (get tool-lisp-sym 'command-fn)
+                       (when tool-var-hyphen (get tool-var-hyphen 'ptc-function))
+                       (when tool-var-under (get tool-var-under 'ptc-function))
+                       (get (intern-soft clean-name) 'ptc-function)
+                       (when (intern-soft hyphen-name) (get (intern-soft hyphen-name) 'ptc-function))
+                       (when (intern-soft under-name) (get (intern-soft under-name) 'ptc-function)))))
          (pos-args (macher-agent-sandbox--resolve-positional-args resolved-tool user-args))
          (run-in-target
           (lambda (fn)
@@ -872,7 +895,9 @@
                        :error (format "ERROR: Tool '%s' is not accessible in this context or is no longer available. Please select another tool or approach." clean-name))))))))
 
 (defun macher-agent--ptc-handle-yielded-value (yielded-val context target-buf ptc-callback &optional on-error stop-iter-fn)
-  "Process structurally validated YIELDED-VAL tool call."
+  "Dispatch YIELDED-VAL tool call in CONTEXT and TARGET-BUF.
+Resumes via PTC-CALLBACK or reports failures to ON-ERROR and
+STOP-ITER-FN."
   (cl-check-type context macher-agent-context)
   (cl-check-type target-buf buffer)
   (if (or (macher-agent-tool-call-p yielded-val) (listp yielded-val))
@@ -904,14 +929,18 @@
       (when (functionp on-error)
         (funcall on-error (list :status 'error :error reason))))))
 
-(defun macher-agent--ptc-resume-step (iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn input)
-  "Advance PTC ITERATOR by one step with INPUT, keeping `macher-agent--active-ptc-execution' bound."
-  (let ((macher-agent--active-ptc-execution t))
+(defun macher-agent--ptc-resume-step (iterator resolved-ctx resolved-buf active-ptc-prims on-success on-error stop-iter-fn input)
+  "Advance PTC ITERATOR by one step with INPUT and ACTIVE-PTC-PRIMS.
+Runs inside RESOLVED-BUF with RESOLVED-CTX, invoking ON-SUCCESS,
+ON-ERROR, or STOP-ITER-FN as appropriate."
+  (let ((macher-agent--active-ptc-execution t)
+        (macher-agent--active-ptc-primitives active-ptc-prims))
     (condition-case iter-err
         (let ((step (with-current-buffer resolved-buf (iter-next iterator input)))
               (resume-cb (lambda (next-input)
                            (macher-agent--ptc-resume-step
-                            iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn next-input))))
+                            iterator resolved-ctx resolved-buf active-ptc-prims
+                            on-success on-error stop-iter-fn next-input))))
           (if (macher-agent-tool-call-p step)
               (macher-agent--ptc-handle-yielded-value
                step resolved-ctx resolved-buf resume-cb on-error stop-iter-fn)
@@ -929,12 +958,17 @@
                (funcall on-error (list :status 'error :error (error-message-string iter-err))))
            (funcall on-error (list :status 'error :error (error-message-string iter-err)))))))))
 
-(defun macher-agent--ptc-resume-loop-start (iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn)
-  "Start the PTC iterator execution loop."
-  (macher-agent--ptc-resume-step iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn nil))
+(defun macher-agent--ptc-resume-loop-start (iterator resolved-ctx resolved-buf active-ptc-prims on-success on-error stop-iter-fn)
+  "Start PTC execution loop for ITERATOR with ACTIVE-PTC-PRIMS.
+Evaluates inside RESOLVED-BUF with RESOLVED-CTX, routing outcomes to
+ON-SUCCESS, ON-ERROR, and STOP-ITER-FN."
+  (macher-agent--ptc-resume-step
+   iterator resolved-ctx resolved-buf active-ptc-prims
+   on-success on-error stop-iter-fn nil))
 
 (defun macher-agent-execute-ptc-script (script context target-buf on-success on-error &optional extra-operations)
-  "Execute Programmatic Tool Calling SCRIPT using CONTEXT in TARGET-BUF."
+  "Execute PTC SCRIPT using CONTEXT in TARGET-BUF.
+Invokes ON-SUCCESS or ON-ERROR, optionally allowing EXTRA-OPERATIONS."
   (cl-check-type script string)
   (cl-check-type target-buf (or buffer string null))
   (cl-check-type on-success (or function null))
@@ -969,7 +1003,6 @@
         (progn
           (with-current-buffer resolved-buf
             (setq-local macher-agent--persistent-context resolved-ctx)
-            (setq-local macher-agent--active-ptc-primitives active-ptc-prims)
             (setq macher-agent-sandbox--globals (make-hash-table :test 'eq)
                   macher-agent-sandbox--primitives (make-hash-table :test 'eq)
                   macher-agent-sandbox--functions (make-hash-table :test 'eq))
@@ -981,13 +1014,15 @@
                                  (when (functionp on-error)
                                    (funcall on-error (list :status 'error :error reason))))))
             (macher-agent--ptc-resume-loop-start
-             iterator resolved-ctx resolved-buf on-success on-error stop-iter-fn)))
+             iterator resolved-ctx resolved-buf active-ptc-prims
+             on-success on-error stop-iter-fn)))
       (error
        (when (functionp on-error)
          (funcall on-error (list :status 'error :error (error-message-string err))))))))
 
 (defun macher-agent-sandbox-run (expression extra-operations context target-buf)
-  "Execute Lisp EXPRESSION in a sandboxed environment with EXTRA-OPERATIONS."
+  "Execute Lisp EXPRESSION in sandbox with EXTRA-OPERATIONS.
+Evaluates inside TARGET-BUF using CONTEXT."
   (let* ((caller-prims (or (when (macher-agent-valid-context-p context)
                              (let ((sb (macher-agent-sandbox-get-state context)))
                                (when (listp sb) (plist-get sb :ptc-primitives))))
@@ -1048,9 +1083,7 @@
          (skill-prims nil))
     (dolist (s skills)
       (let* ((spec (if (listp s) s
-                     (or (alist-get s known)
-                         (when (macher-agent-valid-context-p ctx)
-                           (alist-get s (macher-agent-context-skills ctx))))))
+                     (macher-agent--lookup-skill-spec s ctx target-buf known t)))
              (p (plist-get spec :ptc-primitives)))
         (when (plist-get spec :exclusive)
           (setq buf-prims nil
@@ -1066,32 +1099,42 @@
      :test #'equal)))
 
 (defun macher-agent-sandbox-append-ptc-to-transmission (state)
-  "Hydrate PTC primitives and append PTC instructions to transmission STATE struct."
+  "Hydrate PTC primitives and append PTC instructions to STATE."
   (cl-check-type state macher-agent-transmission-state)
   (let ((prims (macher-agent-sandbox--resolve-transmission-prims state))
         (target-buf (macher-agent-transmission-state-target-buffer state))
         (ctx (or (macher-agent-transmission-state-context state)
                  (macher-agent-resolve-context (macher-agent-transmission-state-target-buffer state)))))
-    (when prims
-      (setf (macher-agent-transmission-state-ptc-primitives state) prims)
-      (let ((tx-plugins (copy-sequence (macher-agent-transmission-state-plugins state))))
-        (setf (macher-agent-transmission-state-plugins state)
-              (plist-put tx-plugins :sandbox (list :ptc-primitives prims))))
-      (when (and target-buf (buffer-live-p target-buf))
-        (with-current-buffer target-buf
-          (setq-local macher-agent--active-ptc-primitives prims)))
+    (setf (macher-agent-transmission-state-ptc-primitives state) prims)
+    (when (and target-buf (buffer-live-p target-buf)
+               (eq (current-buffer) target-buf))
+      (with-current-buffer target-buf
+        (setq-local macher-agent--active-ptc-primitives prims))
       (when (macher-agent-valid-context-p ctx)
         (let ((sb (copy-sequence (macher-agent-sandbox-get-state ctx))))
-          (macher-agent-sandbox-set-state ctx (plist-put sb :ptc-primitives prims))))
-      (when-let* ((fsm (macher-agent-get-active-fsm)))
-        (when (fboundp 'gptel-fsm-info)
-          (let ((info (copy-sequence (gptel-fsm-info fsm))))
-            (macher-agent--set-fsm-info fsm (plist-put info :ptc-primitives prims)))))
+          (macher-agent-sandbox-set-state ctx (plist-put sb :ptc-primitives prims)))))
+    (when prims
       (let* ((tools (macher-agent-transmission-state-tools state))
-             (compiled-ptc-block (macher-agent--inject-ptc-prompt "" prims tools)))
-        (unless (string-empty-p compiled-ptc-block)
-          (push (string-trim compiled-ptc-block)
-                (macher-agent-transmission-state-directives state))))))
+             (already-present (cl-some (lambda (tl)
+                                         (let ((name (macher-agent-canonical-tool-name tl)))
+                                           (and name (member name '("ptc_execution" "ptc-execution")))))
+                                       tools))
+             (ptc-tool (unless already-present
+                         (macher-agent--resolve-ptc-execution-tool ctx))))
+        (when (and (not already-present) (macher-tool-valid-p ptc-tool))
+          (setq tools (append tools (list ptc-tool)))
+          (setf (macher-agent-transmission-state-tools state) tools))
+        (let ((tx-plugins (copy-sequence (macher-agent-transmission-state-plugins state))))
+          (setf (macher-agent-transmission-state-plugins state)
+                (plist-put tx-plugins :sandbox (list :ptc-primitives prims))))
+        (when-let* ((fsm (macher-agent-get-active-fsm)))
+          (when (fboundp 'gptel-fsm-info)
+            (let ((info (copy-sequence (gptel-fsm-info fsm))))
+              (macher-agent--set-fsm-info fsm (plist-put info :ptc-primitives prims)))))
+        (let ((compiled-ptc-block (macher-agent--inject-ptc-prompt "" prims tools)))
+          (unless (string-empty-p compiled-ptc-block)
+            (push (string-trim compiled-ptc-block)
+                  (macher-agent-transmission-state-directives state)))))))
   state)
 
 ;;;###autoload
@@ -1102,10 +1145,10 @@
                                                       on-success
                                                       on-error)
                                                 &rest script-body)
-  "Execute SCRIPT-BODY as a sandboxed PTC script in a detached workspace buffer.
+  "Execute SCRIPT-BODY as a sandboxed PTC script in a detached buffer.
 BUFFER-NAME is the target workspace buffer (default \"*workspace-root*\").
 When REAP is non-nil (default t), kill the buffer after completion.
-PRIMITIVES is an explicit list of allowed tool names, or nil to inherit from PRESETS.
+PRIMITIVES lists allowed tool names, or nil to inherit from PRESETS.
 PRESETS is a preset or list of presets to apply to the detached buffer.
 ON-SUCCESS and ON-ERROR are single-argument callbacks."
   (declare (indent 1) (debug t))

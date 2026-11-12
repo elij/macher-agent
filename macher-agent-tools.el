@@ -14,8 +14,8 @@
 ;;; Presentation Macro
 
 (defmacro macher-agent-with-presentation-context (args &rest body)
-  "Wrap tool execution to provide CONTEXT and safely route errors to the LLM via callback.
-Extracts context from active FSM or falls back to persistent context for detached PTC execution."
+  "Wrap BODY taking ARGS to bind `context' and route errors via callback.
+Extracts `context' from active FSM or persistent buffer context."
   (declare (indent 1))
   (let ((fsm-sym (gensym "fsm-")))
     `(lambda (callback ,@args)

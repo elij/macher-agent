@@ -63,7 +63,7 @@
 
 (defconst macher-agent-transit-buffer-keys
   '(:target-buffer :parent-buffer :buffer :buffer-name)
-  "Authoritative list of keys used to pass buffer references in transit payloads.")
+  "Authoritative keys used to pass buffer references in transit payloads.")
 
 (defconst macher-agent-a2a-schema-version :a2a-v1
   "Current schema version tag for Agent-to-Agent transit messages.")
@@ -84,7 +84,10 @@
                                               shared-state
                                               payload
                                               metadata)
-  "Construct a validated `macher-agent-transit-payload' struct."
+  "Construct a validated `macher-agent-transit-payload' struct.
+Accepts SCHEMA-VERSION, TRANSIT-TYPE, TYPE, TASK-ID, TARGET,
+TARGET-BUFFER, TARGET-CONTEXT, PARENT-CONTEXT, CHILD-CONTEXT,
+SHARED-STATE, PAYLOAD, and METADATA."
   (cl-assert (memq transit-type macher-agent-a2a-transit-types)
              nil "Invalid transit-type: %S (expected one of %S)" transit-type macher-agent-a2a-transit-types)
   (make-macher-agent-transit-payload
@@ -116,7 +119,8 @@
   workspace
   target-buffer
   skill-sym
-  system-message)
+  system-message
+  task-id)
 
 (defconst macher-agent--file-scan-regex "^[^.]"
   "Regular expression matching non-hidden file and directory names.")
@@ -176,7 +180,7 @@
   "Function variable used to dispatch conversation history searches.")
 
 (defcustom macher-agent-max-context-chars '((nil . 2000000))
-  "Alist mapping gptel model symbols to their maximum allowed context characters."
+  "Alist mapping gptel model symbols to maximum allowed context characters."
   :type '(alist :key-type symbol :value-type integer)
   :group 'macher-agent)
 
@@ -184,6 +188,15 @@
   "Maximum character length for sandbox tool output before middle truncation."
   :type 'integer
   :group 'macher-agent)
+
+(defcustom macher-agent-sandbox-command-timeout 60
+  "Maximum seconds a command in `macher-agent-run-in-vfs-sandbox' may run.
+When nil or non-positive, no timeout timer is armed."
+  :type '(choice (const :tag "No timeout" nil) number)
+  :group 'macher-agent)
+
+(defvar macher-agent--active-sandbox-dir nil
+  "Dynamically bound temporary VFS sandbox directory during sandbox execution.")
 
 (defun macher-agent--ensure-trailing-slash (path)
   "Ensure directory string PATH ends with a trailing slash."
@@ -286,6 +299,9 @@
 (defvar-local macher-agent--is-ephemeral nil
   "Flag whether the current buffer is an ephemeral sub-agent.")
 
+(defvar-local macher-agent--explicitly-persistent nil
+  "Non-nil when buffer is an explicitly persistent sub-agent.")
+
 (defvar-local macher-agent--ready-to-reap nil
   "Flag whether the sub-agent buffer is ready for garbage collection.")
 
@@ -307,9 +323,22 @@
 (defvar-local macher-agent--boot-directive nil
   "Initial boot directive instruction string for sub-agent execution.")
 
+(defvar-local macher-agent--force-boot-directive nil
+  "When non-nil, inject `macher-agent--boot-directive' once on the next turn.")
+
+(defvar-local macher-agent--staged-submission nil
+  "Staged task submission plist queued by `submit_task_result' for DONE reaper.")
+
+(defvar-local macher-agent--submit-recovery-pending nil
+  "When non-nil, an automatic recovery turn for `submit_task_result' is pending.")
+
+(defvar-local macher-agent--turn-submission-delivered nil
+  "When non-nil, a submission delivery completed during the current turn.")
+
 (put 'macher-agent--active-fsm 'permanent-local t)
 (put 'macher-agent--current-task-id 'permanent-local t)
 (put 'macher-agent--is-ephemeral 'permanent-local t)
+(put 'macher-agent--explicitly-persistent 'permanent-local t)
 (put 'macher-agent--ready-to-reap 'permanent-local t)
 (put 'macher-agent-task-finished 'permanent-local t)
 (put 'macher-agent--task-result 'permanent-local t)
@@ -320,6 +349,10 @@
 (put 'macher-agent--active-ptc-primitives 'permanent-local t)
 (put 'macher-agent--suppress-patch 'permanent-local t)
 (put 'macher-agent--boot-directive 'permanent-local t)
+(put 'macher-agent--force-boot-directive 'permanent-local t)
+(put 'macher-agent--staged-submission 'permanent-local t)
+(put 'macher-agent--submit-recovery-pending 'permanent-local t)
+(put 'macher-agent--turn-submission-delivered 'permanent-local t)
 (put 'macher-agent--persistent-context 'permanent-local t)
 (put 'macher-agent-fsm-id 'permanent-local t)
 
@@ -488,7 +521,7 @@
               (eq (macher-agent-session-state (macher-agent-context-session ctx)) :reapable)))))))
 
 (defun macher-agent--remove-active-subagent-registries (child-buf &optional fallback-buf)
-  "Clear registries strictly tied to CHILD-BUF object."
+  "Clear registries tied to CHILD-BUF or optional FALLBACK-BUF."
   (let ((buf (if (bufferp child-buf)
                  child-buf
                (if (bufferp fallback-buf)
@@ -609,7 +642,7 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
   "Hook run when an agent task flushes or completes its execution cycle.")
 
 (defun macher-agent-run-task-flush-hook (context)
-  "Invoke the flush hook."
+  "Invoke `macher-agent-task-flush-hook' functions with CONTEXT."
   (dolist (hook-fn (if (consp macher-agent-task-flush-hook)
                        macher-agent-task-flush-hook
                      (list macher-agent-task-flush-hook)))
@@ -620,7 +653,7 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
   "Registry storing pipeline definitions and ordered steps.")
 
 (defun macher-agent-register-pipeline-step (pipeline-sym step-fn priority)
-  "Register STEP-FN in PIPELINE-SYM queue."
+  "Register STEP-FN in PIPELINE-SYM queue at PRIORITY."
   (cl-check-type pipeline-sym symbol)
   (let* ((current-entries (gethash pipeline-sym macher-agent-pipeline-registry))
          (filtered (cl-remove-if (lambda (entry)
@@ -652,7 +685,7 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
     (mapcar (lambda (entry) (plist-get entry :step)) entries)))
 
 (defun macher-agent-run-pipeline (pipeline-name initial-state)
-  "Execute PIPELINE-NAME starting with INITIAL-STATE, returning the final state."
+  "Execute PIPELINE-NAME from INITIAL-STATE and return final state."
   (let ((state initial-state))
     (dolist (step (macher-agent-get-pipeline-steps pipeline-name))
       (when (functionp step)
@@ -716,7 +749,7 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
       "Agent: Workspace")))
 
 (defun macher-agent-search-glob (orig-buf query &optional ctx-lines)
-  "Execute search QUERY against live ORIG-BUF."
+  "Search QUERY in live ORIG-BUF with optional CTX-LINES context."
   (cl-check-type orig-buf buffer)
   (cl-check-type query string)
   (let ((ctx-lines (if (and ctx-lines (> ctx-lines 0)) ctx-lines 5))
@@ -768,7 +801,7 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
         (macher-agent-search-glob buf query context-lines)))))
 
 (defun macher-agent-log-tool-intent (context tool args target &optional extra)
-  "Log TOOL intent with ARGS, TARGET, and optional EXTRA into CONTEXT audit log."
+  "Log TOOL intent with ARGS, TARGET, and EXTRA in CONTEXT audit log."
   (cl-check-type context macher-agent-context)
   (let* ((plugins (macher-agent-context-plugins context))
          (audit (plist-get plugins :audit-log))
