@@ -35,10 +35,14 @@
   (macher-agent-zero-mem-install)
   (macher-agent-vfs-install)
   (macher-agent-transmission-install)
+  (unless macher-agent-global-skills-alist
+    (ignore-errors (macher-agent-initialize-skills)))
 
   (add-hook 'macher-agent-buffer-flush-hook #'macher-agent--flush-sweep-buffer)
   (add-hook 'gptel-prompt-transform-functions #'macher-agent--fsm-hijack-transform)
   (add-hook 'hack-local-variables-hook #'macher-agent--restore-local-state)
+  (add-hook 'gptel-save-state-hook #'macher-agent--sync-preset-before-save)
+  (add-hook 'before-save-hook #'macher-agent--persist-missing-preset-tools 90)
   (add-hook 'gptel-pre-tool-call-functions #'macher-agent--log-gptel-pre-tool)
   (add-hook 'macher-agent-context-mutated-hook #'macher-agent--mutation-dispatcher)
 

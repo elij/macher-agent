@@ -96,14 +96,17 @@
 
 (defun macher-agent-macher-run-with-proxy-context (orphaned-context ws marshalled-files prompt target-buf orig-fn callback args)
   "Execute upstream tool ORIG-FN in TARGET-BUF using a proxy Macher context.
-Validates ORPHANED-CONTEXT, constructs a proxy with WS, MARSHALLED-FILES, and
-PROMPT, invokes ORIG-FN with CALLBACK and ARGS, and returns (RESULT . FILES)."
-  (unless (and (fboundp 'macher-context-p) (macher-context-p orphaned-context))
-    (error "Macher Agent: Tool called without an upstream context"))
-  (let* ((effective-ws (or ws
-                           (when (fboundp 'macher-context-workspace)
-                             (ignore-errors (macher-context-workspace orphaned-context)))))
-         (proxy (when (fboundp 'macher--make-context)
+ORPHANED-CONTEXT may be an upstream `macher-context' or nil when WS is
+supplied.  Constructs a proxy with WS, MARSHALLED-FILES, and PROMPT,
+invokes ORIG-FN with CALLBACK and ARGS, and returns (result . files)."
+  (let* ((effective-ws
+          (or ws
+              (when (and orphaned-context
+                         (fboundp 'macher-context-p)
+                         (macher-context-p orphaned-context)
+                         (fboundp 'macher-context-workspace))
+                (ignore-errors (macher-context-workspace orphaned-context)))))
+         (proxy (when (and effective-ws (fboundp 'macher--make-context))
                   (let ((macher-agent--persistent-context nil))
                     (macher--make-context
                      :workspace effective-ws
