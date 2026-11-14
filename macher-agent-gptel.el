@@ -185,26 +185,66 @@
 
     (when callback (funcall callback))))
 
+(defconst macher-agent--flv-override-vars
+  '(gptel-system-prompt gptel-model gptel-temperature
+    gptel-max-tokens gptel--num-messages-to-send)
+  "Buffer-local `gptel' variables whose file-local overrides take precedence.")
+
+(defun macher-agent--flv-overrides ()
+  "Return file-local `(VAR . VAL)' cells overriding preset defaults."
+  (let ((flv (bound-and-true-p file-local-variables-alist)))
+    (cl-loop for var in macher-agent--flv-override-vars
+             for cell = (assq var flv)
+             when cell collect cell)))
+
+(defun macher-agent--clear-local-variables-gptel-props ()
+  "Remove `gptel' properties from trailing HTML file-local variables block."
+  (save-excursion
+    (goto-char (point-max))
+    (skip-chars-backward " \t\r\n")
+    (when (and (> (point) (point-min))
+               (save-excursion
+                 (beginning-of-line)
+                 (looking-at "[ \t]*<!--+[ \t]*End:[ \t]*--+>[ \t]*$")))
+      (goto-char (line-beginning-position))
+      (when (re-search-backward "^[ \t]*<!--+[ \t]*Local Variables:[ \t]*--+>[ \t]*$" nil t)
+        (with-silent-modifications
+          (remove-text-properties (match-beginning 0) (point-max)
+                                  '(gptel nil front-sticky nil)))))))
+
 (defun macher-agent--restore-saved-gptel-state ()
   "Restore saved gptel preset, tools, and bounds.
 Preserves any file-local variable overrides."
   (when (and (buffer-file-name) (fboundp 'gptel--restore-state))
-    (let* ((flv (bound-and-true-p file-local-variables-alist))
-           (override-vars '(gptel-system-prompt gptel-model
-                            gptel-temperature gptel-max-tokens
-                            gptel--num-messages-to-send))
-           (saved-overrides
-            (cl-loop for var in override-vars
-                     for cell = (assq var flv)
-                     when cell collect cell))
+    (let* ((saved-overrides (macher-agent--flv-overrides))
            (preset-sym (bound-and-true-p gptel--preset))
            (preset-spec (when preset-sym
                           (macher-agent--lookup-skill-spec preset-sym nil (current-buffer)))))
       (when (and preset-spec (plist-get preset-spec :is-command))
         (setq-local gptel--preset nil))
       (ignore-errors (gptel--restore-state))
+      (macher-agent--clear-local-variables-gptel-props)
       (dolist (cell saved-overrides)
         (set (make-local-variable (car cell)) (cdr cell))))))
+
+(defun macher-agent--reconcile-restored-buffer (&optional force-restore)
+  "Reconcile saved `gptel' session metadata in current buffer idempotently.
+When FORCE-RESTORE is non-nil, run `macher-agent--restore-saved-gptel-state'
+unconditionally; otherwise run it only when buffer state diverges."
+  (when (buffer-file-name)
+    (macher-agent--clear-local-variables-gptel-props))
+  (let ((was-restored (bound-and-true-p macher-agent--is-restored-session))
+        (needs-reconcile (or force-restore
+                             (macher-agent--needs-preset-reconcile-p))))
+    (when (or was-restored needs-reconcile)
+      (setq-local macher-agent-presets nil)
+      (setq-local macher-agent--is-restored-session nil)
+      (when needs-reconcile
+        (macher-agent--restore-saved-gptel-state))
+      (macher-agent--clear-local-variables-gptel-props)
+      (macher-agent--sync-preset-before-save)
+      (when (fboundp 'gptel--update-header-line)
+        (gptel--update-header-line)))))
 
 (defun macher-agent--restore-local-state ()
   "Restore agent variables natively after Emacs parses file-local variables."
@@ -214,14 +254,11 @@ Preserves any file-local variable overrides."
             (local-variable-p 'gptel-backend)
             (local-variable-p 'gptel--backend-name)
             (local-variable-p 'gptel--tool-names))
-    (setq-local macher-agent--is-restored-session t)
     (let ((current-root (macher-agent-root default-directory)))
       (when current-root
         (macher-agent--init-workspace-state current-root)))
-    (macher-agent--restore-saved-gptel-state)
-    (macher-agent--sync-preset-before-save)
-    (when (fboundp 'gptel--update-header-line)
-      (gptel--update-header-line))))
+    (macher-agent--reconcile-restored-buffer t)
+    (setq-local macher-agent--is-restored-session t)))
 
 (defun macher-agent--get-max-context-chars (&optional buf model-override)
   "Resolve max context characters based on MODEL-OVERRIDE or the model in BUF."
@@ -235,6 +272,38 @@ Preserves any file-local variable overrides."
         2000000)))
 
 ;;; Prompt Transformation and Inline Skill Extraction
+
+(defun macher-agent--strip-wire-local-variables ()
+  "Strip trailing HTML file-local variables block from current wire buffer."
+  (save-excursion
+    (goto-char (point-max))
+    (skip-chars-backward " \t\r\n")
+    (when (and (> (point) (point-min))
+               (save-excursion
+                 (beginning-of-line)
+                 (looking-at "[ \t]*<!--+[ \t]*End:[ \t]*--+>[ \t]*$")))
+      (goto-char (line-beginning-position))
+      (when (re-search-backward "^[ \t]*<!--+[ \t]*Local Variables:[ \t]*--+>[ \t]*$" nil t)
+        (let ((beg (match-beginning 0)))
+          (unless (memq (car-safe (ensure-list (get-text-property beg 'gptel)))
+                        '(response tool))
+            (delete-region beg (point-max))))))))
+
+(defun macher-agent--prompt-start-pos ()
+  "Return start position of the trailing user prompt in current buffer."
+  (save-excursion
+    (goto-char (point-max))
+    (skip-chars-backward " \t\r\n")
+    (while (and (> (point) (point-min))
+                (eq (get-text-property (1- (point)) 'gptel) 'ignore))
+      (goto-char (or (previous-single-property-change (point) 'gptel)
+                     (point-min)))
+      (skip-chars-backward " \t\r\n"))
+    (if (and (> (point) (point-min))
+             (get-text-property (1- (point)) 'gptel))
+        (point)
+      (or (previous-single-property-change (point) 'gptel)
+          (point-min)))))
 
 (defun macher-agent--skip-prompt-prefix (pos)
   "Advance from POS past whitespace and prompt prefix (`### ', `*** ')."
@@ -526,7 +595,30 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                 (when (local-variable-p 'gptel--known-presets target-buf)
                   (buffer-local-value 'gptel--known-presets target-buf)))
           (when preset-spec
-            (let ((filtered-spec (copy-sequence preset-spec)))
+            (let* ((has-flv-tools
+                    (or (assq 'gptel--tool-names flv)
+                        (assq 'gptel-tools flv)
+                        (and (derived-mode-p 'org-mode)
+                             (fboundp 'org-entry-get)
+                             (org-entry-get (point-min) "GPTEL_TOOLS" 'selective))))
+                   (has-flv-sys (assq 'gptel-system-prompt flv))
+                   (has-parents (plist-get preset-spec :parents))
+                   (raw-sys (unless has-flv-sys
+                              (or (plist-get preset-spec :system)
+                                  (plist-get preset-spec :system-message))))
+                   (direct-sys
+                    (when (and raw-sys
+                               (not has-parents)
+                               (not (and (consp raw-sys) (keywordp (car raw-sys)))))
+                      (cond
+                       ((stringp raw-sys) raw-sys)
+                       ((and (symbolp raw-sys) (not (functionp raw-sys)))
+                        (or (alist-get raw-sys (bound-and-true-p gptel-directives))
+                            raw-sys))
+                       ((consp raw-sys) raw-sys)
+                       (t nil))))
+                   (filtered-spec (copy-sequence preset-spec)))
+              (setq filtered-spec (plist-put filtered-spec :name (symbol-name active-preset)))
               (when (assq 'gptel-model flv)
                 (cl-remf filtered-spec :model))
               (when (or (assq 'gptel-backend flv) (assq 'gptel--backend-name flv))
@@ -535,62 +627,39 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                 (cl-remf filtered-spec :temperature))
               (when (assq 'gptel-max-tokens flv)
                 (cl-remf filtered-spec :max-tokens))
-              (let ((params
-                     (macher-agent-preset-pipe--parameters
-                      (list :backend (macher-agent-transmission-state-backend state)
+              (when (or has-flv-sys direct-sys)
+                (cl-remf filtered-spec :system)
+                (cl-remf filtered-spec :system-message))
+              (when (or tools-suppressed has-flv-tools)
+                (cl-remf filtered-spec :tools)
+                (cl-remf filtered-spec :allowed-tools))
+              (let ((composed
+                     (macher-agent-compose-payload
+                      (list :known-presets (macher-agent-transmission-state-known-presets state)
+                            :backend (macher-agent-transmission-state-backend state)
                             :model (macher-agent-transmission-state-model state)
                             :temperature (macher-agent-transmission-state-temperature state)
-                            :max-tokens (macher-agent-transmission-state-max-tokens state))
-                      (list 'preset active-preset filtered-spec))))
-                (setf (macher-agent-transmission-state-backend state) (plist-get params :backend))
-                (setf (macher-agent-transmission-state-model state) (plist-get params :model))
-                (setf (macher-agent-transmission-state-temperature state) (plist-get params :temperature))
-                (setf (macher-agent-transmission-state-max-tokens state) (plist-get params :max-tokens))))
-            (when-let* ((raw-sys (or (plist-get preset-spec :system)
-                                     (plist-get preset-spec :system-message)))
-                        ((not (assq 'gptel-system-prompt flv))))
-              (let ((resolved-sys
-                     (cond
-                      ((stringp raw-sys) raw-sys)
-                      ((and (symbolp raw-sys) (not (functionp raw-sys)))
-                       (or (alist-get raw-sys (bound-and-true-p gptel-directives))
-                           raw-sys))
-                      ((and (consp raw-sys) (not (keywordp (car raw-sys))))
-                       raw-sys)
-                      (t nil))))
-                (when resolved-sys
-                  (setf (macher-agent-transmission-state-base-prompt state) resolved-sys)
-                  (setf (macher-agent-transmission-state-compiled-prompt state) resolved-sys))))
-            (let ((has-flv-tools
-                   (or (assq 'gptel--tool-names flv)
-                       (assq 'gptel-tools flv)
-                       (and (derived-mode-p 'org-mode)
-                            (fboundp 'org-entry-get)
-                            (org-entry-get (point-min) "GPTEL_TOOLS" 'selective))))
-                  (preset-tools-spec (or (plist-get preset-spec :tools)
-                                         (plist-get preset-spec :allowed-tools))))
-              (when (and (not tools-suppressed)
-                         (not has-flv-tools)
-                         preset-tools-spec)
-                (let* ((is-mod (and (consp preset-tools-spec)
-                                    (keywordp (car preset-tools-spec))))
-                       (merged (macher-agent--compose-merge-tools
-                                (and is-mod refreshed-tools)
-                                preset-tools-spec))
-                       (resolved-preset-tools
+                            :max-tokens (macher-agent-transmission-state-max-tokens state)
+                            :system (or direct-sys
+                                        (macher-agent-transmission-state-base-prompt state))
+                            :tools refreshed-tools
+                            :ptc-primitives (macher-agent-transmission-state-ptc-primitives state))
+                      (list filtered-spec))))
+                (setf (macher-agent-transmission-state-model state) (plist-get composed :model))
+                (setf (macher-agent-transmission-state-backend state) (plist-get composed :backend))
+                (setf (macher-agent-transmission-state-temperature state) (plist-get composed :temperature))
+                (setf (macher-agent-transmission-state-max-tokens state) (plist-get composed :max-tokens))
+                (unless has-flv-sys
+                  (let ((final-sys (or direct-sys (plist-get composed :system))))
+                    (setf (macher-agent-transmission-state-base-prompt state) final-sys)
+                    (setf (macher-agent-transmission-state-compiled-prompt state) final-sys)))
+                (when (and (not tools-suppressed) (not has-flv-tools))
+                  (setf (macher-agent-transmission-state-tools state)
                         (mapcar (lambda (tl)
                                   (macher-agent--refresh-tool-struct tl active-context))
-                                (macher-agent-normalize-tools merged))))
-                  (when resolved-preset-tools
-                    (setf (macher-agent-transmission-state-tools state)
-                          (macher-agent--merge-tools
-                           resolved-preset-tools
-                           (unless is-mod refreshed-tools)))))))
-            (when-let* ((preset-prims (plist-get preset-spec :ptc-primitives)))
-              (setf (macher-agent-transmission-state-ptc-primitives state)
-                    (delete-dups
-                     (append (ensure-list preset-prims)
-                             (macher-agent-transmission-state-ptc-primitives state))))))))))
+                                (plist-get composed :tools))))
+                (setf (macher-agent-transmission-state-ptc-primitives state)
+                      (plist-get composed :ptc-primitives)))))))))
   state)
 
 (defun macher-agent-pipe--apply-skills-and-presets (state)
@@ -1286,8 +1355,7 @@ Leaves the buffer prompt unmodified."
           (if is-command
               (let* ((raw-args (if ctx
                                    (macher-agent-context-prompt ctx)
-                                 (let ((ps (or (previous-single-property-change (point-max) 'gptel)
-                                               (point-min))))
+                                 (let ((ps (macher-agent--prompt-start-pos)))
                                    (string-trim
                                     (buffer-substring-no-properties
                                      (macher-agent--skip-prompt-prefix ps)
@@ -1323,10 +1391,9 @@ Invokes ASYNC-FN when transformation finishes."
          (context (or (when active-fsm
                         (macher-agent-gptel-context-from-fsm active-fsm orig-buf))
                       (macher-agent-resolve-context orig-buf)))
-         (prompt-start (save-excursion
-                         (goto-char (or (previous-single-property-change (point-max) 'gptel)
-                                        (point-min)))
-                         (point))))
+         (_ (unless (eq temp-buf orig-buf)
+              (macher-agent--strip-wire-local-variables)))
+         (prompt-start (macher-agent--prompt-start-pos)))
 
     (when (buffer-live-p orig-buf)
       (with-current-buffer orig-buf
@@ -1406,7 +1473,10 @@ Invokes ASYNC-FN when transformation finishes."
           (when (fboundp 'gptel-fsm-prompt)
             (with-no-warnings (setf (gptel-fsm-prompt active-fsm) redirect-text)))
           (macher-agent--set-fsm-info active-fsm
-                                      (plist-put (gptel-fsm-info active-fsm) :prompt redirect-text)))))
+                                      (plist-put (gptel-fsm-info active-fsm) :prompt redirect-text))))
+
+      (unless (eq temp-buf orig-buf)
+        (setq-local gptel--known-presets nil)))
 
     (when-let* ((fn async-fn)
                 ((functionp fn)))
@@ -1742,7 +1812,11 @@ Checks whether a resolvable tool is absent from `gptel-tools'."
                     (when-let* ((org-tools (org-entry-get (point-min) "GPTEL_TOOLS" 'selective)))
                       (macher-agent--missing-resolvable-tool-p (split-string org-tools))))
                (and (bound-and-true-p gptel--tool-names)
-                    (macher-agent--missing-resolvable-tool-p gptel--tool-names)))))))
+                    (macher-agent--missing-resolvable-tool-p gptel--tool-names))
+               (cl-some (lambda (cell)
+                          (not (equal (and (boundp (car cell)) (symbol-value (car cell)))
+                                      (cdr cell))))
+                        (macher-agent--flv-overrides)))))))
 
 (defun macher-agent--install-gptel-save-hooks ()
   "Register buffer-local save and prompt-transform hooks for Macher Agent."
@@ -1763,14 +1837,7 @@ Checks whether a resolvable tool is absent from `gptel-tools'."
 (defun macher-agent-setup-gptel-buffer ()
   "Set up a gptel buffer with macher-agent capabilities."
   (setq-local macher-agent--active-fsm nil)
-  (when (or (bound-and-true-p macher-agent--is-restored-session)
-            (macher-agent--needs-preset-reconcile-p))
-    (setq-local macher-agent-presets nil)
-    (setq-local macher-agent--is-restored-session nil)
-    (macher-agent--restore-saved-gptel-state)
-    (macher-agent--sync-preset-before-save)
-    (when (fboundp 'gptel--update-header-line)
-      (gptel--update-header-line)))
+  (macher-agent--reconcile-restored-buffer)
   (dolist (transformer (reverse macher-agent-prompt-transformers))
     (remove-hook 'gptel-prompt-transform-functions transformer t)
     (add-hook 'gptel-prompt-transform-functions transformer nil t))

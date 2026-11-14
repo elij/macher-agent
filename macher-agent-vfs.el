@@ -298,14 +298,17 @@ Initialises ORIG, CURR, and optional PENDING-PATCH."
          (truename (file-truename (expand-file-name path ws-root))))
     (file-relative-name truename ws-root)))
 
-(defun macher-agent--resolve-safe-path (unsafe-path root)
-  "Resolve UNSAFE-PATH safely within ROOT directory."
+(defun macher-agent--resolve-safe-path (unsafe-path root &optional canon-root)
+  "Resolve UNSAFE-PATH safely within ROOT directory.
+Optional CANON-ROOT supplies a precomputed canonical `file-truename'
+directory string (with trailing slash) for ROOT."
   (cl-check-type unsafe-path string)
-  (let* ((canonical-base (file-name-as-directory (file-truename (expand-file-name root))))
+  (let* ((canonical-base (or canon-root
+                             (file-name-as-directory (file-truename (expand-file-name root)))))
          (canonical-resolved (file-truename (expand-file-name unsafe-path canonical-base))))
-    (if (or (and (file-directory-p canonical-base) (file-in-directory-p canonical-resolved canonical-base))
-            (string-prefix-p canonical-base (file-name-as-directory canonical-resolved))
-            (string= (directory-file-name canonical-base) (directory-file-name canonical-resolved)))
+    (if (or (string-prefix-p canonical-base (file-name-as-directory canonical-resolved))
+            (string= (directory-file-name canonical-base) (directory-file-name canonical-resolved))
+            (and (file-directory-p canonical-base) (file-in-directory-p canonical-resolved canonical-base)))
         canonical-resolved
       (error "SECURITY ERROR: Path traversal jailbreak detected: %s" unsafe-path))))
 
@@ -524,8 +527,10 @@ physical file was deleted externally."
          (t path)))
     path))
 
-(defun macher-agent--normalize-path-key (path root)
-  "Format canonical workspace-relative key or buffer name from PATH and ROOT."
+(defun macher-agent--normalize-path-key (path root &optional canon-root)
+  "Format canonical workspace-relative key or buffer name from PATH and ROOT.
+Optional CANON-ROOT supplies a precomputed canonical `file-truename'
+directory string (with trailing slash) for ROOT."
   (cl-check-type path string)
   (let* ((ws-root (cond
                    ((stringp root) root)
@@ -538,12 +543,13 @@ physical file was deleted externally."
      ((and ws-root (eq (macher-agent--classify-file-path clean-path ws-root) 'buffer))
       clean-path)
      (ws-root
-      (let* ((canon-root (file-name-as-directory (file-truename (expand-file-name ws-root))))
-             (safe-path (macher-agent--resolve-safe-path clean-path ws-root)))
-        (if (string= (directory-file-name safe-path) (directory-file-name canon-root))
+      (let* ((canonical-base (or canon-root
+                                 (file-name-as-directory (file-truename (expand-file-name ws-root)))))
+             (safe-path (macher-agent--resolve-safe-path clean-path ws-root canonical-base)))
+        (if (string= (directory-file-name safe-path) (directory-file-name canonical-base))
             "."
           (macher-agent--strip-leading-dot-slash
-           (substring safe-path (length canon-root))))))
+           (substring safe-path (length canonical-base))))))
      (t
       (macher-agent--strip-leading-dot-slash clean-path)))))
 
@@ -616,14 +622,27 @@ physical file was deleted externally."
            (cl-find norm-path contents :key #'macher-agent-vfs-entry-path :test #'equal))
       (and raw-path (not (equal raw-path norm-path))
            (cl-find raw-path contents :key #'macher-agent-vfs-entry-path :test #'equal))
-      (cl-find-if
-       (lambda (e)
-         (when-let* ((p (macher-agent-vfs-entry-path e)))
-           (let ((p-norm (ignore-errors (macher-agent--normalize-path-key p context))))
-             (or (and norm-path p-norm (equal p-norm norm-path))
-                 (and raw-path (file-equal-p p raw-path))
-                 (and norm-path (file-equal-p p norm-path))))))
-       contents)))
+      (when contents
+        (let* ((ws-root (cond
+                         ((stringp context) context)
+                         ((macher-agent-context-p context)
+                          (or (macher-agent-context-project-root context)
+                              (macher-agent-context-workspace-root context)))
+                         (t nil)))
+               (canon-root (and (stringp ws-root)
+                                (ignore-errors
+                                  (file-name-as-directory
+                                   (file-truename (expand-file-name ws-root)))))))
+          (cl-find-if
+           (lambda (e)
+             (when-let* ((p (macher-agent-vfs-entry-path e)))
+               (let ((p-norm (ignore-errors
+                               (macher-agent--normalize-path-key p context canon-root))))
+                 (if (and norm-path p-norm)
+                     (equal p-norm norm-path)
+                   (or (and raw-path (file-equal-p p raw-path))
+                       (and norm-path (file-equal-p p norm-path)))))))
+           contents)))))
 
 (defun macher-agent--recompute-dirty-flag (context)
   "Recompute and set dirty flag on CONTEXT from file and buffer diff pools."
@@ -1069,15 +1088,23 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
      (t (error "Invalid tool representation: %S" tool)))))
 
 (defun macher-agent--get-search-in-workspace-tool ()
-  "Return the tool struct defined in skills/scripts/search_in_workspace.el."
-  (let ((tool (when (boundp 'macher-agent-search-in-workspace-tool)
-                (symbol-value 'macher-agent-search-in-workspace-tool))))
+  "Return the tool struct defined in `skills/scripts/search_in_workspace.el'."
+  (let ((tool (or (and (boundp 'macher-agent-search-in-workspace-tool)
+                       (macher-tool-valid-p (symbol-value 'macher-agent-search-in-workspace-tool))
+                       (symbol-value 'macher-agent-search-in-workspace-tool))
+                  (and (bound-and-true-p macher-agent-tools-registry)
+                       (let ((reg-tl (gethash "search_in_workspace" macher-agent-tools-registry)))
+                         (and (macher-tool-valid-p reg-tl)
+                              (not (member (gptel-tool-category reg-tl)
+                                           '("macher" "macher__processed")))
+                              reg-tl))))))
     (unless (macher-tool-valid-p tool)
-      (let* ((script-candidates
+      (let* ((bundled-dir (macher-agent--resolve-bundled-skills-dir))
+             (script-candidates
               (delq nil
                     (list
-                     (when (bound-and-true-p macher-agent--bundled-skills-dir)
-                       (expand-file-name "scripts/search_in_workspace.el" macher-agent--bundled-skills-dir))
+                     (when bundled-dir
+                       (expand-file-name "scripts/search_in_workspace.el" bundled-dir))
                      (locate-file "skills/scripts/search_in_workspace.el" load-path)
                      (locate-file "search_in_workspace.el" load-path)
                      (expand-file-name "skills/scripts/search_in_workspace.el" default-directory)
@@ -1086,31 +1113,36 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
                          (expand-file-name "skills/scripts/search_in_workspace.el" root))))))
              (found (cl-find-if #'file-exists-p script-candidates)))
         (when found
-          (load found nil t))
-        (setq tool (when (boundp 'macher-agent-search-in-workspace-tool)
-                     (symbol-value 'macher-agent-search-in-workspace-tool)))))
-    (or tool
-        (when (bound-and-true-p macher-agent-tools-registry)
-          (gethash "search_in_workspace" macher-agent-tools-registry))
+          (let ((gptel--known-tools (and (boundp 'gptel--known-tools)
+                                         (copy-tree gptel--known-tools))))
+            (load found nil t)))
+        (setq tool (and (boundp 'macher-agent-search-in-workspace-tool)
+                        (symbol-value 'macher-agent-search-in-workspace-tool)))))
+    (or (and (macher-tool-valid-p tool) tool)
         (when (bound-and-true-p gptel--known-tools)
-          (or (alist-get "search_in_workspace" (alist-get "perception" gptel--known-tools nil nil #'equal) nil nil #'equal)
-              (ignore-errors (gptel-get-tool "search_in_workspace")))))))
+          (let ((perc (alist-get "search_in_workspace"
+                                 (alist-get "perception" gptel--known-tools nil nil #'equal)
+                                 nil nil #'equal)))
+            (and (macher-tool-valid-p perc) perc))))))
 
 (defun macher-agent--wrap-single-tool (tool)
   "Wrap single TOOL to intercept upstream macher context and route to VFS."
   (when-let* (((not (gethash tool macher-agent--wrapped-tools-hash)))
               (tool-name (macher-agent--extract-tool-name tool)))
     (if-let* (((string= (format "%s" tool-name) "search_in_workspace"))
+              ((member (format "%s" (gptel-tool-category tool))
+                       '("macher" "macher__processed")))
               (replacement (macher-agent--get-search-in-workspace-tool)))
         (progn
-          (setf (gptel-tool-name tool) (gptel-tool-name replacement)
-                (gptel-tool-function tool) (gptel-tool-function replacement)
-                (gptel-tool-description tool) (gptel-tool-description replacement)
-                (gptel-tool-args tool) (gptel-tool-args replacement)
-                (gptel-tool-category tool) (gptel-tool-category replacement)
-                (gptel-tool-async tool) (gptel-tool-async replacement)
-                (gptel-tool-confirm tool) (gptel-tool-confirm replacement)
-                (gptel-tool-include tool) (gptel-tool-include replacement))
+          (unless (eq tool replacement)
+            (setf (gptel-tool-name tool) (gptel-tool-name replacement)
+                  (gptel-tool-function tool) (gptel-tool-function replacement)
+                  (gptel-tool-description tool) (gptel-tool-description replacement)
+                  (gptel-tool-args tool) (gptel-tool-args replacement)
+                  (gptel-tool-category tool) (gptel-tool-category replacement)
+                  (gptel-tool-async tool) (gptel-tool-async replacement)
+                  (gptel-tool-confirm tool) (gptel-tool-confirm replacement)
+                  (gptel-tool-include tool) (gptel-tool-include replacement)))
           (puthash tool t macher-agent--wrapped-tools-hash))
       (when-let* ((category (gptel-tool-category tool))
                   ((string= (format "%s" category) "macher"))
@@ -1140,17 +1172,47 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
                                       (macher-agent-context-project-root agent-ctx)
                                       (macher-agent-context-workspace-root agent-ctx)
                                       default-directory))
+                         (ctx-root (macher-agent-context-project-root agent-ctx))
+                         (norm-root (or ctx-root
+                                        (macher-agent-context-workspace-root agent-ctx)))
+                         (canon-root (and (stringp norm-root)
+                                          (ignore-errors
+                                            (file-name-as-directory
+                                             (file-truename (expand-file-name norm-root))))))
+                         (ws-canon (and (stringp ws-root)
+                                        (if (and norm-root (equal ws-root norm-root))
+                                            canon-root
+                                          (ignore-errors
+                                            (file-name-as-directory
+                                             (file-truename (expand-file-name ws-root)))))))
+                         (same-root-p (or (null canon-root) (equal ws-canon canon-root)))
                          (before-contents (copy-sequence (macher-agent--get-context-contents agent-ctx)))
+                         (before-by-rel (make-hash-table :test #'equal
+                                                         :size (max 1 (length before-contents))))
+                         (marshalled-rel-by-abs (make-hash-table :test #'equal
+                                                                 :size (max 1 (length before-contents))))
+                         (before-records nil)
                          (marshalled-files
                           (mapcar (lambda (entry)
                                     (let* ((raw-p (macher-agent-vfs-entry-path entry))
+                                           (norm-rel (and (stringp raw-p)
+                                                          (ignore-errors
+                                                            (macher-agent--normalize-path-key
+                                                             raw-p agent-ctx canon-root))))
                                            (abs-p (if (and (stringp raw-p) ws-root)
                                                       (expand-file-name raw-p ws-root)
                                                     raw-p)))
+                                      (when norm-rel
+                                        (unless (gethash norm-rel before-by-rel)
+                                          (puthash norm-rel entry before-by-rel))
+                                        (when (and same-root-p (stringp abs-p))
+                                          (puthash abs-p norm-rel marshalled-rel-by-abs)))
+                                      (push (cons entry (or norm-rel raw-p)) before-records)
                                       (cons abs-p
                                             (cons (macher-agent-vfs-entry-orig entry)
                                                   (macher-agent-vfs-entry-curr entry)))))
                                   before-contents))
+                         (_ (setq before-records (nreverse before-records)))
                          (proxy-outcome
                           (macher-agent-macher-run-with-proxy-context
                            orphaned-context ws marshalled-files
@@ -1159,7 +1221,8 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
                          (res (car-safe proxy-outcome))
                          (raw-after-files (cdr-safe proxy-outcome)))
                     (when (and (consp proxy-outcome) (listp raw-after-files))
-                      (let ((seen-paths (make-hash-table :test #'equal)))
+                      (let ((seen-paths (make-hash-table :test #'equal
+                                                          :size (max 1 (length raw-after-files)))))
                         (dolist (item raw-after-files)
                           (let* ((raw-path (cond
                                             ((macher-agent-vfs-entry-p item) (macher-agent-vfs-entry-path item))
@@ -1175,55 +1238,131 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
                                        ((consp item) (cdr item))
                                        (t nil)))
                                  (rel-path (and (stringp raw-path)
-                                                (ignore-errors
-                                                  (macher-agent--normalize-path-key raw-path agent-ctx))))
-                                 (prev (and rel-path
-                                            (macher-agent--find-vfs-file-entry
-                                             rel-path before-contents agent-ctx raw-path))))
+                                                (or (gethash raw-path marshalled-rel-by-abs)
+                                                    (ignore-errors
+                                                      (macher-agent--normalize-path-key
+                                                       raw-path agent-ctx canon-root)))))
+                                 (prev (and rel-path (gethash rel-path before-by-rel))))
                             (when rel-path
                               (puthash rel-path t seen-paths)
-                              (when (or prev (not (equal orig new)))
+                              (when (if prev
+                                        (not (equal (macher-agent-vfs-entry-curr prev) new))
+                                      (not (equal orig new)))
                                 (macher-agent--update-context-file agent-ctx rel-path new)))))
-                        (dolist (prev before-contents)
-                          (let* ((prev-raw-path (macher-agent-vfs-entry-path prev))
-                                 (prev-rel-path (and (stringp prev-raw-path)
-                                                     (or (ignore-errors
-                                                           (macher-agent--normalize-path-key prev-raw-path agent-ctx))
-                                                         prev-raw-path)))
-                                 (ctx-root (macher-agent-context-project-root agent-ctx))
-                                 (kind (and prev-rel-path
-                                            (macher-agent--classify-file-path prev-rel-path ctx-root))))
-                            (unless (and prev-rel-path (gethash prev-rel-path seen-paths))
-                              (if (and prev-rel-path (memq kind '(file media)))
-                                  (macher-agent--update-context-file
-                                   agent-ctx prev-rel-path (macher-agent-vfs-entry-orig prev))
-                                (macher-agent--set-context-contents
-                                 agent-ctx
-                                 (cl-remove prev (macher-agent--get-context-contents agent-ctx) :test #'eq))
-                                (macher-agent--recompute-dirty-flag agent-ctx)))))))
+                        (dolist (rec before-records)
+                          (let ((prev (car rec))
+                                (prev-rel-path (cdr rec)))
+                            (unless (and (stringp prev-rel-path)
+                                         (gethash prev-rel-path seen-paths))
+                              (let ((kind (and (stringp prev-rel-path)
+                                               (macher-agent--classify-file-path prev-rel-path ctx-root))))
+                                (if (and (stringp prev-rel-path) (memq kind '(file media)))
+                                    (macher-agent--update-context-file
+                                     agent-ctx prev-rel-path (macher-agent-vfs-entry-orig prev))
+                                  (macher-agent--set-context-contents
+                                   agent-ctx
+                                   (cl-remove prev (macher-agent--get-context-contents agent-ctx) :test #'eq))
+                                  (macher-agent--recompute-dirty-flag agent-ctx))))))))
                     res))))
         (puthash tool t macher-agent--wrapped-tools-hash)))))
 
+(defun macher-agent--wrap-macher-tools-in-alist (known-tools)
+  "Wrap Macher tools in KNOWN-TOOLS and inject `search_in_workspace'."
+  (when-let* ((tools-entry (assoc "macher" known-tools)))
+    (unless (assoc "search_in_workspace" (cdr tools-entry))
+      (when-let* ((replacement (macher-agent--get-search-in-workspace-tool))
+                  ((macher-tool-valid-p replacement)))
+        (let ((injected (if (fboundp 'gptel--copy-tool)
+                            (gptel--copy-tool replacement)
+                          replacement)))
+          (puthash injected t macher-agent--wrapped-tools-hash)
+          (setcdr tools-entry
+                  (cons (cons "search_in_workspace" injected)
+                        (cdr tools-entry))))))
+    (dolist (item (cdr tools-entry))
+      (let ((tool (if (consp item) (cdr item) item)))
+        (when (macher-tool-valid-p tool)
+          (macher-agent--wrap-single-tool tool))))))
+
 (defun macher-agent--wrap-macher-tools ()
-  "Wrap all Macher tools to inject persistent VFS context."
-  (when-let* ((tools-entry (assoc "macher" (bound-and-true-p gptel--known-tools))))
-    (let* ((macher-tools (cdr tools-entry))
-           (filtered (cl-remove-if
-                      (lambda (item)
-                        (let ((name (macher-agent--extract-tool-name item)))
-                          (and name (string= (format "%s" name) "search_in_workspace"))))
-                      macher-tools)))
-      (setcdr tools-entry filtered)
-      (dolist (item filtered)
-        (let ((tool (if (consp item) (cdr item) item)))
-          (when (macher-tool-valid-p tool)
-            (macher-agent--wrap-single-tool tool)))))))
+  "Wrap all Macher tools across default and buffer-local `gptel--known-tools'."
+  (when (default-boundp 'gptel--known-tools)
+    (macher-agent--wrap-macher-tools-in-alist (default-value 'gptel--known-tools)))
+  (when (local-variable-p 'gptel--known-tools)
+    (macher-agent--wrap-macher-tools-in-alist gptel--known-tools))
+  (dolist (buf (buffer-list))
+    (when (and (buffer-live-p buf)
+               (local-variable-p 'gptel--known-tools buf))
+      (macher-agent--wrap-macher-tools-in-alist
+       (buffer-local-value 'gptel--known-tools buf)))))
+
+(defun macher-agent-vfs--normalize-tool-list (tools &optional context)
+  "Wrap Macher structs in TOOLS and replace `search_in_workspace'.
+Uses optional CONTEXT to prefer workspace-local script overrides."
+  (let* ((ctx (or (and (macher-agent-valid-context-p context) context)
+                  (macher-agent-resolve-context)))
+         (local-reg (and (macher-agent-valid-context-p ctx)
+                         (macher-agent-context-tools ctx)))
+         (ws-search (and (hash-table-p local-reg)
+                         (not (eq local-reg macher-agent-tools-registry))
+                         (let ((cand (gethash "search_in_workspace" local-reg)))
+                           (and (macher-tool-valid-p cand)
+                                (gethash cand macher-agent--workspace-tool-overrides)
+                                cand)))))
+    (mapcar
+     (lambda (tool)
+       (if (not (macher-tool-valid-p tool))
+           tool
+         (let ((name (gptel-tool-name tool))
+               (cat (gptel-tool-category tool)))
+           (cond
+            ((and (equal name "search_in_workspace") ws-search)
+             ws-search)
+            ((and (equal name "search_in_workspace")
+                  (member cat '("macher" "macher__processed")))
+             (or (macher-agent--get-search-in-workspace-tool) tool))
+            ((equal cat "macher")
+             (macher-agent--wrap-single-tool tool)
+             tool)
+            (t tool)))))
+     tools)))
+
+(defun macher-agent-vfs--wrap-composed-tools (state)
+  "Wrap Macher tools and replace `search_in_workspace' in composed STATE."
+  (cl-check-type state list)
+  (if-let* ((tools (plist-get state :tools)))
+      (plist-put state :tools (macher-agent-vfs--normalize-tool-list tools))
+    state))
+
+(defun macher-agent-vfs--prepare-transmission (state)
+  "Wrap Macher tools and expand workspace placeholders in transmission STATE."
+  (cl-check-type state macher-agent-transmission-state)
+  (let* ((target-buf (or (macher-agent-transmission-state-target-buffer state)
+                         (current-buffer)))
+         (ctx (or (macher-agent-transmission-state-context state)
+                  (macher-agent-resolve-context target-buf)))
+         (tools (macher-agent-transmission-state-tools state))
+         (base-sys (macher-agent-transmission-state-base-prompt state)))
+    (when tools
+      (setf (macher-agent-transmission-state-tools state)
+            (macher-agent-vfs--normalize-tool-list tools ctx)))
+    (when (stringp base-sys)
+      (let ((expanded (if (and (bufferp target-buf) (buffer-live-p target-buf))
+                          (with-current-buffer target-buf
+                            (macher-agent-macher-expand-system-placeholder base-sys target-buf))
+                        (macher-agent-macher-expand-system-placeholder base-sys))))
+        (unless (equal expanded base-sys)
+          (setf (macher-agent-transmission-state-base-prompt state) expanded)
+          (setf (macher-agent-transmission-state-compiled-prompt state) expanded)))))
+  state)
 
 (defun macher-agent-vfs-install ()
   "Install VFS storage hooks, patch interfaces, and pipeline steps."
   (setq macher-agent-macher-entry-converter-function #'macher-agent-vfs-entry-to-macher-entry)
   (setq macher-agent-workspace-read-file-function #'macher-agent-vfs--workspace-read-file)
   (setq macher-agent-workspace-list-files-function #'macher-agent-vfs--workspace-list-files)
+  (macher-agent-register-pipeline-step 'preset-composition #'macher-agent-vfs--wrap-composed-tools 5)
+  (macher-agent-register-pipeline-step 'transmission #'macher-agent-vfs--prepare-transmission 25)
   (macher-agent-register-pipeline-step 'payload-merge #'macher-agent-vfs--merge-payload 10)
   (macher-agent-register-pipeline-step 'context-clone #'macher-agent-vfs--clone-context-step 10)
   (add-hook 'macher-agent-vfs-flush-hook #'macher-agent-vfs-build-patch-from-hook)
@@ -1231,10 +1370,13 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
   (add-hook 'macher-agent-context-sync-hook #'macher-agent--auto-sync-context)
   (add-hook 'macher-agent-peer-sync-hook #'macher-agent--sync-baseline-context)
   (add-hook 'macher-agent-actor-reap-hook #'macher-agent-vfs-release-actor-locks)
-  (macher-agent-macher-install #'macher-agent--collect-raw-files))
+  (macher-agent-macher-install #'macher-agent--collect-raw-files
+                               #'macher-agent--wrap-macher-tools))
 
 (defun macher-agent-vfs-uninstall ()
   "Uninstall VFS storage hooks, patch interfaces, and pipeline steps."
+  (macher-agent-unregister-pipeline-step 'preset-composition #'macher-agent-vfs--wrap-composed-tools)
+  (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-vfs--prepare-transmission)
   (macher-agent-unregister-pipeline-step 'payload-merge #'macher-agent-vfs--merge-payload)
   (macher-agent-unregister-pipeline-step 'context-clone #'macher-agent-vfs--clone-context-step)
   (remove-hook 'macher-agent-vfs-flush-hook #'macher-agent-vfs-build-patch-from-hook)

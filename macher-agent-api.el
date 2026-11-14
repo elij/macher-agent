@@ -37,6 +37,7 @@
   (macher-agent-transmission-install)
   (unless macher-agent-global-skills-alist
     (ignore-errors (macher-agent-initialize-skills)))
+  (macher-agent--wrap-macher-tools)
 
   (add-hook 'macher-agent-buffer-flush-hook #'macher-agent--flush-sweep-buffer)
   (add-hook 'gptel-prompt-transform-functions #'macher-agent--fsm-hijack-transform)

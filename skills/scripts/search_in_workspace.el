@@ -5,6 +5,7 @@
        :name "search_in_workspace"
        :description "Search for regex patterns across files in the workspace (including uncommitted VFS changes) using ripgrep (rg)."
        :category "perception"
+       :include nil
        :args '((:name "regexp" :type "string" :description "The regular expression pattern to search for.")
                (:name "path" :type "string" :description "Optional relative path or file glob to restrict the search." :optional t))
        :async t

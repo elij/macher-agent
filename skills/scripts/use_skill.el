@@ -5,6 +5,7 @@
        :name "use_skill"
        :description "Switch to a specialized skill/preset for subsequent agent operations, or restore original presets when done."
        :category "meta"
+       :include nil
        :args '((:name "skill_name" :type "string"
                       :description "The name of the skill or preset to activate, or 'done' to restore original presets."
                       :optional t)
@@ -92,8 +93,8 @@
                                  (list (macher-normalise-preset-name skill-name)))
                                 ((stringp skill-name)
                                  (let ((trimmed (string-trim skill-name)))
-                                    (unless (string-empty-p trimmed)
-                                      (list (macher-normalise-preset-name trimmed)))))
+                                   (unless (string-empty-p trimmed)
+                                     (list (macher-normalise-preset-name trimmed)))))
                                 (t nil)))
                     (skill-sym (car raw-skill)))
                (unless skill-sym

@@ -1509,41 +1509,56 @@ Also registers resolved tools in `gptel--known-tools'."
 
 (defun macher-agent--compose-merge-system-prompt (current-sys sym sys-spec)
   "Merge SYS-SPEC into CURRENT-SYS for skill SYM."
-  (let ((normalized-sym (cond
-                         ((symbolp sym) (symbol-name sym))
-                         ((stringp sym) sym)
-                         ((consp sym)
-                          (or (plist-get sym :name)
-                              (when (symbolp (car sym)) (symbol-name (car sym)))
-                              "preset"))
-                         (t "preset"))))
-    (when (and (consp sys-spec) (eq (car sys-spec) :function) (cadr sys-spec))
-      (setq sys-spec (cadr sys-spec)))
-    (unless (or (stringp sys-spec)
-                (functionp sys-spec)
-                (and (consp sys-spec) (not (keywordp (car sys-spec))))
-                (null sys-spec))
-      (signal 'wrong-type-argument `((or string function cons null) ,sys-spec)))
-    (let* ((cur (cond
-                 ((stringp current-sys) current-sys)
-                 ((listp current-sys) (string-join (delq nil current-sys) "\n---\n"))
-                 (t "")))
-           (spec-str
-            (cond
-             ((functionp sys-spec)
-              (let ((res (funcall sys-spec cur)))
-                (if (stringp res) res (format "%s" res))))
-             ((consp sys-spec)
-              (string-join (delq nil (mapcar (lambda (x) (if (stringp x) x (format "%s" x))) sys-spec)) "\n"))
-             ((stringp sys-spec) sys-spec)
-             (t "")))
-           (clean-spec (string-trim spec-str)))
-      (if (or (string-empty-p clean-spec)
-              (string-match-p (regexp-quote clean-spec) cur))
-          cur
-        (concat cur
-                (if (string-empty-p cur) "" "\n---\n")
-                (format "### Skill: %s\n%s\n" normalized-sym clean-spec))))))
+  (let* ((normalized-sym
+          (cond
+           ((symbolp sym) (symbol-name sym))
+           ((stringp sym) sym)
+           ((and (consp sym) (not (keywordp (car sym))))
+            (if (symbolp (car sym))
+                (symbol-name (car sym))
+              "preset"))
+           ((consp sym)
+            (or (plist-get sym :name)
+                (and (symbolp (plist-get sym :name-sym))
+                     (symbol-name (plist-get sym :name-sym)))
+                "preset"))
+           (t "preset")))
+         (cur (cond
+               ((stringp current-sys) current-sys)
+               ((listp current-sys) (string-join (delq nil current-sys) "\n---\n"))
+               (t ""))))
+    (cond
+     ((null sys-spec) cur)
+     ((and (consp sys-spec) (keywordp (car sys-spec)))
+      (let ((modified (gptel--modify-value cur sys-spec)))
+        (cond
+         ((stringp modified) modified)
+         ((listp modified) (string-join (delq nil modified) "\n---\n"))
+         (t (format "%s" modified)))))
+     (t
+      (unless (or (stringp sys-spec)
+                  (functionp sys-spec)
+                  (and (consp sys-spec) (not (keywordp (car sys-spec)))))
+        (signal 'wrong-type-argument `((or string function cons null) ,sys-spec)))
+      (let* ((spec-str
+              (cond
+               ((functionp sys-spec)
+                (let* ((arity (func-arity sys-spec))
+                       (res (if (eql (cdr arity) 0)
+                                (funcall sys-spec)
+                              (funcall sys-spec cur))))
+                  (if (stringp res) res (format "%s" res))))
+               ((consp sys-spec)
+                (string-join (delq nil (mapcar (lambda (x) (if (stringp x) x (format "%s" x))) sys-spec)) "\n"))
+               ((stringp sys-spec) sys-spec)
+               (t "")))
+             (clean-spec (string-trim spec-str)))
+        (if (or (string-empty-p clean-spec)
+                (string-match-p (regexp-quote clean-spec) cur))
+            cur
+          (concat cur
+                  (if (string-empty-p cur) "" "\n---\n")
+                  (format "### Skill: %s\n%s\n" normalized-sym clean-spec))))))))
 
 (defun macher-agent--compose-merge-tools (current-tools tools-spec)
   "Merge TOOLS-SPEC into CURRENT-TOOLS without polluting global registries."

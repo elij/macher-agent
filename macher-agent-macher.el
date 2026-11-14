@@ -121,9 +121,20 @@ invokes ORIG-FN with CALLBACK and ARGS, and returns (result . files)."
                               marshalled-files)))
       (cons res raw-after-files))))
 
-(defun macher-agent-macher-install (&optional get-files-fn)
+(defun macher-agent-macher-expand-system-placeholder (prompt &optional buffer)
+  "Replace `macher-context-string-placeholder' in PROMPT using BUFFER."
+  (if (and (stringp prompt)
+           (stringp macher-context-string-placeholder)
+           (not (string-empty-p macher-context-string-placeholder))
+           (string-search macher-context-string-placeholder prompt)
+           (fboundp 'macher--system-replace-placeholder))
+      (macher--system-replace-placeholder prompt buffer)
+    prompt))
+
+(defun macher-agent-macher-install (&optional get-files-fn wrap-tools-fn)
   "Install Macher Core integration and workspace hooks idempotently.
-Optional GET-FILES-FN provides the `:get-files' workspace callback."
+Optional GET-FILES-FN provides the `:get-files' workspace callback.
+Optional WRAP-TOOLS-FN wraps or replaces upstream Macher tools."
   (let ((register-fn
          (lambda ()
            (when (boundp 'macher-workspace-types-alist)
@@ -134,7 +145,9 @@ Optional GET-FILES-FN provides the `:get-files' workspace callback."
                  (setq merged (plist-put merged :get-files get-files-fn)))
                (setf (alist-get 'agent macher-workspace-types-alist) merged)))
            (when (boundp 'macher-workspace-functions)
-             (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent)))))
+             (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent))
+           (when (functionp wrap-tools-fn)
+             (funcall wrap-tools-fn)))))
     (funcall register-fn)
     (with-eval-after-load 'macher
       (funcall register-fn))))
