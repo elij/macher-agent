@@ -19,6 +19,8 @@
 (require 'macher)
 (require 'macher-agent-core)
 
+(defvar macher-tools)
+(defvar macher-tool-prefix)
 (defvar macher-workspace-types-alist)
 (defvar macher-workspace-functions)
 (defvar macher--workspace)
@@ -26,6 +28,36 @@
 
 (defvar macher-agent-macher-entry-converter-function nil
   "Function called with (ENTRY ROOT) to convert an entry into a Macher cell.")
+
+(defun macher-agent-macher-search-tool-name ()
+  "Return the active upstream Macher workspace search tool name."
+  (let* ((entry (and (boundp 'macher-tools)
+                     (listp macher-tools)
+                     (or (cl-find-if
+                          (lambda (spec)
+                            (and (listp spec)
+                                 (eq (plist-get spec :function) 'macher--tool-search)))
+                          macher-tools)
+                         (cl-find-if
+                          (lambda (spec)
+                            (and (listp spec)
+                                 (member (plist-get spec :name)
+                                         '("search" "search_in_workspace" "macher_search"))))
+                          macher-tools))))
+         (raw-name (plist-get entry :name)))
+    (cond
+     ((equal raw-name "search")
+      (concat (if (and (boundp 'macher-tool-prefix)
+                       (stringp macher-tool-prefix))
+                  macher-tool-prefix
+                "macher_")
+              raw-name))
+     ((and (stringp raw-name) (not (string-empty-p raw-name)))
+      raw-name)
+     ((and (boundp 'macher-tool-prefix)
+           (stringp macher-tool-prefix))
+      (concat macher-tool-prefix "search"))
+     (t "search_in_workspace"))))
 
 (defun macher-agent-macher-safe-workspace-hash (context)
   "Generate a safe 16-character hash strictly from the CONTEXT struct."

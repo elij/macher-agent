@@ -1125,18 +1125,53 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
                                  nil nil #'equal)))
             (and (macher-tool-valid-p perc) perc))))))
 
+(defun macher-agent--search-tool-names ()
+  "Return candidate names for the Macher workspace search tool."
+  (delete-dups
+   (list (macher-agent-macher-search-tool-name)
+         "search_in_workspace"
+         "macher_search")))
+
+(defun macher-agent--search-tool-name-p (name)
+  "Return non-nil when NAME identifies a Macher workspace search tool."
+  (and name
+       (member (if (stringp name) name (format "%s" name))
+               (macher-agent--search-tool-names))
+       t))
+
+(defun macher-agent--named-tool-copy (tool target-name &optional force-copy)
+  "Return TOOL or a shallow copy renamed to TARGET-NAME.
+When FORCE-COPY is non-nil, always allocate a distinct struct copy.
+Preserves wrapped status and workspace PTC override mappings."
+  (if (or (not (macher-tool-valid-p tool))
+          (and (not force-copy)
+               (or (not (stringp target-name))
+                   (string-empty-p target-name)
+                   (equal (gptel-tool-name tool) target-name))))
+      tool
+    (let ((copy (if (fboundp 'gptel--copy-tool)
+                    (gptel--copy-tool tool)
+                  (copy-sequence tool))))
+      (when (and (stringp target-name) (not (string-empty-p target-name)))
+        (setf (gptel-tool-name copy) target-name))
+      (puthash copy t macher-agent--wrapped-tools-hash)
+      (when (and (boundp 'macher-agent--workspace-tool-overrides)
+                 (hash-table-p macher-agent--workspace-tool-overrides))
+        (when-let* ((ws-fn (gethash tool macher-agent--workspace-tool-overrides)))
+          (puthash copy ws-fn macher-agent--workspace-tool-overrides)))
+      copy)))
+
 (defun macher-agent--wrap-single-tool (tool)
   "Wrap single TOOL to intercept upstream macher context and route to VFS."
   (when-let* (((not (gethash tool macher-agent--wrapped-tools-hash)))
               (tool-name (macher-agent--extract-tool-name tool)))
-    (if-let* (((string= (format "%s" tool-name) "search_in_workspace"))
+    (if-let* (((macher-agent--search-tool-name-p tool-name))
               ((member (format "%s" (gptel-tool-category tool))
                        '("macher" "macher__processed")))
               (replacement (macher-agent--get-search-in-workspace-tool)))
         (progn
           (unless (eq tool replacement)
-            (setf (gptel-tool-name tool) (gptel-tool-name replacement)
-                  (gptel-tool-function tool) (gptel-tool-function replacement)
+            (setf (gptel-tool-function tool) (gptel-tool-function replacement)
                   (gptel-tool-description tool) (gptel-tool-description replacement)
                   (gptel-tool-args tool) (gptel-tool-args replacement)
                   (gptel-tool-category tool) (gptel-tool-category replacement)
@@ -1267,18 +1302,19 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
         (puthash tool t macher-agent--wrapped-tools-hash)))))
 
 (defun macher-agent--wrap-macher-tools-in-alist (known-tools)
-  "Wrap Macher tools in KNOWN-TOOLS and inject `search_in_workspace'."
+  "Wrap Macher tools in KNOWN-TOOLS and ensure the search tool is present."
   (when-let* ((tools-entry (assoc "macher" known-tools)))
-    (unless (assoc "search_in_workspace" (cdr tools-entry))
-      (when-let* ((replacement (macher-agent--get-search-in-workspace-tool))
-                  ((macher-tool-valid-p replacement)))
-        (let ((injected (if (fboundp 'gptel--copy-tool)
-                            (gptel--copy-tool replacement)
-                          replacement)))
-          (puthash injected t macher-agent--wrapped-tools-hash)
-          (setcdr tools-entry
-                  (cons (cons "search_in_workspace" injected)
-                        (cdr tools-entry))))))
+    (unless (cl-some (lambda (item)
+                       (macher-agent--search-tool-name-p
+                        (if (consp item) (car item) (macher-agent--extract-tool-name item))))
+                     (cdr tools-entry))
+      (let ((expected-name (macher-agent-macher-search-tool-name)))
+        (when-let* ((replacement (macher-agent--get-search-in-workspace-tool))
+                    ((macher-tool-valid-p replacement)))
+          (let ((injected (macher-agent--named-tool-copy replacement expected-name t)))
+            (setcdr tools-entry
+                    (cons (cons expected-name injected)
+                          (cdr tools-entry)))))))
     (dolist (item (cdr tools-entry))
       (let ((tool (if (consp item) (cdr item) item)))
         (when (macher-tool-valid-p tool)
@@ -1297,30 +1333,50 @@ When ONLY-STAGED is non-nil, only return content from staged VFS entries."
        (buffer-local-value 'gptel--known-tools buf)))))
 
 (defun macher-agent-vfs--normalize-tool-list (tools &optional context)
-  "Wrap Macher structs in TOOLS and replace `search_in_workspace'.
+  "Wrap Macher structs in TOOLS and replace Macher search tools.
 Uses optional CONTEXT to prefer workspace-local script overrides."
   (let* ((ctx (or (and (macher-agent-valid-context-p context) context)
                   (macher-agent-resolve-context)))
          (local-reg (and (macher-agent-valid-context-p ctx)
                          (macher-agent-context-tools ctx)))
-         (ws-search (and (hash-table-p local-reg)
-                         (not (eq local-reg macher-agent-tools-registry))
-                         (let ((cand (gethash "search_in_workspace" local-reg)))
-                           (and (macher-tool-valid-p cand)
-                                (gethash cand macher-agent--workspace-tool-overrides)
-                                cand)))))
+         (ws-reg-p (and (hash-table-p local-reg)
+                        (not (eq local-reg macher-agent-tools-registry))))
+         (ws-search (and ws-reg-p
+                         (cl-some (lambda (key)
+                                    (let ((cand (gethash key local-reg)))
+                                      (and (macher-tool-valid-p cand)
+                                           (gethash cand macher-agent--workspace-tool-overrides)
+                                           cand)))
+                                  (macher-agent--search-tool-names)))))
     (mapcar
      (lambda (tool)
        (if (not (macher-tool-valid-p tool))
            tool
          (let ((name (gptel-tool-name tool))
-               (cat (gptel-tool-category tool)))
+               (cat (gptel-tool-category tool))
+               (was-ws-override (and (boundp 'macher-agent--workspace-tool-overrides)
+                                     (hash-table-p macher-agent--workspace-tool-overrides)
+                                     (gethash tool macher-agent--workspace-tool-overrides))))
            (cond
-            ((and (equal name "search_in_workspace") ws-search)
-             ws-search)
-            ((and (equal name "search_in_workspace")
-                  (member cat '("macher" "macher__processed")))
-             (or (macher-agent--get-search-in-workspace-tool) tool))
+            ((and (macher-agent--search-tool-name-p name)
+                  ws-search
+                  (or (member cat '("macher" "macher__processed" "perception"))
+                      was-ws-override
+                      (member name '("search_in_workspace" "macher_search"))))
+             (macher-agent--named-tool-copy
+              (or (and ws-reg-p
+                       (let ((exact (gethash name local-reg)))
+                         (and (macher-tool-valid-p exact)
+                              (gethash exact macher-agent--workspace-tool-overrides)
+                              exact)))
+                  ws-search)
+              name))
+            ((and (macher-agent--search-tool-name-p name)
+                  (or (member cat '("macher" "macher__processed"))
+                      was-ws-override))
+             (or (macher-agent--named-tool-copy
+                  (macher-agent--get-search-in-workspace-tool) name)
+                 tool))
             ((equal cat "macher")
              (macher-agent--wrap-single-tool tool)
              tool)
