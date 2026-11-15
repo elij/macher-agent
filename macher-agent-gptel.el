@@ -44,6 +44,7 @@
 (defvar gptel-tools)
 (defvar gptel-temperature)
 (defvar gptel-max-tokens)
+(defvar gptel--request-params)
 
 (defvar-local macher-agent--is-restored-session nil
   "Track whether current buffer is restored from a saved state.")
@@ -62,6 +63,8 @@
   model
   temperature
   max-tokens
+  request-params
+  disable-local-tools
   tools
   ptc-primitives
   known-presets
@@ -92,6 +95,60 @@
     (plist-put info :tool-use nil)
     (plist-put info :tool-result nil)
     t))
+
+(defun macher-agent--sanitize-tool-result-entries (tool-results info)
+  "Ensure each `(TOOL ARGS RESULT)' in TOOL-RESULTS holds a `gptel-tool'.
+Upstream `gptel--process-tool-call' stores nil in the TOOL slot when a
+pre-tool hook blocks an out-of-scope call or an unknown tool is requested,
+causing `gptel--display-tool-results' to signal `wrong-type-argument'."
+  (let ((tool-use (and (macher-agent--plist-p info) (plist-get info :tool-use))))
+    (mapcar
+     (lambda (entry)
+       (if (or (not (consp entry)) (gptel-tool-p (car entry)))
+           entry
+         (let* ((args (nth 1 entry))
+                (result (nth 2 entry))
+                (matched-tu
+                 (or (cl-find-if (lambda (tu)
+                                   (and (equal (plist-get tu :args) args)
+                                        (equal (plist-get tu :result) result)))
+                                 tool-use)
+                     (cl-find-if (lambda (tu)
+                                   (equal (plist-get tu :result) result))
+                                 tool-use)
+                     (car tool-use)))
+                (tname (or (and (listp matched-tu) (plist-get matched-tu :name))
+                           "unknown_tool")))
+           (list (gptel-make-tool
+                  :name (format "%s" tname)
+                  :description "Blocked or unavailable tool"
+                  :function #'ignore
+                  :include t)
+                 args
+                 result))))
+     tool-results)))
+
+(defun macher-agent--sanitize-fsm-tool-results (fsm)
+  "Sanitise `:tools' and `:tool-result' on FSM before `TRET' display handlers."
+  (when (and fsm (fboundp 'gptel-fsm-info))
+    (let ((info (gptel-fsm-info fsm)))
+      (when (macher-agent--plist-p info)
+        (let ((tools (plist-get info :tools))
+              (tool-results (plist-get info :tool-result))
+              (updated nil))
+          (when (and (listp tools) (cl-some (lambda (tl) (not (gptel-tool-p tl))) tools))
+            (setq info (plist-put (copy-sequence info) :tools
+                                  (cl-remove-if-not #'gptel-tool-p tools))
+                  updated t))
+          (when (and (listp tool-results)
+                     (cl-some (lambda (tr) (not (gptel-tool-p (car-safe tr)))) tool-results))
+            (unless updated (setq info (copy-sequence info)))
+            (setq info (plist-put info :tool-result
+                                  (macher-agent--sanitize-tool-result-entries tool-results info))
+                  updated t))
+          (when updated
+            (macher-agent--set-fsm-info fsm info)
+            (setf (gptel-fsm-info fsm) info)))))))
 
 (defun macher-agent--install-tret-done-edge (fsm)
   "Ensure transition table for FSM routes `TRET' to `DONE' on staged submit."
@@ -158,13 +215,30 @@
                                              actual-fsm))
                                 (with-current-buffer target-buf
                                   (setq-local macher-agent--active-fsm nil)))
+                              (when (and (consp (car cb-args))
+                                         (eq (caar cb-args) 'tool-result))
+                                (let* ((cb-info (cadr cb-args))
+                                       (raw-tr (cdar cb-args))
+                                       (cb-tools (and (macher-agent--plist-p cb-info)
+                                                      (plist-get cb-info :tools))))
+                                  (when (and (listp cb-tools)
+                                             (cl-some (lambda (tl) (not (gptel-tool-p tl))) cb-tools))
+                                    (setq cb-info (plist-put (copy-sequence cb-info) :tools
+                                                             (cl-remove-if-not #'gptel-tool-p cb-tools)))
+                                    (setcar (cdr cb-args) cb-info))
+                                  (when (and (listp raw-tr)
+                                             (cl-some (lambda (tr) (not (gptel-tool-p (car-safe tr)))) raw-tr))
+                                    (setcar cb-args
+                                            (cons 'tool-result
+                                                  (macher-agent--sanitize-tool-result-entries
+                                                   raw-tr cb-info))))))
                               (apply orig-cb cb-args)))))
         (macher-agent--set-fsm-info actual-fsm inf)
         (setf (gptel-fsm-info actual-fsm) inf)))
 
     (when actual-fsm
       (let* ((handlers (gptel-fsm-handlers actual-fsm))
-             (all-states (delete-dups (append (mapcar #'car handlers) '(WAIT DONE ERRS ABRT))))
+             (all-states (delete-dups (append (mapcar #'car handlers) '(WAIT TRET DONE ERRS ABRT))))
              (augmented-handlers
               (cl-loop for state in all-states
                        for funcs = (alist-get state handlers)
@@ -174,6 +248,10 @@
                                        (if (memq #'macher-agent--inject-media-fsm-logic funcs)
                                            funcs
                                          (cons #'macher-agent--inject-media-fsm-logic funcs)))
+                                      ((eq state 'TRET)
+                                       (if (memq #'macher-agent--sanitize-fsm-tool-results funcs)
+                                           funcs
+                                         (cons #'macher-agent--sanitize-fsm-tool-results funcs)))
                                       ((memq state '(DONE ERRS ABRT))
                                        (if (memq #'macher-agent-gptel--trigger-flush funcs)
                                            funcs
@@ -398,6 +476,8 @@ unconditionally; otherwise run it only when buffer state diverges."
       (setq new-info (plist-put new-info :model model))
       (setq new-info (plist-put new-info :temperature (macher-agent-transmission-state-temperature state)))
       (setq new-info (plist-put new-info :max-tokens (macher-agent-transmission-state-max-tokens state)))
+      (setq new-info (plist-put new-info :request-params (macher-agent-transmission-state-request-params state)))
+      (setq new-info (plist-put new-info :disable-local-tools (macher-agent-transmission-state-disable-local-tools state)))
       (setq new-info (plist-put new-info :tools tools))
       (setq new-info (plist-put new-info :ptc-primitives
                                 (macher-agent-transmission-state-ptc-primitives state)))
@@ -574,7 +654,8 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                (inherited (macher-agent-transmission-state-tools state))
                (local-p (local-variable-p 'gptel-tools target-buf))
                (buf-tools (when (boundp 'gptel-tools) gptel-tools))
-               (tools-suppressed (and local-p (null buf-tools)))
+               (was-toolless (buffer-local-value 'macher-agent--disable-local-tools target-buf))
+               (tools-suppressed (and local-p (null buf-tools) (not was-toolless)))
                (merged-tools (unless tools-suppressed
                                (macher-agent--merge-tools inherited buf-tools)))
                (refreshed-tools
@@ -588,6 +669,11 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
           (setf (macher-agent-transmission-state-compiled-prompt state) gptel-system-prompt)
           (setf (macher-agent-transmission-state-temperature state) (bound-and-true-p gptel-temperature))
           (setf (macher-agent-transmission-state-max-tokens state) (bound-and-true-p gptel-max-tokens))
+          (setf (macher-agent-transmission-state-request-params state)
+                (when (local-variable-p 'gptel--request-params target-buf)
+                  (buffer-local-value 'gptel--request-params target-buf)))
+          (setf (macher-agent-transmission-state-disable-local-tools state)
+                (buffer-local-value 'macher-agent--disable-local-tools target-buf))
           (setf (macher-agent-transmission-state-tools state) refreshed-tools)
           (setf (macher-agent-transmission-state-ptc-primitives state)
                 (bound-and-true-p macher-agent--active-ptc-primitives))
@@ -595,6 +681,16 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                 (when (local-variable-p 'gptel--known-presets target-buf)
                   (buffer-local-value 'gptel--known-presets target-buf)))
           (when preset-spec
+            (when (and (macher-agent-transmission-state-disable-local-tools state)
+                       (not (plist-get preset-spec :disable-local-tools)))
+              (setf (macher-agent-transmission-state-disable-local-tools state) nil))
+            (when (and (not (assq 'gptel--request-params flv))
+                       (not (plist-member preset-spec :request-params))
+                       (local-variable-p 'macher-agent--preset-request-params target-buf)
+                       (buffer-local-value 'macher-agent--preset-request-params target-buf)
+                       (equal (macher-agent-transmission-state-request-params state)
+                              (buffer-local-value 'macher-agent--preset-request-params target-buf)))
+              (setf (macher-agent-transmission-state-request-params state) nil))
             (let* ((has-flv-tools
                     (or (assq 'gptel--tool-names flv)
                         (assq 'gptel-tools flv)
@@ -627,6 +723,8 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                 (cl-remf filtered-spec :temperature))
               (when (assq 'gptel-max-tokens flv)
                 (cl-remf filtered-spec :max-tokens))
+              (when (assq 'gptel--request-params flv)
+                (cl-remf filtered-spec :request-params))
               (when (or has-flv-sys direct-sys)
                 (cl-remf filtered-spec :system)
                 (cl-remf filtered-spec :system-message))
@@ -640,6 +738,8 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                             :model (macher-agent-transmission-state-model state)
                             :temperature (macher-agent-transmission-state-temperature state)
                             :max-tokens (macher-agent-transmission-state-max-tokens state)
+                            :request-params (macher-agent-transmission-state-request-params state)
+                            :disable-local-tools (macher-agent-transmission-state-disable-local-tools state)
                             :system (or direct-sys
                                         (macher-agent-transmission-state-base-prompt state))
                             :tools refreshed-tools
@@ -649,17 +749,29 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                 (setf (macher-agent-transmission-state-backend state) (plist-get composed :backend))
                 (setf (macher-agent-transmission-state-temperature state) (plist-get composed :temperature))
                 (setf (macher-agent-transmission-state-max-tokens state) (plist-get composed :max-tokens))
+                (unless (assq 'gptel--request-params flv)
+                  (setf (macher-agent-transmission-state-request-params state)
+                        (plist-get composed :request-params)))
+                (setf (macher-agent-transmission-state-disable-local-tools state)
+                      (plist-get composed :disable-local-tools))
                 (unless has-flv-sys
                   (let ((final-sys (or direct-sys (plist-get composed :system))))
                     (setf (macher-agent-transmission-state-base-prompt state) final-sys)
                     (setf (macher-agent-transmission-state-compiled-prompt state) final-sys)))
-                (when (and (not tools-suppressed) (not has-flv-tools))
-                  (setf (macher-agent-transmission-state-tools state)
-                        (mapcar (lambda (tl)
-                                  (macher-agent--refresh-tool-struct tl active-context))
-                                (plist-get composed :tools))))
-                (setf (macher-agent-transmission-state-ptc-primitives state)
-                      (plist-get composed :ptc-primitives)))))))))
+                (if (macher-agent-transmission-state-disable-local-tools state)
+                    (progn
+                      (setf (macher-agent-transmission-state-tools state) nil)
+                      (setf (macher-agent-transmission-state-ptc-primitives state) nil))
+                  (when (and (not tools-suppressed) (not has-flv-tools))
+                    (setf (macher-agent-transmission-state-tools state)
+                          (mapcar (lambda (tl)
+                                    (macher-agent--refresh-tool-struct tl active-context))
+                                  (plist-get composed :tools))))
+                  (setf (macher-agent-transmission-state-ptc-primitives state)
+                        (plist-get composed :ptc-primitives))))))
+          (when (macher-agent-transmission-state-disable-local-tools state)
+            (setf (macher-agent-transmission-state-tools state) nil)
+            (setf (macher-agent-transmission-state-ptc-primitives state) nil))))))
   state)
 
 (defun macher-agent-pipe--apply-skills-and-presets (state)
@@ -676,7 +788,9 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                                   :tools (macher-agent-transmission-state-tools state)
                                   :ptc-primitives (macher-agent-transmission-state-ptc-primitives state)
                                   :temperature (macher-agent-transmission-state-temperature state)
-                                  :max-tokens (macher-agent-transmission-state-max-tokens state)))
+                                  :max-tokens (macher-agent-transmission-state-max-tokens state)
+                                  :request-params (macher-agent-transmission-state-request-params state)
+                                  :disable-local-tools (macher-agent-transmission-state-disable-local-tools state)))
              (composed (if (and target-buf (buffer-live-p target-buf))
                            (with-current-buffer target-buf
                              (macher-agent-compose-payload payload-plist combined-modules))
@@ -691,30 +805,40 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
           (setf (macher-agent-transmission-state-temperature state) (plist-get composed :temperature)))
         (when (plist-get composed :max-tokens)
           (setf (macher-agent-transmission-state-max-tokens state) (plist-get composed :max-tokens)))
-        (when (plist-member composed :tools)
-          (setf (macher-agent-transmission-state-tools state) (plist-get composed :tools)))
-        (when (plist-member composed :ptc-primitives)
-          (setf (macher-agent-transmission-state-ptc-primitives state)
-                (plist-get composed :ptc-primitives))))))
+        (when (plist-member composed :request-params)
+          (setf (macher-agent-transmission-state-request-params state) (plist-get composed :request-params)))
+        (when (plist-member composed :disable-local-tools)
+          (setf (macher-agent-transmission-state-disable-local-tools state)
+                (plist-get composed :disable-local-tools)))
+        (if (macher-agent-transmission-state-disable-local-tools state)
+            (progn
+              (setf (macher-agent-transmission-state-tools state) nil)
+              (setf (macher-agent-transmission-state-ptc-primitives state) nil))
+          (when (plist-member composed :tools)
+            (setf (macher-agent-transmission-state-tools state) (plist-get composed :tools)))
+          (when (plist-member composed :ptc-primitives)
+            (setf (macher-agent-transmission-state-ptc-primitives state)
+                  (plist-get composed :ptc-primitives)))))))
   state)
 
 (defun macher-agent-pipe--inject-dynamic-context-tools (state)
   "Inject dynamic context tools into STATE when buffer exceeds `max-chars'."
   (cl-check-type state macher-agent-transmission-state)
-  (let* ((target-buf (or (macher-agent-transmission-state-target-buffer state)
-                         (current-buffer)))
-         (max-chars (macher-agent--get-max-context-chars
-                     target-buf (macher-agent-transmission-state-model state)))
-         (buf-size (if (and target-buf (buffer-live-p target-buf))
-                       (with-current-buffer target-buf (buffer-size))
-                     0)))
-    (when (> buf-size max-chars)
-      (let ((ctx (or (macher-agent-transmission-state-context state)
-                     (macher-agent-resolve-context target-buf))))
-        (setf (macher-agent-transmission-state-tools state)
-              (macher-agent--ensure-tool-in-list
-               (macher-agent-transmission-state-tools state)
-               "search_conversation_history" ctx target-buf)))))
+  (unless (macher-agent-transmission-state-disable-local-tools state)
+    (let* ((target-buf (or (macher-agent-transmission-state-target-buffer state)
+                           (current-buffer)))
+           (max-chars (macher-agent--get-max-context-chars
+                       target-buf (macher-agent-transmission-state-model state)))
+           (buf-size (if (and target-buf (buffer-live-p target-buf))
+                         (with-current-buffer target-buf (buffer-size))
+                       0)))
+      (when (> buf-size max-chars)
+        (let ((ctx (or (macher-agent-transmission-state-context state)
+                       (macher-agent-resolve-context target-buf))))
+          (setf (macher-agent-transmission-state-tools state)
+                (macher-agent--ensure-tool-in-list
+                 (macher-agent-transmission-state-tools state)
+                 "search_conversation_history" ctx target-buf))))))
   state)
 
 (defun macher-agent-pipe--process-hidden-blocks (state)
@@ -725,32 +849,34 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
 (defun macher-agent-pipe--auto-retain-use-skill (state)
   "Retain `use_skill' in STATE when target buffer has cached presets."
   (cl-check-type state macher-agent-transmission-state)
-  (let ((target-buf (or (macher-agent-transmission-state-target-buffer state)
-                        (current-buffer))))
-    (when (macher-agent--has-cached-skill-state-p target-buf)
-      (let ((ctx (or (macher-agent-transmission-state-context state)
-                     (macher-agent-resolve-context target-buf))))
-        (setf (macher-agent-transmission-state-tools state)
-              (macher-agent--ensure-tool-in-list
-               (macher-agent-transmission-state-tools state)
-               "use_skill" ctx target-buf 'macher-agent-use-skill-tool)))))
+  (unless (macher-agent-transmission-state-disable-local-tools state)
+    (let ((target-buf (or (macher-agent-transmission-state-target-buffer state)
+                          (current-buffer))))
+      (when (macher-agent--has-cached-skill-state-p target-buf)
+        (let ((ctx (or (macher-agent-transmission-state-context state)
+                       (macher-agent-resolve-context target-buf))))
+          (setf (macher-agent-transmission-state-tools state)
+                (macher-agent--ensure-tool-in-list
+                 (macher-agent-transmission-state-tools state)
+                 "use_skill" ctx target-buf 'macher-agent-use-skill-tool))))))
   state)
 
 (defun macher-agent-pipe--auto-enable-task-tool (state)
   "Auto-enable `submit_task_result' in STATE when a task or route is active."
   (cl-check-type state macher-agent-transmission-state)
-  (let* ((target-buf (or (macher-agent-transmission-state-target-buffer state)
-                         (current-buffer)))
-         (has-task (when (and target-buf (buffer-live-p target-buf))
-                     (or (buffer-local-value 'macher-agent--routing-stack target-buf)
-                         (buffer-local-value 'macher-agent--current-task-id target-buf)))))
-    (when has-task
-      (let ((ctx (or (macher-agent-transmission-state-context state)
-                     (macher-agent-resolve-context target-buf))))
-        (setf (macher-agent-transmission-state-tools state)
-              (macher-agent--ensure-tool-in-list
-               (macher-agent-transmission-state-tools state)
-               "submit_task_result" ctx target-buf 'macher-agent-submit-task-result-tool)))))
+  (unless (macher-agent-transmission-state-disable-local-tools state)
+    (let* ((target-buf (or (macher-agent-transmission-state-target-buffer state)
+                           (current-buffer)))
+           (has-task (when (and target-buf (buffer-live-p target-buf))
+                       (or (buffer-local-value 'macher-agent--routing-stack target-buf)
+                           (buffer-local-value 'macher-agent--current-task-id target-buf)))))
+      (when has-task
+        (let ((ctx (or (macher-agent-transmission-state-context state)
+                       (macher-agent-resolve-context target-buf))))
+          (setf (macher-agent-transmission-state-tools state)
+                (macher-agent--ensure-tool-in-list
+                 (macher-agent-transmission-state-tools state)
+                 "submit_task_result" ctx target-buf 'macher-agent-submit-task-result-tool))))))
   state)
 
 (defun macher-agent-pipe--init-core-directives (state)
@@ -824,10 +950,11 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
                              (macher-agent--merge-preset-meta sym base-spec lookup-spec))
                          (or base-spec lookup-spec)))
                  (is-cmd (and (listp spec) (plist-get spec :is-command)))
+                 (toolless (and (listp spec) (plist-get spec :disable-local-tools)))
                  (name (cond ((symbolp sym) (symbol-name sym))
                              ((stringp sym) sym)
                              (t (format "%s" sym)))))
-            (unless (or is-cmd (gethash name seen))
+            (unless (or is-cmd toolless (gethash name seen))
               (puthash name t seen)
               (let ((desc (cond
                            ((and (listp spec) (plist-get spec :description))
@@ -1061,6 +1188,64 @@ Uses optional COUNTS and USED tables from prior buffer tool blocks."
                      (push p acc)))))))))
     (append prompts open-prompts)))
 
+(defun macher-agent--flatten-wire-tool-regions ()
+  "Convert `(tool . _)' `gptel' properties in wire buffer to `response'.
+Deletes `'ignore' spans so adjacent `'response' regions coalesce."
+  (let ((inhibit-read-only t)
+        (ignore-ranges nil)
+        (pos (point-min)))
+    (while (< pos (point-max))
+      (let ((prop (get-char-property pos 'gptel))
+            (next (next-single-property-change pos 'gptel nil (point-max))))
+        (cond
+         ((and (consp prop) (eq (car prop) 'tool))
+          (put-text-property pos next 'gptel 'response))
+         ((eq prop 'ignore)
+          (push (cons pos next) ignore-ranges)))
+        (setq pos next)))
+    (dolist (rng ignore-ranges)
+      (delete-region (car rng) (cdr rng)))))
+
+(defun macher-agent--sanitize-prompts-for-toolless (prompts)
+  "Flatten `:functionCall' and `:functionResponse' parts in PROMPTS to `:text'."
+  (when (listp prompts)
+    (macher-agent--merge-parallel-open-prompts
+     (mapcar
+      (lambda (msg)
+        (if (not (and (listp msg) (vectorp (plist-get msg :parts))))
+            msg
+          (let* ((parts (plist-get msg :parts))
+                 (changed nil)
+                 (new-parts
+                  (vconcat
+                   (mapcar
+                    (lambda (part)
+                      (cond
+                       ((and (listp part) (plist-member part :functionCall))
+                        (setq changed t)
+                        (let ((fc (plist-get part :functionCall)))
+                          (list :text
+                                (format "[Prior tool call %s(%S)]"
+                                        (or (plist-get fc :name) "tool")
+                                        (plist-get fc :args)))))
+                       ((and (listp part) (plist-member part :functionResponse))
+                        (setq changed t)
+                        (let* ((fr (plist-get part :functionResponse))
+                               (inner (plist-get fr :response))
+                               (content (if (listp inner)
+                                            (plist-get inner :content)
+                                          inner)))
+                          (list :text
+                                (format "[Prior tool result %s: %s]"
+                                        (or (plist-get fr :name) "tool")
+                                        (or content "")))))
+                       (t part)))
+                    parts))))
+            (if changed
+                (plist-put (copy-sequence msg) :parts new-parts)
+              msg))))
+      prompts))))
+
 (defun macher-agent--resolve-backend-url (backend model info)
   "Resolve URL string for BACKEND and MODEL given FSM INFO, or nil."
   (when (and backend (fboundp 'gptel-backend-p) (gptel-backend-p backend))
@@ -1105,6 +1290,10 @@ NORMALIZED-TOOLS, MODEL, and BACKEND, tracking transitions from PREV-BACKEND."
            (effective-prev-backend (or prev-backend info-backend))
            (backend-changed-p (and effective-backend effective-prev-backend
                                    (not (eq effective-backend effective-prev-backend))))
+           (disable-local-tools (and is-plist (plist-get info :disable-local-tools)))
+           (has-req-params (and is-plist (plist-member info :request-params)))
+           (req-params (when has-req-params (plist-get info :request-params)))
+           (effective-tools (unless disable-local-tools normalized-tools))
            (info-updated nil))
       (when is-plist
         (when (and backend (not (eq backend info-backend)))
@@ -1115,14 +1304,18 @@ NORMALIZED-TOOLS, MODEL, and BACKEND, tracking transitions from PREV-BACKEND."
           (unless info-updated (setq info (copy-sequence info)))
           (setq info (plist-put info :model model)
                 info-updated t))
+        (when (and disable-local-tools (plist-get info :tools))
+          (unless info-updated (setq info (copy-sequence info)))
+          (setq info (plist-put info :tools nil)
+                info-updated t))
         (cond
-         ((and normalized-tools
+         ((and effective-tools
                (eq (bound-and-true-p gptel-use-tools) 'force)
                (not (eq (plist-get info :use-tools) 'force)))
           (unless info-updated (setq info (copy-sequence info)))
           (setq info (plist-put info :use-tools 'force)
                 info-updated t))
-         ((and (null normalized-tools)
+         ((and (null effective-tools)
                (plist-member info :use-tools))
           (unless info-updated (setq info (copy-sequence info)))
           (cl-remf info :use-tools)
@@ -1166,31 +1359,41 @@ NORMALIZED-TOOLS, MODEL, and BACKEND, tracking transitions from PREV-BACKEND."
                 (when (and (stringp compiled-prompt)
                            (not (string-empty-p compiled-prompt)))
                   compiled-prompt))
-               (gptel-tools normalized-tools)
+               (gptel-tools effective-tools)
                (gptel-use-tools
-                (if normalized-tools
+                (if effective-tools
                     (if (or (eq (bound-and-true-p gptel-use-tools) 'force)
                             (eq (plist-get info :use-tools) 'force))
                         'force
                       (or (bound-and-true-p gptel-use-tools) t))
                   nil))
+               (gptel--request-params
+                (if has-req-params
+                    req-params
+                  (bound-and-true-p gptel--request-params)))
                (gptel-stream (plist-get info :stream))
                (gptel-temperature (or (plist-get info :temperature)
                                       (bound-and-true-p gptel-temperature)))
                (gptel-max-tokens (or (plist-get info :max-tokens)
                                      (bound-and-true-p gptel-max-tokens)))
-               (prompts (if backend-changed-p
-                            (macher-agent--build-prompts-from-buffer
-                             (plist-get info :buffer)
-                             effective-backend
-                             (plist-get info :tool-use)
-                             info)
-                          (or (macher-agent--existing-prompts-from-data data)
-                              (macher-agent--build-prompts-from-buffer
-                               (plist-get info :buffer)
-                               effective-backend
-                               (plist-get info :tool-use)
-                               info))))
+               (raw-prompts
+                (if backend-changed-p
+                    (macher-agent--build-prompts-from-buffer
+                     (plist-get info :buffer)
+                     effective-backend
+                     (unless disable-local-tools (plist-get info :tool-use))
+                     info)
+                  (or (macher-agent--existing-prompts-from-data data)
+                      (macher-agent--build-prompts-from-buffer
+                       (plist-get info :buffer)
+                       effective-backend
+                       (unless disable-local-tools (plist-get info :tool-use))
+                       info))))
+               (prompts
+                (if (and disable-local-tools
+                         (eq (type-of effective-backend) 'gptel-gemini))
+                    (macher-agent--sanitize-prompts-for-toolless raw-prompts)
+                  raw-prompts))
                (reencoded (condition-case nil
                               (gptel--request-data effective-backend prompts)
                             (error nil))))
@@ -1276,26 +1479,46 @@ Leaves the buffer prompt unmodified."
                       ((stringp raw-sys)))
             (setq-local gptel-system-prompt raw-sys)))
         (let* ((known (bound-and-true-p gptel--known-presets))
+               (use-skill-active (macher-agent--has-cached-skill-state-p target-buf))
+               (fsm-inline-skills (when (and matching-fsm (not use-skill-active))
+                                    (plist-get fsm-info :inline-skills)))
+               (fsm-redirected-skill (when (and matching-fsm (not use-skill-active))
+                                       (plist-get fsm-info :redirected-skill)))
+               (has-ephemeral-inline (or fsm-inline-skills fsm-redirected-skill))
                (tx-skills (macher-agent--transformer-resolve-skills
-                           buffer-presets nil known ctx target-buf))
+                           buffer-presets fsm-inline-skills known ctx target-buf))
                (state (macher-agent--compile-transmission-payload
-                       target-buf buffer-presets tx-skills nil ctx
+                       target-buf buffer-presets tx-skills fsm-redirected-skill ctx
                        (if has-live-request-data t :preserve)))
-               (norm-tools (macher-agent-normalize-tools
-                            (macher-agent-transmission-state-tools state)))
+               (norm-tools (unless (macher-agent-transmission-state-disable-local-tools state)
+                             (macher-agent-normalize-tools
+                              (macher-agent-transmission-state-tools state))))
                (resolved-model (macher-agent-transmission-state-model state))
                (resolved-backend (macher-agent-transmission-state-backend state)))
           (setf (macher-agent-transmission-state-tools state) norm-tools)
-          (when (macher-agent--has-cached-skill-state-p target-buf)
-            (setq-local gptel-tools
-                        (macher-agent--ensure-tool-in-list
-                         gptel-tools "use_skill" ctx target-buf 'macher-agent-use-skill-tool)))
-          (when (and resolved-model (not (assq 'gptel-model flv)))
-            (setq-local gptel-model resolved-model))
-          (when (and resolved-backend
-                     (not (assq 'gptel-backend flv))
-                     (not (assq 'gptel--backend-name flv)))
-            (setq-local gptel-backend resolved-backend))
+          (unless has-ephemeral-inline
+            (if (macher-agent-transmission-state-disable-local-tools state)
+                (setq-local gptel-tools nil)
+              (when use-skill-active
+                (setq-local gptel-tools
+                            (macher-agent--ensure-tool-in-list
+                             gptel-tools "use_skill" ctx target-buf 'macher-agent-use-skill-tool))))
+            (unless (assq 'gptel--request-params flv)
+              (let ((rp (macher-agent-transmission-state-request-params state)))
+                (if rp
+                    (progn
+                      (setq-local gptel--request-params rp)
+                      (setq-local macher-agent--preset-request-params rp))
+                  (kill-local-variable 'gptel--request-params)
+                  (setq-local macher-agent--preset-request-params nil))))
+            (setq-local macher-agent--disable-local-tools
+                        (and (macher-agent-transmission-state-disable-local-tools state) t))
+            (when (and resolved-model (not (assq 'gptel-model flv)))
+              (setq-local gptel-model resolved-model))
+            (when (and resolved-backend
+                       (not (assq 'gptel-backend flv))
+                       (not (assq 'gptel--backend-name flv)))
+              (setq-local gptel-backend resolved-backend)))
           (when matching-fsm
             (macher-agent--update-fsm-info-from-transmission-state matching-fsm state))
           state)))))
@@ -1337,9 +1560,23 @@ Leaves the buffer prompt unmodified."
                                    (plist-get redirected-skill :backend)
                                  (or (plist-get spec :backend)
                                      (plist-get redirect-state :backend))))
+             (redirect-req-params (if is-plist
+                                      (plist-get redirected-skill :request-params)
+                                    (or (plist-get spec :request-params)
+                                        (plist-get redirect-state :request-params))))
+             (redirect-disable-tools (if is-plist
+                                         (plist-get redirected-skill :disable-local-tools)
+                                       (or (plist-get spec :disable-local-tools)
+                                           (plist-get redirect-state :disable-local-tools))))
              (is-command (if is-plist
                              (plist-get redirected-skill :is-command)
                            (plist-get spec :is-command))))
+        (when (or redirect-req-params redirect-disable-tools)
+          (setf (macher-agent-transmission-state-request-params state) redirect-req-params))
+        (when redirect-disable-tools
+          (setf (macher-agent-transmission-state-disable-local-tools state) t)
+          (setf (macher-agent-transmission-state-tools state) nil)
+          (setf (macher-agent-transmission-state-ptc-primitives state) nil))
         (when (or redirect-model redirect-backend)
           (pcase-let ((`(,resolved-backend . ,resolved-model)
                        (macher-agent--resolve-model-and-backend
@@ -1374,7 +1611,8 @@ Leaves the buffer prompt unmodified."
             (setf (macher-agent-transmission-state-redirect-prompt state) redirect-text)
             (setf (macher-agent-transmission-state-base-prompt state) redirect-text)
             (setf (macher-agent-transmission-state-compiled-prompt state) redirect-text)))
-        (when redirect-tools
+        (when (and redirect-tools
+                   (not (macher-agent-transmission-state-disable-local-tools state)))
           (setf (macher-agent-transmission-state-tools state)
                 (append redirect-tools (macher-agent-transmission-state-tools state)))))))
   state)
@@ -1443,25 +1681,36 @@ Invokes ASYNC-FN when transformation finishes."
            (state (macher-agent--compile-transmission-payload
                    orig-buf buffer-presets transmission-skills redirected-skill context))
            (normalized-tools
-            (if (buffer-live-p orig-buf)
-                (with-current-buffer orig-buf
-                  (macher-agent-normalize-tools (macher-agent-transmission-state-tools state)))
-              (macher-agent-normalize-tools (macher-agent-transmission-state-tools state))))
+            (unless (macher-agent-transmission-state-disable-local-tools state)
+              (if (buffer-live-p orig-buf)
+                  (with-current-buffer orig-buf
+                    (macher-agent-normalize-tools (macher-agent-transmission-state-tools state)))
+                (macher-agent-normalize-tools (macher-agent-transmission-state-tools state)))))
            (payload (list :model (macher-agent-transmission-state-model state)
                           :backend (or (macher-agent-transmission-state-backend state)
                                        (when (buffer-live-p orig-buf) (buffer-local-value 'gptel-backend orig-buf)))
                           :temperature (macher-agent-transmission-state-temperature state)
                           :max-tokens (macher-agent-transmission-state-max-tokens state)
+                          :request-params (macher-agent-transmission-state-request-params state)
+                          :disable-local-tools (macher-agent-transmission-state-disable-local-tools state)
                           :tools normalized-tools
                           :ptc-primitives (macher-agent-transmission-state-ptc-primitives state))))
 
       (setf (macher-agent-transmission-state-tools state) normalized-tools)
       (macher-agent--apply-payload-locally payload)
+      (when (and (macher-agent-transmission-state-disable-local-tools state)
+                 (not (eq temp-buf orig-buf)))
+        (setq-local gptel-use-tools nil))
 
       (when-let* ((compiled (macher-agent-transmission-state-compiled-prompt state)))
         (setq-local gptel-system-prompt compiled))
 
       (when active-fsm
+        (let ((inf (copy-sequence (gptel-fsm-info active-fsm))))
+          (setq inf (plist-put inf :inline-skills inline-skills))
+          (setq inf (plist-put inf :redirected-skill redirected-skill))
+          (macher-agent--set-fsm-info active-fsm inf)
+          (setf (gptel-fsm-info active-fsm) inf))
         (macher-agent--update-fsm-info-from-transmission-state active-fsm state))
 
       (when-let* ((redirect-text (macher-agent-transmission-state-redirect-prompt state)))
@@ -1474,6 +1723,10 @@ Invokes ASYNC-FN when transformation finishes."
             (with-no-warnings (setf (gptel-fsm-prompt active-fsm) redirect-text)))
           (macher-agent--set-fsm-info active-fsm
                                       (plist-put (gptel-fsm-info active-fsm) :prompt redirect-text))))
+
+      (when (and (macher-agent-transmission-state-disable-local-tools state)
+                 (not (eq temp-buf orig-buf)))
+        (macher-agent--flatten-wire-tool-regions))
 
       (unless (eq temp-buf orig-buf)
         (setq-local gptel--known-presets nil)))
@@ -1505,6 +1758,31 @@ Invokes ASYNC-FN when transformation finishes."
           (null sub-id)
           (equal sub-id expected-task-id)))))
 
+(defun macher-agent--extract-turn-response-text (&optional beg end)
+  "Extract assistant response text between BEG and END, skipping ignored blocks."
+  (let* ((has-bounds (and (integer-or-marker-p beg)
+                          (integer-or-marker-p end)
+                          (< beg end)))
+         (b (if has-bounds (max (point-min) (min (point-max) beg)) (point-min)))
+         (e (if has-bounds (max (point-min) (min (point-max) end)) (point-max)))
+         (response-parts nil)
+         (non-ignored-parts nil)
+         (pos b))
+    (while (< pos e)
+      (let* ((prop (get-char-property pos 'gptel))
+             (next (min e (next-single-property-change pos 'gptel nil e)))
+             (chunk (buffer-substring-no-properties pos next)))
+        (when (eq prop 'response)
+          (push chunk response-parts))
+        (unless (or (eq prop 'ignore)
+                    (and (consp prop) (eq (car prop) 'reasoning)))
+          (push chunk non-ignored-parts))
+        (setq pos next)))
+    (string-trim
+     (if response-parts
+         (apply #'concat (nreverse response-parts))
+       (apply #'concat (nreverse non-ignored-parts))))))
+
 (defun macher-agent--make-transmit-response-hook (on-error &optional on-success expected-task-id)
   "Build response hook invoking ON-ERROR or ON-SUCCESS on turn completion.
 Skips ON-SUCCESS while a routing frame awaits `submit_task_result'.
@@ -1519,12 +1797,15 @@ scope submission and error checks to that task ID."
              (bound-and-true-p macher-agent--current-task-id))))
     (setq
      hook-fn
-     (lambda (_beg _end)
+     (lambda (beg end)
        (let* ((res (string-trim (buffer-substring-no-properties (point-min) (point-max))))
               (fsm (macher-agent-get-active-fsm))
               (info (and fsm (fboundp 'gptel-fsm-info) (ignore-errors (gptel-fsm-info fsm))))
               (err-data (and info (plist-get info :error)))
               (tool-calls (and info (plist-get info :tool-use)))
+              (disable-local-tools
+               (or (and info (plist-get info :disable-local-tools))
+                   (bound-and-true-p macher-agent--disable-local-tools)))
               (routing-stack (bound-and-true-p macher-agent--routing-stack))
               (top-task-id (or (plist-get (car-safe routing-stack) :task-id)
                                (bound-and-true-p macher-agent--current-task-id)))
@@ -1588,7 +1869,19 @@ scope submission and error checks to that task ID."
           ((and has-routing
                 (not tool-calls)
                 (not finished))
-           (if (not recovery-attempted)
+           (if disable-local-tools
+               (let ((turn-res (macher-agent--extract-turn-response-text beg end)))
+                 (setq-local macher-agent--submit-recovery-pending nil)
+                 (remove-hook 'gptel-post-response-functions hook-fn t)
+                 (if (string-empty-p turn-res)
+                     (funcall on-error "Buffer stopped silently or returned empty.")
+                   (when (functionp macher-agent-direct-task-submit-function)
+                     (funcall macher-agent-direct-task-submit-function
+                              (current-buffer)
+                              turn-res
+                              expected-task-id
+                              (bound-and-true-p macher-agent--persistent-context)))))
+             (if (not recovery-attempted)
                (progn
                  (setq recovery-attempted t)
                  (setq-local macher-agent--submit-recovery-pending t)
@@ -1624,7 +1917,7 @@ scope submission and error checks to that task ID."
                     (funcall on-error (error-message-string send-err)))))
              (setq-local macher-agent--submit-recovery-pending nil)
              (remove-hook 'gptel-post-response-functions hook-fn t)
-             (funcall on-error "Agent halted without invoking submit_task_result.")))))))
+             (funcall on-error "Agent halted without invoking submit_task_result."))))))))
     hook-fn))
 
 (defun macher-agent-gptel-transmit (task-context callbacks)

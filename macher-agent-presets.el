@@ -31,6 +31,7 @@
 (defvar gptel--known-backends)
 (defvar gptel-temperature)
 (defvar gptel-max-tokens)
+(defvar gptel--request-params)
 (defvar gptel-tools)
 
 (defcustom macher-agent-skill-directories nil
@@ -93,7 +94,7 @@
       (setq macher-agent--bundled-skills-dir dir))))
 
 (defconst macher-agent--preset-meta-keys
-  '(:exclusive :is-command :boot-directive :ptc-primitives)
+  '(:exclusive :is-command :boot-directive :ptc-primitives :disable-local-tools :server-tools)
   "Preset keys managed by `macher-agent' outside `gptel--known-presets'.")
 
 (defun macher-agent-set-preset-meta (sym &rest meta)
@@ -183,6 +184,27 @@
         (cl-loop for cand in candidates
                  thereis (funcall macher-agent-workspace-read-file-function context cand nil)))))
 
+(defun macher-agent--normalize-server-tool-names (tools)
+  "Normalise server-side TOOLS into a deduplicated list of non-empty strings."
+  (let ((raw (if (vectorp tools) (append tools nil) (ensure-list tools)))
+        (acc nil))
+    (dolist (item raw (nreverse acc))
+      (when (or (stringp item) (symbolp item))
+        (let ((clean (string-trim (if (symbolp item) (symbol-name item) item))))
+          (setq clean (replace-regexp-in-string "\\`:+" "" clean))
+          (when (and (not (string-empty-p clean))
+                     (not (member clean acc)))
+            (push clean acc)))))))
+
+(defun macher-agent--server-tools-request-params (server-tools &optional _backend)
+  "Build API `:request-params' plist for SERVER-TOOLS names, or nil."
+  (when-let* ((names (macher-agent--normalize-server-tool-names server-tools)))
+    (list :tools
+          (vconcat
+           (mapcar (lambda (tname)
+                     (list (intern (concat ":" tname)) nil))
+                   names)))))
+
 (defun macher-agent--extract-skill-frontmatter-and-body ()
   "Extract frontmatter metadata and body string from the current buffer."
   (goto-char (point-min))
@@ -197,20 +219,29 @@
     (setq body (string-trim (buffer-substring-no-properties (point) (point-max))))
     (setq name (gethash "name" fm-hash))
     (setq has-tools (not (eq (gethash "allowed-tools" fm-hash 'missing) 'missing)))
-    (list :name name
-          :name-sym (when name (intern name))
-          :description (gethash "description" fm-hash)
-          :model (gethash "model" fm-hash)
-          :backend (gethash "backend" fm-hash)
-          :boot-directive (gethash "boot-directive" fm-hash)
-          :has-tools has-tools
-          :allowed-tools (gethash "allowed-tools" fm-hash)
-          :exclusive (gethash "exclusive" fm-hash)
-          :ptc-primitives (when-let* ((raw (gethash "ptc-primitives" fm-hash)))
-                            (if (listp raw)
-                                (mapcar (lambda (p) (if (symbolp p) p (intern p))) raw)
-                              raw))
-          :system body)))
+    (let* ((allowed-tools (gethash "allowed-tools" fm-hash))
+           (disable-local-tools (and (gethash "disable-local-tools" fm-hash) t))
+           (server-tools (when disable-local-tools
+                           (macher-agent--normalize-server-tool-names allowed-tools)))
+           (request-params (when server-tools
+                             (macher-agent--server-tools-request-params server-tools))))
+      (list :name name
+            :name-sym (when name (intern name))
+            :description (gethash "description" fm-hash)
+            :model (gethash "model" fm-hash)
+            :backend (gethash "backend" fm-hash)
+            :boot-directive (gethash "boot-directive" fm-hash)
+            :has-tools has-tools
+            :allowed-tools allowed-tools
+            :server-tools server-tools
+            :exclusive (gethash "exclusive" fm-hash)
+            :disable-local-tools disable-local-tools
+            :request-params request-params
+            :ptc-primitives (when-let* ((raw (gethash "ptc-primitives" fm-hash)))
+                              (if (listp raw)
+                                  (mapcar (lambda (p) (if (symbolp p) p (intern p))) raw)
+                                raw))
+            :system body))))
 
 (defun macher-agent-parse-skill-file (filepath context)
   "Parse FILEPATH string strictly bound to CONTEXT struct."
@@ -1086,6 +1117,15 @@ Also registers resolved tools in `gptel--known-tools'."
               (setq preset-plist (plist-put preset-plist :description desc)))
             (when-let* ((mod (plist-get spec :model)))
               (setq preset-plist (plist-put preset-plist :model mod)))
+            (if (plist-get spec :disable-local-tools)
+                (setq preset-plist
+                      (plist-put
+                       (plist-put
+                        (plist-put preset-plist :request-params (plist-get spec :request-params))
+                        :tools nil)
+                       :use-tools nil))
+              (when-let* ((req-params (plist-get spec :request-params)))
+                (setq preset-plist (plist-put preset-plist :request-params req-params))))
             (when-let* ((raw-backend (plist-get spec :backend))
                         (resolved-backend (macher-agent--resolve-backend raw-backend)))
               (let ((bname (and (fboundp 'gptel-backend-name)
@@ -1136,18 +1176,27 @@ Also registers resolved tools in `gptel--known-tools'."
              (boot-directive (plist-get parsed :boot-directive))
              (tool-names (plist-get parsed :allowed-tools))
              (exclusive (plist-get parsed :exclusive))
-             (ptc-primitives (plist-get parsed :ptc-primitives))
+             (disable-local-tools (plist-get parsed :disable-local-tools))
+             (server-tools (when disable-local-tools
+                             (or (plist-get parsed :server-tools)
+                                 (macher-agent--normalize-server-tool-names tool-names))))
+             (request-params (if (and (plist-member parsed :request-params)
+                                      (plist-get parsed :request-params))
+                                 (plist-get parsed :request-params)
+                               (when server-tools
+                                 (macher-agent--server-tools-request-params server-tools))))
+             (ptc-primitives (unless disable-local-tools
+                               (plist-get parsed :ptc-primitives)))
              (has-tools (plist-get parsed :has-tools))
              (is-command (plist-get parsed :is-command))
              (skill-base-dir (file-name-directory skill-file))
              (registry (macher-agent--local-tools-table context))
              (resolved-tools
-              (when tool-names
+              (when (and tool-names (not disable-local-tools))
                 (delq nil (mapcar (lambda (tname)
                                     (macher-agent-resolve-tool tname registry skill-base-dir context))
                                   tool-names))))
-             (alist (macher-agent-context-skills context)))
-        (setf (alist-get sym alist)
+             (skill-plist
               (list :system body
                     :description desc
                     :model (when model (intern model))
@@ -1158,6 +1207,14 @@ Also registers resolved tools in `gptel--known-tools'."
                     :exclusive exclusive
                     :ptc-primitives ptc-primitives
                     :is-command is-command))
+             (alist (macher-agent-context-skills context)))
+        (when disable-local-tools
+          (setq skill-plist (plist-put skill-plist :disable-local-tools t))
+          (setq skill-plist (plist-put skill-plist :server-tools server-tools))
+          (setq skill-plist (plist-put skill-plist :request-params request-params)))
+        (when (and request-params (not disable-local-tools))
+          (setq skill-plist (plist-put skill-plist :request-params request-params)))
+        (setf (alist-get sym alist) skill-plist)
         (setf (macher-agent-context-skills context) alist)))))
 
 (defun macher-agent--load-skill-from-path (path context)
@@ -1705,6 +1762,9 @@ only defaults to the first preset when PRESETS has length 1."
            (setq st (plist-put st :tools nil))
            (setq st (plist-put st :boot-directive nil))
            (setq st (plist-put st :ptc-primitives nil))
+           (setq st (plist-put st :request-params nil))
+           (setq st (plist-put st :disable-local-tools nil))
+           (setq st (plist-put st :server-tools nil))
            st)
        state))
     (_ state)))
@@ -1725,12 +1785,14 @@ only defaults to the first preset when PRESETS has length 1."
   "Merge allowed tools specification or standalone tool in ITEM into STATE."
   (pcase item
     (`(preset ,_sym ,spec)
-     (if-let* ((tools-spec (or (plist-get spec :tools)
-                               (plist-get spec :allowed-tools))))
-         (plist-put state :tools
-                    (macher-agent--compose-merge-tools
-                     (plist-get state :tools) tools-spec))
-       state))
+     (if (plist-get spec :disable-local-tools)
+         (plist-put state :tools nil)
+       (if-let* ((tools-spec (or (plist-get spec :tools)
+                                 (plist-get spec :allowed-tools))))
+           (plist-put state :tools
+                      (macher-agent--compose-merge-tools
+                       (plist-get state :tools) tools-spec))
+         state)))
     (`(tool ,tool-obj)
      (let* ((canonical-tool
              (cond
@@ -1776,6 +1838,26 @@ only defaults to the first preset when PRESETS has length 1."
        (dolist (key '(:temperature :max-tokens))
          (when-let* ((val (plist-get spec key)))
            (setq st (plist-put st key val))))
+       (when (plist-member spec :disable-local-tools)
+         (setq st (plist-put st :disable-local-tools (plist-get spec :disable-local-tools))))
+       (cond
+        ((plist-member spec :request-params)
+         (setq st (plist-put st :request-params (plist-get spec :request-params)))
+         (when (plist-member spec :server-tools)
+           (setq st (plist-put st :server-tools
+                               (macher-agent--normalize-server-tool-names
+                                (plist-get spec :server-tools))))))
+        ((and (plist-get spec :disable-local-tools)
+              (or (plist-member spec :server-tools)
+                  (plist-member spec :allowed-tools)))
+         (let ((srv (macher-agent--normalize-server-tool-names
+                     (if (plist-member spec :server-tools)
+                         (plist-get spec :server-tools)
+                       (plist-get spec :allowed-tools)))))
+           (setq st (plist-put st :server-tools srv))
+           (setq st (plist-put st :request-params
+                               (macher-agent--server-tools-request-params
+                                srv (plist-get st :backend)))))))
        st))
     (_ state)))
 
@@ -1844,7 +1926,11 @@ only defaults to the first preset when PRESETS has length 1."
                             st))
                         dynamic-steps
                         state)))
-    (setq state (plist-put state :tools (macher-agent-normalize-tools (plist-get state :tools))))
+    (setq state (plist-put state :tools
+                           (unless (plist-get state :disable-local-tools)
+                             (macher-agent-normalize-tools (plist-get state :tools)))))
+    (when (plist-get state :disable-local-tools)
+      (setq state (plist-put state :ptc-primitives nil)))
     state))
 
 (defun macher-agent--apply-payload-locally (payload)
@@ -1861,6 +1947,17 @@ only defaults to the first preset when PRESETS has length 1."
       (setq-local gptel-temperature (plist-get payload :temperature)))
     (when (plist-member payload :max-tokens)
       (setq-local gptel-max-tokens (plist-get payload :max-tokens)))
+    (when (plist-member payload :request-params)
+      (let ((rp (plist-get payload :request-params)))
+        (if rp
+            (progn
+              (setq-local gptel--request-params rp)
+              (setq-local macher-agent--preset-request-params rp))
+          (kill-local-variable 'gptel--request-params)
+          (setq-local macher-agent--preset-request-params nil))))
+    (when (plist-member payload :disable-local-tools)
+      (setq-local macher-agent--disable-local-tools
+                  (and (plist-get payload :disable-local-tools) t)))
     (when (plist-member payload :tools)
       (setq-local gptel-tools (plist-get payload :tools)))
     (when (plist-member payload :ptc-primitives)
@@ -1945,6 +2042,9 @@ spec lacks `:tools', causing `gptel--save-state' to drop active tools."
                            :system (bound-and-true-p gptel-system-prompt)
                            :temperature (bound-and-true-p gptel-temperature)
                            :max-tokens (bound-and-true-p gptel-max-tokens)
+                           :request-params (when (local-variable-p 'gptel--request-params)
+                                             gptel--request-params)
+                           :disable-local-tools (bound-and-true-p macher-agent--disable-local-tools)
                            :tools gptel-tools
                            :ptc-primitives (bound-and-true-p macher-agent--active-ptc-primitives)
                            :known-presets (bound-and-true-p gptel--known-presets)))
@@ -1984,6 +2084,12 @@ spec lacks `:tools', causing `gptel--save-state' to drop active tools."
             (let ((spec (macher-agent--validate-activatable-skill sym ctx target-buf)))
               (when (plist-get spec :exclusive)
                 (setq has-exclusive t))))
+          (when (or has-exclusive
+                    (bound-and-true-p macher-agent--disable-local-tools)
+                    (bound-and-true-p macher-agent--preset-request-params))
+            (kill-local-variable 'gptel--request-params)
+            (setq-local macher-agent--preset-request-params nil)
+            (setq-local macher-agent--disable-local-tools nil))
           (when has-exclusive
             (setq-local gptel-tools nil)
             (setq-local macher-agent--active-ptc-primitives nil))

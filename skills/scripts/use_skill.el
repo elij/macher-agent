@@ -62,6 +62,17 @@
                    (setq-local gptel-model (plist-get baseline :model)))
                  (when (plist-member baseline :backend)
                    (setq-local gptel-backend (plist-get baseline :backend)))
+                 (when (plist-member baseline :request-params)
+                   (let ((rp (plist-get baseline :request-params)))
+                     (if rp
+                         (setq-local gptel--request-params rp)
+                       (kill-local-variable 'gptel--request-params))))
+                 (when (plist-member baseline :preset-request-params)
+                   (setq-local macher-agent--preset-request-params
+                               (plist-get baseline :preset-request-params)))
+                 (when (plist-member baseline :disable-local-tools)
+                   (setq-local macher-agent--disable-local-tools
+                               (plist-get baseline :disable-local-tools)))
                  (macher-agent-clear-cached-presets target-buf)
                  (kill-local-variable 'macher-agent--cached-presets-set)
                  (kill-local-variable 'macher-agent--cached-skill-baseline)
@@ -100,6 +111,9 @@
                (unless skill-sym
                  (error "ERROR: skill_name must be provided to activate a skill, or set done to true"))
                (let ((spec (macher-agent--validate-activatable-skill skill-sym ctx target-buf)))
+                 (when (plist-get spec :disable-local-tools)
+                   (error "Skill '%s' disables local tools and cannot be activated mid-turn via `use_skill'; delegate via `delegate_tasks_to_subagents' with `:presets [\"%s\"]' instead"
+                          skill-sym skill-sym))
                  (unless (or (bound-and-true-p macher-agent--cached-presets-set)
                              (local-variable-p 'macher-agent--cached-presets target-buf))
                    (setq-local macher-agent--cached-presets (copy-sequence macher-agent-presets))
@@ -109,6 +123,10 @@
                                      :system-prompt gptel-system-prompt
                                      :model gptel-model
                                      :backend (bound-and-true-p gptel-backend)
+                                     :request-params (when (local-variable-p 'gptel--request-params target-buf)
+                                                       (buffer-local-value 'gptel--request-params target-buf))
+                                     :preset-request-params (bound-and-true-p macher-agent--preset-request-params)
+                                     :disable-local-tools (bound-and-true-p macher-agent--disable-local-tools)
                                      :tools (copy-sequence gptel-tools)
                                      :ptc-primitives
                                      (copy-sequence (bound-and-true-p macher-agent--active-ptc-primitives)))))

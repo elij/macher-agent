@@ -35,6 +35,8 @@
   (macher-agent-zero-mem-install)
   (macher-agent-vfs-install)
   (macher-agent-transmission-install)
+  (setq macher-agent-direct-task-submit-function
+        #'macher-agent--submit-direct-task-result)
   (unless macher-agent-global-skills-alist
     (ignore-errors (macher-agent-initialize-skills)))
   (macher-agent--wrap-macher-tools)

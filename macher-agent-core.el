@@ -146,6 +146,9 @@ SHARED-STATE, PAYLOAD, and METADATA."
 (defvar macher-agent-fsm-info-function nil
   "Function called with FSM to extract its info plist.")
 
+(defvar macher-agent-direct-task-submit-function nil
+  "Function called with (BUF ANSWER TASK-ID CTX) for toolless sub-agents.")
+
 (defvar macher-agent-workspace-read-file-function nil
   "Function called with (CONTEXT PATH &optional ONLY-STAGED) to read a file.")
 
@@ -335,7 +338,15 @@ When nil or non-positive, no timeout timer is armed."
 (defvar-local macher-agent--turn-submission-delivered nil
   "When non-nil, a submission delivery completed during the current turn.")
 
+(defvar-local macher-agent--disable-local-tools nil
+  "Non-nil when active skill disables local tool declarations in current buffer.")
+
+(defvar-local macher-agent--preset-request-params nil
+  "Last `gptel--request-params' value installed locally by a skill or preset.")
+
 (put 'macher-agent--active-fsm 'permanent-local t)
+(put 'macher-agent--disable-local-tools 'permanent-local t)
+(put 'macher-agent--preset-request-params 'permanent-local t)
 (put 'macher-agent--current-task-id 'permanent-local t)
 (put 'macher-agent--is-ephemeral 'permanent-local t)
 (put 'macher-agent--explicitly-persistent 'permanent-local t)

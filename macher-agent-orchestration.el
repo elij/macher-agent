@@ -188,6 +188,10 @@ When SKIP-CLONE is non-nil, preserves existing context in BUF."
       (setq-local macher-agent--ready-to-reap nil)
       (setq-local macher-agent--staged-submission nil)
       (setq-local macher-agent--turn-submission-delivered nil)
+      (unless skip-clone
+        (kill-local-variable 'gptel--request-params)
+        (setq-local macher-agent--preset-request-params nil)
+        (setq-local macher-agent--disable-local-tools nil))
       (if (and (fboundp 'gptel-mode) (not (bound-and-true-p gptel-mode)))
           (macher-agent--configure-subagent-buffer
            buf p-buf (macher-agent-context-project-root parent-ctx))
@@ -738,6 +742,54 @@ When KEEP-FSM is non-nil, leave `macher-agent--active-fsm' untouched."
           (when a2a-payload
             (macher-agent-a2a-dispatch (list a2a-payload) nil valid-ctx))
           t)))))
+
+(defun macher-agent--submit-direct-task-result (buf final-answer &optional task-id context)
+  "Stage and deliver FINAL-ANSWER directly for toolless sub-agent BUF.
+Uses optional TASK-ID and CONTEXT."
+  (when (and (bufferp buf) (buffer-live-p buf))
+    (with-current-buffer buf
+      (let* ((ctx (or (macher-agent-resolve-context buf)
+                      (macher-agent-resolve-context context)))
+             (route-frame (car-safe (bound-and-true-p macher-agent--routing-stack)))
+             (target-name (plist-get route-frame :originator-name))
+             (callback-id (or (plist-get route-frame :task-id)
+                              (bound-and-true-p macher-agent--current-task-id)
+                              task-id))
+             (suppress (plist-get route-frame :suppress-patch))
+             (meta (list :suppress-patch suppress
+                         :ephemeral (and (bound-and-true-p macher-agent--is-ephemeral)
+                                         (not (bound-and-true-p macher-agent--explicitly-persistent))))))
+        (when callback-id
+          (setq-local macher-agent--current-task-id callback-id)
+          (setq-local macher-agent--task-result final-answer)
+          (when (and suppress (macher-agent-valid-context-p ctx))
+            (setf (macher-agent-context-plugins ctx)
+                  (plist-put (copy-sequence (macher-agent-context-plugins ctx))
+                             :suppress-patch t)))
+          (let* ((valid-ctx (when (macher-agent-valid-context-p ctx) ctx))
+                 (raw-msg (list :payload final-answer
+                                :child-context valid-ctx
+                                :metadata meta))
+                 (msg-payload (macher-agent-run-pipeline 'artifact-compose raw-msg))
+                 (a2a-payload (macher-agent-make-a2a-payload
+                               :transit-type :subagent-to-parent
+                               :type 'ARTIFACT_UPDATE
+                               :task-id callback-id
+                               :target-buffer target-name
+                               :target-context valid-ctx
+                               :parent-context valid-ctx
+                               :child-context valid-ctx
+                               :shared-state (list :task-id callback-id)
+                               :payload msg-payload
+                               :metadata meta)))
+            (setq-local macher-agent--staged-submission
+                        (list :a2a-payload a2a-payload
+                              :context valid-ctx
+                              :suppress suppress
+                              :task-id callback-id))
+            (macher-agent--deliver-staged-submission buf t)))))))
+
+(setq macher-agent-direct-task-submit-function #'macher-agent--submit-direct-task-result)
 
 (defun macher-agent--drain-routing-on-halt ()
   "Pop remaining routing frames and notify waiting callbacks of premature halt."
