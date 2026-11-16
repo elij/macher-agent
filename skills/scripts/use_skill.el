@@ -57,7 +57,8 @@
                  (when (plist-member baseline :gptel-preset)
                    (setq-local gptel--preset orig-gptel-preset))
                  (when (plist-member baseline :system-prompt)
-                   (setq-local gptel-system-prompt (plist-get baseline :system-prompt)))
+                   (macher-agent--set-programmatic-system-prompt
+                    (plist-get baseline :system-prompt)))
                  (when (plist-member baseline :model)
                    (setq-local gptel-model (plist-get baseline :model)))
                  (when (plist-member baseline :backend)

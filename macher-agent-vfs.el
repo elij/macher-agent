@@ -1417,6 +1417,7 @@ Uses optional CONTEXT to prefer workspace-local script overrides."
   (setq macher-agent-macher-entry-converter-function #'macher-agent-vfs-entry-to-macher-entry)
   (setq macher-agent-workspace-read-file-function #'macher-agent-vfs--workspace-read-file)
   (setq macher-agent-workspace-list-files-function #'macher-agent-vfs--workspace-list-files)
+  (setq macher-agent-vfs-normalize-tools-function #'macher-agent-vfs--normalize-tool-list)
   (macher-agent-register-pipeline-step 'preset-composition #'macher-agent-vfs--wrap-composed-tools 5)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-vfs--prepare-transmission 25)
   (macher-agent-register-pipeline-step 'payload-merge #'macher-agent-vfs--merge-payload 10)
@@ -1431,6 +1432,8 @@ Uses optional CONTEXT to prefer workspace-local script overrides."
 
 (defun macher-agent-vfs-uninstall ()
   "Uninstall VFS storage hooks, patch interfaces, and pipeline steps."
+  (when (eq macher-agent-vfs-normalize-tools-function #'macher-agent-vfs--normalize-tool-list)
+    (setq macher-agent-vfs-normalize-tools-function nil))
   (macher-agent-unregister-pipeline-step 'preset-composition #'macher-agent-vfs--wrap-composed-tools)
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-vfs--prepare-transmission)
   (macher-agent-unregister-pipeline-step 'payload-merge #'macher-agent-vfs--merge-payload)

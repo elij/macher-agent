@@ -19,6 +19,7 @@
 (declare-function vc-root-dir "vc-hooks" ())
 
 (defvar gptel-directives)
+(defvar gptel-system-prompt)
 
 (cl-defstruct (macher-agent-session
                (:constructor make-macher-agent-session)
@@ -155,6 +156,9 @@ SHARED-STATE, PAYLOAD, and METADATA."
 (defvar macher-agent-workspace-list-files-function nil
   "Function called with (CONTEXT) returning paths tracked in workspace storage.")
 
+(defvar macher-agent-vfs-normalize-tools-function nil
+  "Function called with (TOOLS &optional CONTEXT) to wrap Macher tools.")
+
 (defvar macher-agent-context-mutated-hook nil
   "Hook run when a context is mutated.")
 
@@ -196,6 +200,20 @@ SHARED-STATE, PAYLOAD, and METADATA."
   "Maximum seconds a command in `macher-agent-run-in-vfs-sandbox' may run.
 When nil or non-positive, no timeout timer is armed."
   :type '(choice (const :tag "No timeout" nil) number)
+  :group 'macher-agent)
+
+(defcustom macher-agent-immutable-ledger t
+  "When non-nil, maintain an append-only conversation ledger for KV caching.
+Anchors the top-level system directive and static tool schema per session,
+persists all tool executions in the buffer while hiding non-included tools
+and session-authenticated `<runtime_directive>' blocks in the UI, and
+quantises context truncation and tool-output deduplication."
+  :type 'boolean
+  :group 'macher-agent)
+
+(defcustom macher-agent-context-compaction-ratio 0.25
+  "Fraction of `macher-agent-max-context-chars' reclaimed per cut-off epoch."
+  :type 'float
   :group 'macher-agent)
 
 (defvar macher-agent--active-sandbox-dir nil
@@ -344,9 +362,46 @@ When nil or non-positive, no timeout timer is armed."
 (defvar-local macher-agent--preset-request-params nil
   "Last `gptel--request-params' value installed locally by a skill or preset.")
 
+(defvar-local macher-agent--ledger-auth-token nil
+  "Per-session 8-hex-character authentication token for `<runtime_directive>'.")
+
+(defvar-local macher-agent--ledger-system-prompt nil
+  "Frozen constitutional top-level system prompt for current buffer session.")
+
+(defvar-local macher-agent--ledger-baseline-body nil
+  "Canonical `<baseline_defaults>' body embedded in the ledger system prompt.")
+
+(defvar-local macher-agent--ledger-user-system-snapshot nil
+  "Last programmatic or ledger-anchored `gptel-system-prompt' snapshot.")
+
+(defvar-local macher-agent--ledger-directive-rev 0
+  "Monotonic revision counter for session-authenticated `<runtime_directive>'.")
+
+(defvar-local macher-agent--ledger-wire-tools nil
+  "Deterministic sorted list of all known `gptel-tool' structs for wire `:data'.")
+
+(defvar-local macher-agent--wire-dedup-beg nil
+  "Marker in wire prompt buffer bounding the start of quantised tool dedup.")
+
+(defvar-local macher-agent--wire-dedup-end nil
+  "Marker in wire prompt buffer bounding the end of quantised tool dedup.")
+
+(defvar-local macher-agent-zero-mem--event-horizon nil
+  "Buffer-local event horizon plist (:line L :offset O :tick T :quantised Q).")
+
+(defvar macher-agent--computing-ledger-baseline nil
+  "Non-nil while compiling the resting `<baseline_defaults>' state.")
+
 (put 'macher-agent--active-fsm 'permanent-local t)
 (put 'macher-agent--disable-local-tools 'permanent-local t)
 (put 'macher-agent--preset-request-params 'permanent-local t)
+(put 'macher-agent--ledger-auth-token 'permanent-local t)
+(put 'macher-agent--ledger-system-prompt 'permanent-local t)
+(put 'macher-agent--ledger-baseline-body 'permanent-local t)
+(put 'macher-agent-zero-mem--event-horizon 'permanent-local t)
+(put 'macher-agent--ledger-user-system-snapshot 'permanent-local t)
+(put 'macher-agent--ledger-directive-rev 'permanent-local t)
+(put 'macher-agent--ledger-wire-tools 'permanent-local t)
 (put 'macher-agent--current-task-id 'permanent-local t)
 (put 'macher-agent--is-ephemeral 'permanent-local t)
 (put 'macher-agent--explicitly-persistent 'permanent-local t)
@@ -759,6 +814,31 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
         (concat "Agent: " name)
       "Agent: Workspace")))
 
+(defun macher-agent--generate-ledger-auth-token ()
+  "Generate a random 8-hex-character session authentication token."
+  (format "%04x%04x" (random #x10000) (random #x10000)))
+
+(defun macher-agent--set-programmatic-system-prompt (prompt)
+  "Set buffer-local `gptel-system-prompt' to PROMPT and record ledger snapshot."
+  (setq-local gptel-system-prompt prompt)
+  (setq-local macher-agent--ledger-user-system-snapshot prompt)
+  prompt)
+
+(defconst macher-agent--runtime-directive-re
+  "\\(?:\n\n\\|\n\\)?<runtime_directive[ \t]+auth=\"\\([^\"]+\\)\"[ \t]+rev=\"\\([0-9]+\\)\">\\([[:ascii:][:nonascii:]]*?\\)</runtime_directive>"
+  "Regexp matching a session-authenticated `<runtime_directive>' block.")
+
+(defun macher-agent--strip-runtime-directives (text &optional auth-token)
+  "Strip `<runtime_directive>' blocks from TEXT.
+When AUTH-TOKEN is non-nil, only strip blocks carrying AUTH-TOKEN."
+  (if (not (and (stringp text) (string-search "<runtime_directive" text)))
+      text
+    (let ((re (if (and (stringp auth-token) (not (string-empty-p auth-token)))
+                  (format "\\(?:\n\n\\|\n\\)?<runtime_directive[ \t]+auth=\"%s\"[ \t]+rev=\"[0-9]+\">[[:ascii:][:nonascii:]]*?</runtime_directive>"
+                          (regexp-quote auth-token))
+                macher-agent--runtime-directive-re)))
+      (replace-regexp-in-string re "" text t t))))
+
 (defun macher-agent-search-glob (orig-buf query &optional ctx-lines)
   "Search QUERY in live ORIG-BUF with optional CTX-LINES context."
   (cl-check-type orig-buf buffer)
@@ -769,31 +849,35 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
     (if (not (buffer-live-p orig-buf))
         "Error: Cannot locate original conversation buffer."
       (with-current-buffer orig-buf
-        (save-excursion
-          (goto-char (point-min))
-          (condition-case err
-              (let ((continue t))
-                (while (and continue (re-search-forward query nil t))
-                  (let* ((match-beg (match-beginning 0))
-                         (match-end (match-end 0))
-                         (start-pt (save-excursion
+        (let ((auth-tok (bound-and-true-p macher-agent--ledger-auth-token)))
+          (save-excursion
+            (goto-char (point-min))
+            (condition-case err
+                (let ((continue t))
+                  (while (and continue (re-search-forward query nil t))
+                    (let* ((match-beg (match-beginning 0))
+                           (match-end (match-end 0))
+                           (start-pt (save-excursion
+                                       (goto-char match-beg)
+                                       (forward-line (- ctx-lines))
+                                       (line-beginning-position)))
+                           (end-pt (save-excursion
                                      (goto-char match-beg)
-                                     (forward-line (- ctx-lines))
-                                     (line-beginning-position)))
-                         (end-pt (save-excursion
-                                   (goto-char match-beg)
-                                   (forward-line ctx-lines)
-                                   (line-end-position)))
-                         (snippet (buffer-substring-no-properties start-pt end-pt)))
-                    (push (format "--- Match near line %d ---\n%s\n"
-                                  (line-number-at-pos match-beg) snippet)
-                          results)
-                    (when (= match-beg match-end)
-                      (if (eobp)
-                          (setq continue nil)
-                        (forward-char 1))))))
-            (invalid-regexp
-             (setq invalid-re (error-message-string err))))))
+                                     (forward-line ctx-lines)
+                                     (line-end-position)))
+                           (raw-snippet (buffer-substring-no-properties start-pt end-pt))
+                           (snippet (macher-agent--strip-runtime-directives raw-snippet auth-tok)))
+                      (when (and (not (string-empty-p (string-trim snippet)))
+                                 (string-match-p query snippet))
+                        (push (format "--- Match near line %d ---\n%s\n"
+                                      (line-number-at-pos match-beg) snippet)
+                              results))
+                      (when (= match-beg match-end)
+                        (if (eobp)
+                            (setq continue nil)
+                          (forward-char 1))))))
+              (invalid-regexp
+               (setq invalid-re (error-message-string err)))))))
       (cond
        (invalid-re
         (format "Error: Invalid regular expression: %s" invalid-re))

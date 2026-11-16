@@ -142,6 +142,10 @@ PARENT-CTX-OVERRIDE."
 
 (defun macher-agent--install-subagent-hooks ()
   "Register local `gptel' hooks for the current sub-agent buffer."
+  (macher-agent--ensure-ledger-invisibility-spec (current-buffer))
+  (dolist (transformer (reverse macher-agent-prompt-transformers))
+    (remove-hook 'gptel-prompt-transform-functions transformer t)
+    (add-hook 'gptel-prompt-transform-functions transformer nil t))
   (remove-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer t)
   (add-hook 'gptel-prompt-transform-functions #'macher-agent-sync-prompt-transformer nil t)
   (add-hook 'gptel-pre-tool-call-functions #'macher-agent--enforce-tool-scope nil t)

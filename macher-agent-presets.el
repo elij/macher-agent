@@ -1933,11 +1933,90 @@ only defaults to the first preset when PRESETS has length 1."
       (setq state (plist-put state :ptc-primitives nil)))
     state))
 
+(defun macher-agent--tool-schema-signature (tools)
+  "Return deterministic wire-schema signature list for TOOLS."
+  (mapcar (lambda (tl)
+            (when (macher-tool-valid-p tl)
+              (list (gptel-tool-name tl)
+                    (gptel-tool-description tl)
+                    (gptel-tool-args tl))))
+          tools))
+
+(defun macher-agent--extract-tools-from-known-alist (known-alist)
+  "Extract valid `gptel-tool' structs from `gptel--known-tools' KNOWN-ALIST."
+  (let ((acc nil))
+    (dolist (cat-entry known-alist (nreverse acc))
+      (when (consp (cdr cat-entry))
+        (dolist (tool-entry (cdr cat-entry))
+          (let ((tl (cdr-safe tool-entry)))
+            (when (macher-tool-valid-p tl)
+              (push tl acc))))))))
+
+(defun macher-agent--collect-all-known-tools (&optional context target-buf extra-tools)
+  "Return deterministic sorted list of all known `gptel-tool' structs.
+Resolves workspace overrides in CONTEXT and TARGET-BUF ahead of global
+tables and merges EXTRA-TOOLS."
+  (let* ((buf (and (bufferp target-buf) (buffer-live-p target-buf) target-buf))
+         (valid-ctx (and (macher-agent-valid-context-p context) context))
+         (local-reg (when valid-ctx (macher-agent--local-tools-table valid-ctx)))
+         (candidates nil))
+    (dolist (tl extra-tools)
+      (when (macher-tool-valid-p tl)
+        (push tl candidates)))
+    (when (hash-table-p local-reg)
+      (let ((local-items nil))
+        (maphash (lambda (_k v)
+                   (when (macher-tool-valid-p v)
+                     (push v local-items)))
+                 local-reg)
+        (dolist (tl (sort local-items
+                          (lambda (a b)
+                            (string< (gptel-tool-name a) (gptel-tool-name b)))))
+          (push tl candidates))))
+    (when buf
+      (dolist (tl (buffer-local-value 'gptel-tools buf))
+        (when (macher-tool-valid-p tl)
+          (push tl candidates)))
+      (when (local-variable-p 'gptel--known-tools buf)
+        (dolist (tl (macher-agent--extract-tools-from-known-alist
+                     (buffer-local-value 'gptel--known-tools buf)))
+          (push tl candidates))))
+    (when (hash-table-p macher-agent-tools-registry)
+      (let ((global-items nil))
+        (maphash (lambda (_k v)
+                   (when (macher-tool-valid-p v)
+                     (push v global-items)))
+                 macher-agent-tools-registry)
+        (dolist (tl (sort global-items
+                          (lambda (a b)
+                            (string< (gptel-tool-name a) (gptel-tool-name b)))))
+          (push tl candidates))))
+    (when (default-boundp 'gptel--known-tools)
+      (dolist (tl (macher-agent--extract-tools-from-known-alist
+                   (default-value 'gptel--known-tools)))
+        (push tl candidates)))
+    (setq candidates (nreverse candidates))
+    (when (functionp macher-agent-vfs-normalize-tools-function)
+      (setq candidates
+            (funcall macher-agent-vfs-normalize-tools-function candidates valid-ctx)))
+    (let ((seen (make-hash-table :test 'equal))
+          (unique nil))
+      (dolist (tl candidates)
+        (when (macher-tool-valid-p tl)
+          (let ((key (downcase (replace-regexp-in-string
+                                "-" "_" (gptel-tool-name tl)))))
+            (unless (gethash key seen)
+              (puthash key t seen)
+              (push tl unique)))))
+      (sort unique
+            (lambda (a b)
+              (string< (gptel-tool-name a) (gptel-tool-name b)))))))
+
 (defun macher-agent--apply-payload-locally (payload)
   "Apply a composed PAYLOAD to the current buffer variables."
   (when payload
     (when (plist-member payload :system)
-      (setq-local gptel-system-prompt (plist-get payload :system)))
+      (macher-agent--set-programmatic-system-prompt (plist-get payload :system)))
     (when (plist-member payload :model)
       (setq-local gptel-model (plist-get payload :model)))
     (when-let* ((backend-val (plist-get payload :backend))

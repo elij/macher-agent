@@ -760,8 +760,9 @@ Includes TRUNCATED-CALL header, CALL-STR, and STR-RES output."
       (when (fboundp 'gptel-markdown-cycle-block)
         (gptel-markdown-cycle-block)))))
 
-(defun macher-agent--insert-ptc-tool-result (target-buf call-str res-data original-name-str)
-  "Insert RES-DATA for CALL-STR and ORIGINAL-NAME-STR into TARGET-BUF."
+(defun macher-agent--insert-ptc-tool-result (target-buf call-str res-data original-name-str &optional resolved-tool)
+  "Insert RES-DATA for CALL-STR and ORIGINAL-NAME-STR into TARGET-BUF.
+Applies UI visibility for optional RESOLVED-TOOL when ledger mode is active."
   (cl-check-type res-data string)
   (when (bound-and-true-p gptel-post-tool-call-functions)
     (run-hook-wrapped
@@ -770,17 +771,49 @@ Includes TRUNCATED-CALL header, CALL-STR, and STR-RES output."
        (ignore-errors
          (funcall f (list :name original-name-str :call call-str :result res-data
                           :buffer (buffer-name target-buf) :model (bound-and-true-p gptel-model)))))))
-  (when (bound-and-true-p gptel-include-tool-results)
+  (when (or macher-agent-immutable-ledger
+            (bound-and-true-p gptel-include-tool-results))
     (with-current-buffer target-buf
-      (save-excursion
-        (goto-char (point-max))
-        (let* ((inhibit-read-only t)
-               (truncated-call (truncate-string-to-width call-str 60 nil nil " ...)"))
-               (start-pt (point)))
-          (insert (macher-agent--format-ptc-result-block truncated-call call-str res-data))
-          (goto-char start-pt)
-          (forward-line 1)
-          (macher-agent--cycle-ptc-result-block))))))
+      (let* ((user-inc gptel-include-tool-results)
+             (vis (if macher-agent-immutable-ledger
+                      (macher-agent--effective-tool-visibility
+                       user-inc
+                       (or resolved-tool
+                           (macher-agent--lookup-known-tool-for-visibility
+                            original-name-str target-buf)))
+                    (if user-inc 'full 'hidden))))
+        (save-excursion
+          (goto-char (point-max))
+          (let* ((inhibit-read-only t)
+                 (truncated-call (truncate-string-to-width call-str 60 nil nil " ...)"))
+                 (start-pt (point)))
+            (insert (macher-agent--format-ptc-result-block truncated-call call-str res-data))
+            (let ((end-pt (point)))
+              (when macher-agent-immutable-ledger
+                (put-text-property start-pt end-pt 'gptel 'ignore))
+              (pcase vis
+                ('hidden
+                 (macher-agent--make-ledger-overlay start-pt end-pt 'tool target-buf))
+                ('call
+                 (goto-char start-pt)
+                 (forward-line 2)
+                 (let ((res-beg (line-end-position))
+                       (res-end (save-excursion
+                                  (goto-char end-pt)
+                                  (forward-line -1)
+                                  (line-beginning-position))))
+                   (when (< res-beg res-end)
+                     (macher-agent--make-ledger-overlay res-beg res-end 'tool-result target-buf)))
+                 (goto-char start-pt)
+                 (forward-line 1)
+                 (macher-agent--cycle-ptc-result-block))
+                (_
+                 (goto-char start-pt)
+                 (forward-line 1)
+                 (macher-agent--cycle-ptc-result-block)))
+              (when-let* ((tok (bound-and-true-p macher-agent--ledger-auth-token)))
+                (macher-agent--hide-authenticated-directives-in-region
+                 start-pt end-pt tok target-buf)))))))))
 
 (defun macher-agent-sandbox--coerce-arg-for-spec (val arg-spec)
   "Coerce VAL to a vector when ARG-SPEC declares `:type \"array\"'."
@@ -918,7 +951,8 @@ STOP-ITER-FN."
              (call-str (prin1-to-string `(:name ,original-name-str :args ,args)))
              (cb (lambda (res-data)
                    (let ((str-res (if (stringp res-data) res-data (prin1-to-string res-data))))
-                     (macher-agent--insert-ptc-tool-result target-buf call-str str-res original-name-str)
+                     (macher-agent--insert-ptc-tool-result
+                      target-buf call-str str-res original-name-str resolved-tool)
                      (funcall ptc-callback res-data)))))
         (if (and resolved-tool (macher-tool-valid-p resolved-tool))
             (macher-agent--dispatch-ptc-primitive

@@ -149,6 +149,16 @@ Memory recall beyond the `macher-agent-max-context-chars` boundary operates thro
 |Fixed-Point PPR|0.293908 s|9        |0.197646 s|
 |Glob           |0.000115 s|0        |0 s       |
 
+### KV cache improvements (immutable ledger)
+
+With `macher-agent-immutable-ledger` enabled (the default), `macher-agent` preserves an append-only conversation prefix for prefix-based KV caching across multi-turn sessions, inline `@skill` switches, mid-turn `use_skill` transitions, and history compaction.
+
+The immutable ledger preserves cache stability across three layers. On the initial turn, `macher-agent` binds `gptel-system-prompt` to a frozen `<CONSTITUTIONAL_STATE_PROTOCOL>` wrapper containing `<baseline_defaults>` and a session-specific token, and declares the static tool schema set via `macher-agent--ledger-wire-tools`.
+
+Skill instructions and tool-scope changes from `@skill` or `use_skill` are emitted as append-only `<runtime_directive auth="..." rev="N">` blocks on the latest user prompt or final tool result (hidden in Emacs with `macher-agent-ledger` overlays). At runtime, `gptel-pre-tool-call-functions` (`macher-agent--enforce-tool-scope`) enforces `allowed-tools` through local scope checks without altering the top-level system prompt or `:tools` array.
+
+Every tool call and result block remains in the buffer ledger regardless of `:include` or `gptel-include-tool-results` settings. When history exceeds `macher-agent-max-context-chars`, `macher-agent-context-compaction-ratio` pins truncation cut-offs and tool-output deduplication windows (`macher-agent-transformer-deduplicate-tools`) per compaction epoch.
+
 ### Programmatic tool calling (PTC) for token efficiency
 
 Programmatic tool calling in Emacs Lisp allows complex operations that would otherwise require multiple conversational turns to execute within a single request. The execution runs inside a yielding Emacs Lisp sandbox.
