@@ -367,7 +367,7 @@ When REPLACE-ALL is non-nil, replace every occurrence."
      ((= count 0)
       (error "Text not found: %s" old-text))
      ((and (> count 1) (not replace-all))
-      (error "Multiple matches found for text. Set replace_all to true or provide more context: %s" old-text))
+      (error "Multiple matches found for text.  Set replace_all to true or provide more context: %s" old-text))
      (t
       (replace-regexp-in-string (regexp-quote old-text) new-text content t t)))))
 
@@ -1745,8 +1745,8 @@ callback receives the final result."
 Manages the output buffer, `make-process', sentinel cleanup, and
 output truncation for `skills/scripts/*.el'.  Accepts CTX-OR-COMMAND,
 COMMAND-OR-RESOLVE, RESOLVE-OR-FORMAT, and MAYBE-FORMAT-FN, supporting
-both (command resolve-fn &optional format-fn) and
-(ctx command resolve-fn &optional format-fn).  The command may be a
+both `(command resolve-fn &optional format-fn)' and
+`(ctx command resolve-fn &optional format-fn)'.  The command may be a
 shell string or list of program and arguments.  The format function,
 when non-nil, is called as `(funcall format-fn exit-code output)'."
   (let* ((has-ctx (not (functionp command-or-resolve)))
@@ -1833,7 +1833,7 @@ when non-nil, is called as `(funcall format-fn exit-code output)'."
                                   (error-message-string err))))))))))
 
 (defmacro macher-agent-with-strict-vfs-pipeline (context callback &rest body)
-  "Hydrate CONTEXT VFS sandbox asynchronously, exposing `done' inside BODY."
+  "Hydrate CONTEXT VFS sandbox with CALLBACK, exposing `done' in BODY."
   (declare (indent 2) (debug t))
   `(macher-agent-call-with-strict-vfs-pipeline
     ,context

@@ -31,6 +31,7 @@
 (declare-function gptel-tool-args "gptel" (tool))
 (declare-function gptel-tool-function "gptel" (tool))
 (declare-function gptel-tool-async "gptel" (tool))
+(declare-function gptel-tool-include "gptel" (tool))
 (declare-function gptel-get-tool "gptel" (name))
 (declare-function gptel--update-status "gptel" (status))
 (declare-function gptel--update-tool-call "gptel" (fsm))
@@ -760,8 +761,10 @@ Includes TRUNCATED-CALL header, CALL-STR, and STR-RES output."
       (when (fboundp 'gptel-markdown-cycle-block)
         (gptel-markdown-cycle-block)))))
 
-(defun macher-agent--insert-ptc-tool-result (target-buf call-str res-data original-name-str)
-  "Insert RES-DATA for CALL-STR and ORIGINAL-NAME-STR into TARGET-BUF."
+(defun macher-agent--insert-ptc-tool-result (target-buf call-str res-data original-name-str &optional resolved-tool)
+  "Insert RES-DATA for CALL-STR and ORIGINAL-NAME-STR into TARGET-BUF.
+Respects buffer-local `gptel-include-tool-results' and optional
+RESOLVED-TOOL `:include' policy."
   (cl-check-type res-data string)
   (when (bound-and-true-p gptel-post-tool-call-functions)
     (run-hook-wrapped
@@ -770,45 +773,56 @@ Includes TRUNCATED-CALL header, CALL-STR, and STR-RES output."
        (ignore-errors
          (funcall f (list :name original-name-str :call call-str :result res-data
                           :buffer (buffer-name target-buf) :model (bound-and-true-p gptel-model)))))))
-  (when (bound-and-true-p gptel-include-tool-results)
-    (with-current-buffer target-buf
-      (save-excursion
-        (let* ((inhibit-read-only t)
-               (fsm (or (bound-and-true-p macher-agent--active-fsm)
-                        (macher-agent-get-active-fsm)))
-               (info (and fsm (fboundp 'gptel-fsm-info)
-                          (ignore-errors (gptel-fsm-info fsm))))
-               (pos-m (and (listp info) (plist-get info :position)))
-               (track-m (and (listp info) (plist-get info :tracking-marker)))
-               (owns-fsm (and (listp info)
-                              (or (eq (plist-get info :buffer) target-buf)
-                                  (and (markerp pos-m) (eq (marker-buffer pos-m) target-buf))
-                                  (and (markerp track-m) (eq (marker-buffer track-m) target-buf))))))
-          (cond
-           ((and owns-fsm (markerp track-m) (eq (marker-buffer track-m) target-buf))
-            (set-marker-insertion-type track-m t)
-            (goto-char track-m))
-           ((and owns-fsm (markerp pos-m) (eq (marker-buffer pos-m) target-buf))
-            (goto-char pos-m)
-            (setq track-m (set-marker (make-marker) (point) target-buf))
-            (set-marker-insertion-type track-m t)
-            (setq info (plist-put info :tracking-marker track-m))
-            (macher-agent--set-fsm-info fsm info))
-           (t
-            (goto-char (point-max))))
-          (let ((truncated-call (truncate-string-to-width call-str 60 nil nil " ...)"))
-                (start-pt (point)))
-            (insert (macher-agent--format-ptc-result-block truncated-call call-str res-data))
-            (add-text-properties start-pt (point) '(gptel ignore macher-agent-ptc-log t))
-            (when (and owns-fsm (markerp track-m) (eq (marker-buffer track-m) target-buf))
-              (let ((tool-m (plist-get info :tool-marker)))
-                (if (and (markerp tool-m) (eq (marker-buffer tool-m) target-buf))
-                    (move-marker tool-m track-m)
-                  (setq info (plist-put info :tool-marker (copy-marker track-m nil)))
-                  (macher-agent--set-fsm-info fsm info))))
-            (goto-char start-pt)
-            (forward-line 1)
-            (macher-agent--cycle-ptc-result-block)))))))
+  (when (and (bufferp target-buf)
+             (buffer-live-p target-buf))
+    (let* ((inc-mode (with-current-buffer target-buf
+                       (bound-and-true-p gptel-include-tool-results)))
+           (tool-inc (if (and resolved-tool (macher-tool-valid-p resolved-tool))
+                         (gptel-tool-include resolved-tool)
+                       t))
+           (eff-inc (if (eq inc-mode 'auto) tool-inc inc-mode)))
+      (when eff-inc
+        (with-current-buffer target-buf
+          (save-excursion
+            (let* ((inhibit-read-only t)
+                   (fsm (or (bound-and-true-p macher-agent--active-fsm)
+                            (macher-agent-get-active-fsm)))
+                   (info (and fsm (fboundp 'gptel-fsm-info)
+                              (ignore-errors (gptel-fsm-info fsm))))
+                   (pos-m (and (listp info) (plist-get info :position)))
+                   (track-m (and (listp info) (plist-get info :tracking-marker)))
+                   (owns-fsm (and (listp info)
+                                  (or (eq (plist-get info :buffer) target-buf)
+                                      (and (markerp pos-m) (eq (marker-buffer pos-m) target-buf))
+                                      (and (markerp track-m) (eq (marker-buffer track-m) target-buf))))))
+              (cond
+               ((and owns-fsm (markerp track-m) (eq (marker-buffer track-m) target-buf))
+                (set-marker-insertion-type track-m t)
+                (goto-char track-m))
+               ((and owns-fsm (markerp pos-m) (eq (marker-buffer pos-m) target-buf))
+                (goto-char pos-m)
+                (setq track-m (set-marker (make-marker) (point) target-buf))
+                (set-marker-insertion-type track-m t)
+                (setq info (plist-put info :tracking-marker track-m))
+                (macher-agent--set-fsm-info fsm info))
+               (t
+                (goto-char (point-max))))
+              (let ((truncated-call (truncate-string-to-width call-str 60 nil nil " ...)"))
+                    (display-res (if (eq eff-inc 'call)
+                                     "(Cached tool result — available during original generation)"
+                                   res-data))
+                    (start-pt (point)))
+                (insert (macher-agent--format-ptc-result-block truncated-call call-str display-res))
+                (add-text-properties start-pt (point) '(gptel ignore macher-agent-ptc-log t))
+                (when (and owns-fsm (markerp track-m) (eq (marker-buffer track-m) target-buf))
+                  (let ((tool-m (plist-get info :tool-marker)))
+                    (if (and (markerp tool-m) (eq (marker-buffer tool-m) target-buf))
+                        (move-marker tool-m track-m)
+                      (setq info (plist-put info :tool-marker (copy-marker track-m nil)))
+                      (macher-agent--set-fsm-info fsm info))))
+                (goto-char start-pt)
+                (forward-line 1)
+                (macher-agent--cycle-ptc-result-block)))))))))
 
 (defun macher-agent-sandbox--coerce-arg-for-spec (val arg-spec)
   "Coerce VAL to a vector when ARG-SPEC declares `:type \"array\"'."
@@ -946,7 +960,8 @@ STOP-ITER-FN."
              (call-str (prin1-to-string `(:name ,original-name-str :args ,args)))
              (cb (lambda (res-data)
                    (let ((str-res (if (stringp res-data) res-data (prin1-to-string res-data))))
-                     (macher-agent--insert-ptc-tool-result target-buf call-str str-res original-name-str)
+                     (macher-agent--insert-ptc-tool-result
+                      target-buf call-str str-res original-name-str resolved-tool)
                      (funcall ptc-callback res-data)))))
         (if (and resolved-tool (macher-tool-valid-p resolved-tool))
             (macher-agent--dispatch-ptc-primitive

@@ -19,11 +19,18 @@
 (declare-function vc-root-dir "vc-hooks" ())
 (declare-function gptel--create-prompt-buffer "gptel-request" (&optional prompt-end))
 (declare-function gptel--parse-buffer "gptel-request" (backend max-entries))
+(declare-function gptel--parse-list "gptel-request" (backend prompt-list))
 (declare-function gptel--parse-list-and-insert "gptel-request" (prompts))
 (declare-function gptel--model-request-params "gptel-request" (model))
 (declare-function gptel--error-p "gptel-request" (info))
 (declare-function gptel--request-data "gptel-request" (backend prompts))
+(declare-function gptel--inject-prompt "gptel-request" (backend data new-prompt &optional position))
+(declare-function gptel--json-encode "gptel-request" (object))
+(declare-function gptel--insert-response "gptel" (response info &optional raw))
+(declare-function gptel-curl--stream-insert-response "gptel" (response info &optional raw))
 (declare-function gptel-prompt-prefix-string "gptel" ())
+(declare-function gptel-response-prefix-string "gptel" ())
+(declare-function gptel-context--collect-media "gptel-context" ())
 
 (defvar gptel-system-prompt)
 (defvar gptel-directives)
@@ -38,13 +45,34 @@
 (defvar gptel-track-response)
 (defvar gptel-save-state-hook)
 (defvar gptel-prompt-prefix-alist)
+(defvar gptel-response-separator)
+(defvar gptel-include-reasoning)
+(defvar gptel-include-tool-results)
+(defvar gptel-context)
+(defvar gptel-use-context)
 (defvar gptel-stream)
 (defvar gptel-use-curl)
 (defvar gptel-use-tools)
 (defvar gptel-tools)
 (defvar gptel-temperature)
 (defvar gptel-max-tokens)
+(defvar gptel-cache)
 (defvar gptel--request-params)
+
+(defvar macher-agent-wire-pre-truncate-hook nil
+  "Hook run with `(ORIG-BUF SHADOW-OFFSET)' before wire horizon truncation.")
+
+(defvar-local macher-agent--wire-backend nil
+  "Backend instance associated with committed spans in the shadow wire buffer.")
+(put 'macher-agent--wire-backend 'permanent-local t)
+
+(defvar-local macher-agent--wire-span-counter 0
+  "Monotonic span counter inside a shadow wire buffer.")
+(put 'macher-agent--wire-span-counter 'permanent-local t)
+
+(defvar-local macher-agent--wire-last-media-hash nil
+  "Hash of `gptel-context' media already injected into cached wire history.")
+(put 'macher-agent--wire-last-media-hash 'permanent-local t)
 
 (defvar-local macher-agent--is-restored-session nil
   "Track whether current buffer is restored from a saved state.")
@@ -98,9 +126,7 @@
 
 (defun macher-agent--sanitize-tool-result-entries (tool-results info)
   "Ensure each `(TOOL ARGS RESULT)' in TOOL-RESULTS holds a `gptel-tool'.
-Upstream `gptel--process-tool-call' stores nil in the TOOL slot when a
-pre-tool hook blocks an out-of-scope call or an unknown tool is requested,
-causing `gptel--display-tool-results' to signal `wrong-type-argument'."
+Correlates nil tool slots against `:tool-use' in FSM INFO."
   (let ((tool-use (and (macher-agent--plist-p info) (plist-get info :tool-use))))
     (mapcar
      (lambda (entry)
@@ -170,6 +196,304 @@ causing `gptel--display-tool-results' to signal `wrong-type-argument'."
               (setf (alist-get 'TRET new-table) new-edges)
               (setf (gptel-fsm-table fsm) new-table))))))))
 
+;;; Shadow Wire Buffer Core Helpers
+
+(defun macher-agent--wire-enabled-p (buf &optional info)
+  "Return non-nil when shadow wire caching is enabled for BUF and FSM INFO."
+  (and macher-agent-wire-buffer-mode
+       (bufferp buf)
+       (buffer-live-p buf)
+       (or (buffer-local-value 'macher-agent--is-workspace buf)
+           (and (boundp 'macher-agent-mode)
+                (buffer-local-value 'macher-agent-mode buf))
+           (and (macher-agent--plist-p info)
+                (macher-agent-valid-context-p
+                 (or (plist-get info :macher-agent-context)
+                     (plist-get info :context))))
+           (macher-agent-valid-context-p
+            (buffer-local-value 'macher-agent--persistent-context buf)))))
+
+(defun macher-agent--deep-copy-wire-data (obj)
+  "Return an immutable deep copy of wire structure OBJ without text properties."
+  (cond
+   ((stringp obj) (substring-no-properties obj))
+   ((vectorp obj)
+    (let* ((len (length obj))
+           (vec (make-vector len nil)))
+      (dotimes (i len)
+        (aset vec i (macher-agent--deep-copy-wire-data (aref obj i))))
+      vec))
+   ((consp obj)
+    (let ((head nil)
+          (cur obj))
+      (while (consp cur)
+        (push (macher-agent--deep-copy-wire-data (car cur)) head)
+        (setq cur (cdr cur)))
+      (let ((tail (macher-agent--deep-copy-wire-data cur)))
+        (dolist (elt head tail)
+          (setq tail (cons elt tail))))))
+   (t obj)))
+
+(defun macher-agent--wire-estimate-chars (entries)
+  "Estimate JSON character footprint of wire ENTRIES."
+  (cond
+   ((null entries) 0)
+   ((fboundp 'gptel--json-encode)
+    (condition-case nil
+        (length (gptel--json-encode (vconcat entries)))
+      (error (length (prin1-to-string entries)))))
+   (t (length (prin1-to-string entries)))))
+
+(defun macher-agent--wire-normalize-text (str &optional prompt-pfx response-pfx)
+  "Return whitespace-normalised canonical form of STR.
+Strips optional PROMPT-PFX and RESPONSE-PFX before collapsing whitespace."
+  (if (not (stringp str))
+      ""
+    (let ((s (string-trim str)))
+      (dolist (pfx (list prompt-pfx response-pfx))
+        (when (and (stringp pfx)
+                   (not (string-empty-p (string-trim pfx)))
+                   (string-prefix-p (string-trim pfx) s))
+          (setq s (string-trim-left (substring s (length (string-trim pfx)))))))
+      (when (string-match "\\`\\(?:#+\\|\\*+\\|>+\\)[ \t]+" s)
+        (setq s (substring s (match-end 0))))
+      (string-trim (replace-regexp-in-string "[ \t\r\n]+" " " s)))))
+
+(defun macher-agent--wire-norm-hash (buf beg end)
+  "Compute normalised content hash of BUF between BEG and END."
+  (if (not (and (bufferp buf) (buffer-live-p buf)))
+      (sxhash-equal "")
+    (with-current-buffer buf
+      (let* ((b (max (point-min) (min (point-max) (if (markerp beg) (marker-position beg) beg))))
+             (e (max (point-min) (min (point-max) (if (markerp end) (marker-position end) end))))
+             (raw (if (< b e) (buffer-substring-no-properties b e) ""))
+             (ppfx (when (fboundp 'gptel-prompt-prefix-string)
+                     (ignore-errors (gptel-prompt-prefix-string))))
+             (rpfx (when (fboundp 'gptel-response-prefix-string)
+                     (ignore-errors (gptel-response-prefix-string)))))
+        (sxhash-equal (macher-agent--wire-normalize-text raw ppfx rpfx))))))
+
+(defun macher-agent--wire-last-committed-end (buf &optional before-pos)
+  "Return largest committed `macher-agent-orig-end' in BUF at or before BEFORE-POS."
+  (when-let* ((wbuf (macher-agent--wire-buffer-for buf nil)))
+    (let ((limit (or before-pos (with-current-buffer buf (point-max))))
+          (best nil))
+      (with-current-buffer wbuf
+        (let ((pos (point-min)))
+          (while (< pos (point-max))
+            (let ((next (next-single-property-change
+                         pos 'macher-agent-span-id wbuf (point-max)))
+                  (end-m (get-text-property pos 'macher-agent-orig-end))
+                  (beg-m (get-text-property pos 'macher-agent-orig-beg))
+                  (nonempty (get-text-property pos 'macher-agent-orig-nonempty)))
+              (when (and (markerp end-m)
+                         (eq (marker-buffer end-m) buf)
+                         (<= (marker-position end-m) limit)
+                         (or (not nonempty)
+                             (and (markerp beg-m)
+                                  (< (marker-position beg-m) (marker-position end-m)))))
+                (let ((ep (marker-position end-m)))
+                  (when (or (null best) (> ep best))
+                    (setq best ep))))
+              (setq pos next)))))
+      best)))
+
+(defun macher-agent--shadow-close-reasoning-fence (wbuf fsm)
+  "Close an open reasoning fence in shadow buffer WBUF for FSM."
+  (when (and fsm (bufferp wbuf) (buffer-live-p wbuf))
+    (let ((info (gptel-fsm-info fsm)))
+      (when (and (macher-agent--plist-p info)
+                 (plist-get info :macher-agent-shadow-in-reasoning))
+        (with-current-buffer wbuf
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (pt (point-max)))
+            (save-excursion
+              (goto-char pt)
+              (unless (eq (char-before) ?\n)
+                (insert "\n"))
+              (insert "```\n\n")
+              (put-text-property pt (point) 'gptel 'ignore))))
+        (setq info (plist-put info :macher-agent-shadow-in-reasoning nil))
+        (macher-agent--set-fsm-info fsm info)))))
+
+(defun macher-agent--shadow-append-reasoning (wbuf fsm chunk)
+  "Append reasoning CHUNK into shadow buffer WBUF for FSM."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf))
+    (if (eq chunk t)
+        (macher-agent--shadow-close-reasoning-fence wbuf fsm)
+      (when (and (stringp chunk) (not (string-empty-p chunk)))
+        (let ((info (and fsm (gptel-fsm-info fsm))))
+          (with-current-buffer wbuf
+            (let ((inhibit-read-only t)
+                  (inhibit-modification-hooks t)
+                  (pt (point-max)))
+              (save-excursion
+                (goto-char pt)
+                (unless (and (macher-agent--plist-p info)
+                             (plist-get info :macher-agent-shadow-in-reasoning))
+                  (unless (or (bobp) (eq (char-before) ?\n))
+                    (insert "\n"))
+                  (insert "``` reasoning\n")
+                  (when (macher-agent--plist-p info)
+                    (setq info (plist-put info :macher-agent-shadow-in-reasoning t))
+                    (macher-agent--set-fsm-info fsm info)))
+                (insert (substring-no-properties chunk))
+                (put-text-property pt (point) 'gptel 'ignore)))))))))
+
+(defun macher-agent--shadow-append-tool-results (wbuf fsm tool-results info)
+  "Append formatted TOOL-RESULTS into shadow buffer WBUF for FSM using INFO."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf) (listp tool-results) tool-results)
+    (macher-agent--shadow-close-reasoning-fence wbuf fsm)
+    (let ((tool-use (and (macher-agent--plist-p info) (plist-get info :tool-use)))
+          (used-ids (make-hash-table :test 'equal)))
+      (with-current-buffer wbuf
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t))
+          (save-excursion
+            (goto-char (point-max))
+            (pcase-dolist (`(,tool ,args ,result) tool-results)
+              (let* ((name (or (and (gptel-tool-p tool) (gptel-tool-name tool))
+                               (macher-agent-canonical-tool-name tool)
+                               "unknown_tool"))
+                     (matched-tu
+                      (or (cl-find-if
+                           (lambda (tu)
+                             (and (equal (plist-get tu :name) name)
+                                  (equal (plist-get tu :args) args)
+                                  (not (and (plist-get tu :id)
+                                            (gethash (plist-get tu :id) used-ids)))))
+                           tool-use)
+                          (cl-find-if
+                           (lambda (tu)
+                             (and (equal (plist-get tu :name) name)
+                                  (not (and (plist-get tu :id)
+                                            (gethash (plist-get tu :id) used-ids)))))
+                           tool-use)))
+                     (id (and (listp matched-tu) (plist-get matched-tu :id)))
+                     (call-str (prin1-to-string `(:name ,name :args ,args)))
+                     (res-str (if (stringp result)
+                                  (substring-no-properties result)
+                                (format "%s" (or result ""))))
+                     (head-str (truncate-string-to-width
+                                (string-replace "\n" " " (format "(%s %S)" name args))
+                                80 0 nil " ...)"))
+                     (f1-beg nil)
+                     (body-beg nil)
+                     (f2-beg nil))
+                (when id (puthash id t used-ids))
+                (unless (or (bobp) (eq (char-before) ?\n))
+                  (insert "\n"))
+                (setq f1-beg (point))
+                (insert (format "``` tool %s" head-str))
+                (put-text-property f1-beg (point) 'gptel 'ignore)
+                (setq body-beg (point))
+                (insert "\n" call-str "\n\n" res-str)
+                (put-text-property body-beg (point) 'gptel (cons 'tool id))
+                (setq f2-beg (point))
+                (insert "\n```\n\n")
+                (put-text-property f2-beg (point) 'gptel 'ignore)))
+            (when (and fsm (macher-agent--plist-p info))
+              (let* ((cur-info (gptel-fsm-info fsm))
+                     (cur-data (and (macher-agent--plist-p cur-info)
+                                    (plist-get cur-info :data)))
+                     (post-tret-len (length (macher-agent--existing-prompts-from-data cur-data))))
+                (setq cur-info (plist-put cur-info :macher-agent-wire-shadow-tools-end (point)))
+                (setq cur-info (plist-put cur-info :macher-agent-wire-shadow-final-written nil))
+                (setq cur-info (plist-put cur-info :macher-agent-wire-wait-len post-tret-len))
+                (macher-agent--set-fsm-info fsm cur-info)))))))))
+
+(defun macher-agent--shadow-append-response-chunk (wbuf fsm text)
+  "Append assistant response TEXT into shadow buffer WBUF for FSM."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf)
+             (stringp text) (not (string-empty-p text)))
+    (macher-agent--shadow-close-reasoning-fence wbuf fsm)
+    (with-current-buffer wbuf
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t)
+            (pt (point-max)))
+        (save-excursion
+          (goto-char pt)
+          (insert (substring-no-properties text))
+          (put-text-property pt (point) 'gptel 'response))))
+    (when fsm
+      (let ((cur-info (gptel-fsm-info fsm)))
+        (when (macher-agent--plist-p cur-info)
+          (setq cur-info (plist-put cur-info :macher-agent-wire-shadow-final-written t))
+          (macher-agent--set-fsm-info fsm cur-info))))))
+
+(defun macher-agent--make-wrapped-fsm-callback (actual-fsm target-buf orig-cb)
+  "Build wrapped FSM callback for ACTUAL-FSM, TARGET-BUF, and ORIG-CB."
+  (lambda (&rest cb-args)
+    (when (and target-buf
+               (buffer-live-p target-buf)
+               (fboundp 'gptel-fsm-state)
+               (memq (gptel-fsm-state actual-fsm) '(DONE ERRS ABRT))
+               (eq (buffer-local-value 'macher-agent--active-fsm target-buf)
+                   actual-fsm))
+      (with-current-buffer target-buf
+        (setq-local macher-agent--active-fsm nil)))
+    (let* ((first-arg (car cb-args))
+           (cb-info (cadr cb-args))
+           (fsm-info (and actual-fsm (fboundp 'gptel-fsm-info)
+                          (ignore-errors (gptel-fsm-info actual-fsm))))
+           (eff-info (if (macher-agent--plist-p fsm-info) fsm-info cb-info))
+           (wire-active (and target-buf
+                             (macher-agent--wire-enabled-p target-buf eff-info)
+                             (macher-agent--plist-p eff-info)
+                             (plist-get eff-info :macher-agent-turn-started)
+                             (not (plist-get eff-info :macher-agent-wire-turn-invalidated))))
+           (wbuf (when wire-active
+                   (macher-agent--wire-buffer-for target-buf t))))
+      (cond
+       ((and (consp first-arg) (eq (car first-arg) 'reasoning))
+        (when wbuf
+          (macher-agent--shadow-append-reasoning wbuf actual-fsm (cdr first-arg)))
+        (when (or (not wire-active)
+                  (and (buffer-live-p target-buf)
+                       (with-current-buffer target-buf
+                         (bound-and-true-p gptel-include-reasoning))))
+          (apply orig-cb cb-args)))
+       ((and (consp first-arg) (eq (car first-arg) 'tool-result))
+        (let* ((raw-tr (cdr first-arg))
+               (cb-tools (and (macher-agent--plist-p cb-info)
+                              (plist-get cb-info :tools))))
+          (when (and (listp cb-tools)
+                     (cl-some (lambda (tl) (not (gptel-tool-p tl))) cb-tools))
+            (setq cb-info (plist-put (copy-sequence cb-info) :tools
+                                     (cl-remove-if-not #'gptel-tool-p cb-tools)))
+            (setcar (cdr cb-args) cb-info))
+          (when (and (listp raw-tr)
+                     (cl-some (lambda (tr) (not (gptel-tool-p (car-safe tr)))) raw-tr))
+            (setq raw-tr (macher-agent--sanitize-tool-result-entries raw-tr cb-info))
+            (setcar cb-args (cons 'tool-result raw-tr)))
+          (when wbuf
+            (macher-agent--shadow-append-tool-results wbuf actual-fsm raw-tr cb-info))
+          (apply orig-cb cb-args)
+          (when (and wire-active actual-fsm (buffer-live-p target-buf))
+            (let* ((cur-info (gptel-fsm-info actual-fsm))
+                   (tm (and (macher-agent--plist-p cur-info)
+                            (plist-get cur-info :tracking-marker)))
+                   (pm (and (macher-agent--plist-p cur-info)
+                            (plist-get cur-info :position)))
+                   (orig-tend (cond
+                               ((and (markerp tm) (eq (marker-buffer tm) target-buf))
+                                (marker-position tm))
+                               ((and (markerp pm) (eq (marker-buffer pm) target-buf))
+                                (marker-position pm))
+                               (t nil))))
+              (when (and orig-tend (macher-agent--plist-p cur-info))
+                (setq cur-info (plist-put cur-info :macher-agent-orig-tools-end orig-tend))
+                (macher-agent--set-fsm-info actual-fsm cur-info))))))
+       ((stringp first-arg)
+        (when (and wbuf (null (nth 2 cb-args)))
+          (macher-agent--shadow-append-response-chunk wbuf actual-fsm first-arg))
+        (apply orig-cb cb-args))
+       (t
+        (when wbuf
+          (macher-agent--shadow-close-reasoning-fence wbuf actual-fsm))
+        (apply orig-cb cb-args))))))
+
 (defun macher-agent--fsm-hijack-transform (arg1 &optional arg2)
   "Mutate the FSM using ARG1 and optional ARG2 to inject hooks and media."
   (let* ((callback (cond ((functionp arg1) arg1)
@@ -204,68 +528,72 @@ causing `gptel--display-tool-results' to signal `wrong-type-argument'."
         (macher-agent--set-fsm-info actual-fsm inf)
         (setf (gptel-fsm-info actual-fsm) inf)))
 
-    (when (and actual-fsm orig-cb)
-      (let ((inf (plist-put (gptel-fsm-info actual-fsm) :callback
-                            (lambda (&rest cb-args)
-                              (when (and target-buf
-                                         (buffer-live-p target-buf)
-                                         (fboundp 'gptel-fsm-state)
-                                         (memq (gptel-fsm-state actual-fsm) '(DONE ERRS ABRT))
-                                         (eq (buffer-local-value 'macher-agent--active-fsm target-buf)
-                                             actual-fsm))
-                                (with-current-buffer target-buf
-                                  (setq-local macher-agent--active-fsm nil)))
-                              (when (and (consp (car cb-args))
-                                         (eq (caar cb-args) 'tool-result))
-                                (let* ((cb-info (cadr cb-args))
-                                       (raw-tr (cdar cb-args))
-                                       (cb-tools (and (macher-agent--plist-p cb-info)
-                                                      (plist-get cb-info :tools))))
-                                  (when (and (listp cb-tools)
-                                             (cl-some (lambda (tl) (not (gptel-tool-p tl))) cb-tools))
-                                    (setq cb-info (plist-put (copy-sequence cb-info) :tools
-                                                             (cl-remove-if-not #'gptel-tool-p cb-tools)))
-                                    (setcar (cdr cb-args) cb-info))
-                                  (when (and (listp raw-tr)
-                                             (cl-some (lambda (tr) (not (gptel-tool-p (car-safe tr)))) raw-tr))
-                                    (setcar cb-args
-                                            (cons 'tool-result
-                                                  (macher-agent--sanitize-tool-result-entries
-                                                   raw-tr cb-info))))))
-                              (apply orig-cb cb-args)))))
+    (when (and actual-fsm orig-cb (not (plist-get (gptel-fsm-info actual-fsm) :macher-agent-cb-wrapped)))
+      (let* ((inf (gptel-fsm-info actual-fsm))
+             (wrapped (macher-agent--make-wrapped-fsm-callback actual-fsm target-buf orig-cb)))
+        (setq inf (plist-put inf :callback wrapped))
+        (setq inf (plist-put inf :macher-agent-cb-wrapped t))
         (macher-agent--set-fsm-info actual-fsm inf)
         (setf (gptel-fsm-info actual-fsm) inf)))
 
     (when actual-fsm
       (let* ((handlers (gptel-fsm-handlers actual-fsm))
-             (all-states (delete-dups (append (mapcar #'car handlers) '(WAIT TRET DONE ERRS ABRT))))
+             (all-states (delete-dups (append (mapcar #'car handlers) '(INIT WAIT TRET DONE ERRS ABRT))))
              (augmented-handlers
               (cl-loop for state in all-states
                        for funcs = (alist-get state handlers)
                        collect (cons state
                                      (cond
-                                      ((eq state 'WAIT)
-                                       (if (memq #'macher-agent--inject-media-fsm-logic funcs)
+                                      ((eq state 'INIT)
+                                       (if (memq #'macher-agent--apply-wire-prefix-to-fsm funcs)
                                            funcs
-                                         (cons #'macher-agent--inject-media-fsm-logic funcs)))
+                                         (append funcs (list #'macher-agent--apply-wire-prefix-to-fsm))))
+                                      ((eq state 'WAIT)
+                                       (let ((f funcs))
+                                         (unless (memq #'macher-agent--handle-wire-wait f)
+                                           (setq f (cons #'macher-agent--handle-wire-wait f)))
+                                         (unless (memq #'macher-agent--inject-media-fsm-logic f)
+                                           (setq f (cons #'macher-agent--inject-media-fsm-logic f)))
+                                         (unless (memq #'macher-agent--apply-wire-prefix-to-fsm f)
+                                           (setq f (cons #'macher-agent--apply-wire-prefix-to-fsm f)))
+                                         f))
                                       ((eq state 'TRET)
                                        (if (memq #'macher-agent--sanitize-fsm-tool-results funcs)
                                            funcs
                                          (cons #'macher-agent--sanitize-fsm-tool-results funcs)))
-                                      ((memq state '(DONE ERRS ABRT))
-                                       (if (memq #'macher-agent-gptel--trigger-flush funcs)
-                                           funcs
-                                         (append funcs (list #'macher-agent-gptel--trigger-flush))))
+                                      ((eq state 'DONE)
+                                       (let ((f funcs))
+                                         (unless (memq #'macher-agent--capture-wire-done f)
+                                           (setq f (cons #'macher-agent--capture-wire-done f)))
+                                         (unless (memq #'macher-agent-gptel--trigger-flush f)
+                                           (setq f (append f (list #'macher-agent-gptel--trigger-flush))))
+                                         f))
+                                      ((memq state '(ERRS ABRT))
+                                       (let ((f funcs))
+                                         (unless (memq #'macher-agent--rollback-wire-turn f)
+                                           (setq f (cons #'macher-agent--rollback-wire-turn f)))
+                                         (unless (memq #'macher-agent-gptel--trigger-flush f)
+                                           (setq f (append f (list #'macher-agent-gptel--trigger-flush))))
+                                         f))
                                       (t funcs))))))
         (macher-agent--set-fsm-handlers actual-fsm augmented-handlers)
         (setf (gptel-fsm-handlers actual-fsm) augmented-handlers))
       (macher-agent--install-tret-done-edge actual-fsm))
 
-    (when callback (funcall callback))))
+    (when callback (funcall callback))
+    (when actual-fsm
+      (macher-agent--apply-wire-prefix-to-fsm actual-fsm))))
+
+(defun macher-agent--finalize-wire-transform (async-fn fsm)
+  "Invoke ASYNC-FN and splice pending wire prefix onto FSM `:data'."
+  (when (functionp async-fn)
+    (funcall async-fn))
+  (when fsm
+    (macher-agent--apply-wire-prefix-to-fsm fsm)))
 
 (defconst macher-agent--flv-override-vars
   '(gptel-system-prompt gptel-model gptel-temperature
-    gptel-max-tokens gptel--num-messages-to-send)
+                        gptel-max-tokens gptel--num-messages-to-send)
   "Buffer-local `gptel' variables whose file-local overrides take precedence.")
 
 (defun macher-agent--flv-overrides ()
@@ -367,21 +695,27 @@ unconditionally; otherwise run it only when buffer state diverges."
                         '(response tool))
             (delete-region beg (point-max))))))))
 
-(defun macher-agent--prompt-start-pos ()
-  "Return start position of the trailing user prompt in current buffer."
+(defun macher-agent--prompt-start-pos (&optional end-pos)
+  "Return start position of the trailing user prompt before END-POS."
   (save-excursion
-    (goto-char (point-max))
-    (skip-chars-backward " \t\r\n")
-    (while (and (> (point) (point-min))
-                (eq (get-text-property (1- (point)) 'gptel) 'ignore))
-      (goto-char (or (previous-single-property-change (point) 'gptel)
-                     (point-min)))
-      (skip-chars-backward " \t\r\n"))
-    (if (and (> (point) (point-min))
-             (get-text-property (1- (point)) 'gptel))
-        (point)
-      (or (previous-single-property-change (point) 'gptel)
-          (point-min)))))
+    (let ((limit (or end-pos (point-max))))
+      (goto-char limit)
+      (skip-chars-backward " \t\r\n")
+      (while (and (> (point) (point-min))
+                  (eq (get-text-property (1- (point)) 'gptel) 'ignore))
+        (goto-char (or (previous-single-property-change (point) 'gptel)
+                       (point-min)))
+        (skip-chars-backward " \t\r\n"))
+      (let ((prop-start
+             (if (and (> (point) (point-min))
+                      (get-text-property (1- (point)) 'gptel))
+                 (point)
+               (or (previous-single-property-change (point) 'gptel)
+                   (point-min))))
+            (wire-end (macher-agent--wire-last-committed-end (current-buffer) limit)))
+        (if (and wire-end (> wire-end prop-start))
+            wire-end
+          prop-start)))))
 
 (defun macher-agent--skip-prompt-prefix (pos)
   "Advance from POS past whitespace and prompt prefix (`### ', `*** ')."
@@ -423,8 +757,9 @@ unconditionally; otherwise run it only when buffer state diverges."
             (unless (re-search-forward end-re nil 'move)
               (goto-char (point-max)))))
          ((re-search-forward "@\\([[:alnum:]_-]+\\)" (line-end-position) t)
-          (when (or (= (match-beginning 0) (point-min))
-                    (memq (char-before (match-beginning 0)) '(32 ?\t ?\n ?\r 62)))
+          (when (and (not (eq (get-text-property (match-beginning 0) 'gptel) 'response))
+                     (or (= (match-beginning 0) (point-min))
+                         (memq (char-before (match-beginning 0)) '(32 ?\t ?\n ?\r 62))))
             (let* ((match-start (match-beginning 0))
                    (sym-name (match-string-no-properties 1))
                    (sym (intern sym-name))
@@ -485,8 +820,8 @@ unconditionally; otherwise run it only when buffer state diverges."
       (macher-agent--sync-fsm-request-data
        fsm compiled tools model backend prev-backend))))
 
-(defun macher-agent-transformer-deduplicate-tools (async-fn _fsm)
-  "Remove redundant tool usage blocks and invoke ASYNC-FN."
+(defun macher-agent-transformer-deduplicate-tools (async-fn fsm)
+  "Remove redundant tool usage blocks for FSM and invoke ASYNC-FN."
   (when (and macher-agent-max-duplicate-tools
              (> macher-agent-max-duplicate-tools 0))
     (let ((seen-tools (make-hash-table :test 'equal)))
@@ -522,7 +857,9 @@ unconditionally; otherwise run it only when buffer state diverges."
                       (puthash signature (1+ count) seen-tools)))))))))))
   (when-let* ((fn async-fn)
               ((functionp fn)))
-    (funcall fn)))
+    (funcall fn))
+  (when fsm
+    (macher-agent--apply-wire-prefix-to-fsm fsm)))
 
 (defun macher-agent--transformer-sync-context (orig-buf context)
   "Synchronise CONTEXT struct to live ORIG-BUF."
@@ -830,7 +1167,8 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
            (max-chars (macher-agent--get-max-context-chars
                        target-buf (macher-agent-transmission-state-model state)))
            (buf-size (if (and target-buf (buffer-live-p target-buf))
-                         (with-current-buffer target-buf (buffer-size))
+                         (max (with-current-buffer target-buf (buffer-size))
+                              (macher-agent--wire-total-chars target-buf))
                        0)))
       (when (> buf-size max-chars)
         (let ((ctx (or (macher-agent-transmission-state-context state)
@@ -902,8 +1240,9 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
     (when (and boot-dir (stringp boot-dir) (not (string-empty-p boot-dir))
                target-buf
                (or forced
-                   (not (with-current-buffer target-buf
-                          (text-property-any (point-min) (point-max) 'gptel 'response)))))
+                   (and (not (macher-agent--wire-has-spans-p target-buf))
+                        (not (with-current-buffer target-buf
+                               (text-property-any (point-min) (point-max) 'gptel 'response))))))
       (push boot-dir (macher-agent-transmission-state-directives state))
       (when (and forced
                  (macher-agent-transmission-state-consume-boot-directive state)
@@ -1134,6 +1473,365 @@ Uses optional COUNTS and USED tables from prior buffer tool blocks."
               (member (plist-get msg :role) '("system" "developer"))))
        (append vec nil)))))
 
+(defun macher-agent--parse-buffer-slice (buf beg end backend &optional strip-skills orig-ref-buf id-tables-cell)
+  "Parse BUF between BEG and END into BACKEND prompts.
+When STRIP-SKILLS is non-nil, strip inline `@skill' tags relative to
+ORIG-REF-BUF.  When ID-TABLES-CELL is a cons cell, store `(COUNTS . USED)'
+in its car."
+  (when (and (bufferp buf) (buffer-live-p buf)
+             backend (fboundp 'gptel--create-prompt-buffer))
+    (with-current-buffer buf
+      (let ((b (max (point-min) (min (point-max) beg)))
+            (e (max (point-min) (min (point-max) end))))
+        (when (and (< b e)
+                   (not (string-blank-p (buffer-substring-no-properties b e))))
+          (save-excursion
+            (save-restriction
+              (narrow-to-region b e)
+              (goto-char (point-max))
+              (let* ((mark-active nil)
+                     (copy-buf (gptel--create-prompt-buffer (point))))
+                (unwind-protect
+                    (with-current-buffer copy-buf
+                      (macher-agent--strip-wire-local-variables)
+                      (when strip-skills
+                        (macher-agent--extract-inline-skills
+                         (point-min) (or orig-ref-buf buf)))
+                      (let ((tables (macher-agent--assign-missing-buffer-tool-ids)))
+                        (when (consp id-tables-cell)
+                          (setcar id-tables-cell tables)))
+                      (setq-local gptel-track-response t)
+                      (setq-local gptel-backend backend)
+                      (goto-char (point-max))
+                      (unless (string-blank-p
+                               (buffer-substring-no-properties (point-min) (point-max)))
+                        (gptel--parse-buffer backend nil)))
+                  (when (buffer-live-p copy-buf)
+                    (kill-buffer copy-buf)))))))))))
+
+(defun macher-agent--collect-wire-spans (wbuf)
+  "Scan shadow wire buffer WBUF and return ordered list of span plists."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf))
+    (with-current-buffer wbuf
+      (let ((pos (point-min))
+            (spans nil))
+        (while (< pos (point-max))
+          (let ((sid (get-text-property pos 'macher-agent-span-id))
+                (next (next-single-property-change
+                       pos 'macher-agent-span-id wbuf (point-max))))
+            (when sid
+              (push (list :span-id sid
+                          :turn-id (get-text-property pos 'macher-agent-turn-id)
+                          :kind (get-text-property pos 'macher-agent-span-kind)
+                          :entries (get-text-property pos 'macher-agent-wire-entries)
+                          :backend-type (get-text-property pos 'macher-agent-wire-backend-type)
+                          :chars (or (get-text-property pos 'macher-agent-wire-chars) 0)
+                          :orig-beg (get-text-property pos 'macher-agent-orig-beg)
+                          :orig-end (get-text-property pos 'macher-agent-orig-end)
+                          :prompt-beg (get-text-property pos 'macher-agent-prompt-beg)
+                          :prompt-end (get-text-property pos 'macher-agent-prompt-end)
+                          :nonempty (get-text-property pos 'macher-agent-orig-nonempty)
+                          :norm-hash (get-text-property pos 'macher-agent-norm-hash)
+                          :sbeg pos
+                          :send next)
+                    spans))
+            (setq pos next)))
+        (nreverse spans)))))
+
+(defun macher-agent--prune-shadow-spans (wbuf spans)
+  "Delete SPANS from shadow wire buffer WBUF and detach unreferenced markers."
+  (when (and spans (bufferp wbuf) (buffer-live-p wbuf))
+    (with-current-buffer wbuf
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t)
+            (candidate-markers nil)
+            (still-used (make-hash-table :test 'eq))
+            (sorted (sort (copy-sequence spans)
+                          (lambda (a b) (> (plist-get a :sbeg) (plist-get b :sbeg))))))
+        (dolist (sp sorted)
+          (let ((sb (max (point-min) (min (point-max) (plist-get sp :sbeg))))
+                (se (max (point-min) (min (point-max) (plist-get sp :send)))))
+            (when (< sb se)
+              (let ((pos sb))
+                (while (< pos se)
+                  (dolist (prop '(macher-agent-orig-beg
+                                  macher-agent-orig-end
+                                  macher-agent-prompt-beg
+                                  macher-agent-prompt-end))
+                    (let ((m (get-text-property pos prop)))
+                      (when (markerp m)
+                        (push m candidate-markers))))
+                  (setq pos (next-property-change pos wbuf se))))
+              (delete-region sb se))))
+        (when candidate-markers
+          (let ((pos (point-min)))
+            (while (< pos (point-max))
+              (dolist (prop '(macher-agent-orig-beg
+                              macher-agent-orig-end
+                              macher-agent-prompt-beg
+                              macher-agent-prompt-end))
+                (let ((m (get-text-property pos prop)))
+                  (when (markerp m)
+                    (puthash m t still-used))))
+              (setq pos (next-property-change pos wbuf (point-max)))))
+          (dolist (m candidate-markers)
+            (unless (gethash m still-used)
+              (set-marker m nil))))))))
+
+(defun macher-agent--update-shadow-span (wbuf span new-entries new-hash backend-type)
+  "Update SPAN in WBUF with NEW-ENTRIES, NEW-HASH, and BACKEND-TYPE."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf))
+    (with-current-buffer wbuf
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t)
+            (sb (max (point-min) (min (point-max) (plist-get span :sbeg))))
+            (se (max (point-min) (min (point-max) (plist-get span :send))))
+            (copied (macher-agent--deep-copy-wire-data new-entries)))
+        (when (< sb se)
+          (add-text-properties
+           sb se
+           (list 'macher-agent-wire-entries copied
+                 'macher-agent-norm-hash new-hash
+                 'macher-agent-wire-backend-type backend-type
+                 'macher-agent-wire-chars (macher-agent--wire-estimate-chars copied))))))))
+
+(defun macher-agent--group-wire-spans-by-turn (spans)
+  "Group ordered SPANS list into chronological `(TURN-ID . SPAN-LIST)' cells."
+  (let ((groups nil))
+    (dolist (sp spans)
+      (let* ((tid (plist-get sp :turn-id))
+             (cell (assq tid groups)))
+        (if cell
+            (setcdr cell (append (cdr cell) (list sp)))
+          (push (cons tid (list sp)) groups))))
+    (nreverse groups)))
+
+(defun macher-agent--span-live-in-buf-p (sp buf)
+  "Return non-nil when SPAN SP has live markers attached to BUF."
+  (let ((bm (plist-get sp :orig-beg))
+        (em (plist-get sp :orig-end)))
+    (and (markerp bm) (markerp em)
+         (eq (marker-buffer bm) buf)
+         (eq (marker-buffer em) buf))))
+
+(defun macher-agent--span-deleted-p (sp buf)
+  "Return non-nil when SPAN SP was deleted or cleared to blank in BUF."
+  (or (not (macher-agent--span-live-in-buf-p sp buf))
+      (and (plist-get sp :nonempty)
+           (let ((b (marker-position (plist-get sp :orig-beg)))
+                 (e (marker-position (plist-get sp :orig-end))))
+             (or (>= b e)
+                 (eql (macher-agent--wire-norm-hash buf b e)
+                      (sxhash-equal "")))))))
+
+(defun macher-agent--format-truncation-alert-prompt (backend lines-deleted toolless)
+  "Build synthetic user alert prompt for BACKEND after truncating LINES-DELETED.
+Adjusts wording when TOOLLESS is non-nil."
+  (let ((msg (if toolless
+                 (format "[... SYSTEM ALERT: macher-agent truncated %d lines of early history to conserve tokens ...]"
+                         lines-deleted)
+               (format "[... SYSTEM ALERT: macher-agent truncated %d lines of early history to conserve tokens. If you need this context, use the `search_conversation_history` tool ...]"
+                       lines-deleted))))
+    (or (and backend
+             (fboundp 'gptel--parse-list)
+             (let ((gptel-backend backend)
+                   (gptel-cache nil))
+               (car (ignore-errors (gptel--parse-list backend (list msg))))))
+        (list :role "user" :content msg))))
+
+(defun macher-agent--restore-response-props (buf beg end)
+  "Restore `gptel' `response' property on unpropertised text in BUF `[BEG, END)'."
+  (when (and (bufferp buf) (buffer-live-p buf))
+    (with-current-buffer buf
+      (with-silent-modifications
+        (let ((p (max (point-min) beg))
+              (lim (min (point-max) end)))
+          (while (< p lim)
+            (let ((gp (get-text-property p 'gptel))
+                  (nx (next-single-property-change p 'gptel buf lim)))
+              (unless gp
+                (add-text-properties
+                 p nx '(gptel response rear-nonsticky (gptel))))
+              (setq p nx))))))))
+
+(defun macher-agent--reconcile-wire-history (orig-buf limit-pos effective-backend disable-local-tools &optional max-turns max-chars id-tables-cell)
+  "Reconcile shadow wire history of ORIG-BUF up to LIMIT-POS.
+Formats prompts for EFFECTIVE-BACKEND, flattening tools when
+DISABLE-LOCAL-TOOLS is non-nil, and bounding turns by MAX-TURNS and
+MAX-CHARS.  Stores parsed ID tables in ID-TABLES-CELL when provided."
+  (let* ((wbuf (macher-agent--wire-buffer-for orig-buf nil))
+         (target-btype (and effective-backend (type-of effective-backend)))
+         (spans (and wbuf (macher-agent--collect-wire-spans wbuf)))
+         (groups (macher-agent--group-wire-spans-by-turn spans))
+         (to-prune nil)
+         (turn-bundles nil)
+         (prev-orig-pos (with-current-buffer orig-buf (point-min)))
+         (stop-after-limit nil))
+    (dolist (grp groups)
+      (let* ((gspans (cdr grp))
+             (u-sp (cl-find 'user-prompt gspans :key (lambda (s) (plist-get s :kind))))
+             (t-sp (cl-find 'tool-step gspans :key (lambda (s) (plist-get s :kind))))
+             (f-sp (cl-find 'model-final gspans :key (lambda (s) (plist-get s :kind))))
+             (anchor-sp (or u-sp t-sp f-sp)))
+        (cond
+         ((not (and anchor-sp (macher-agent--span-live-in-buf-p anchor-sp orig-buf)))
+          (setq to-prune (append to-prune gspans)))
+         ((and u-sp (macher-agent--span-deleted-p u-sp orig-buf))
+          (setq to-prune (append to-prune gspans)))
+         ((>= (marker-position (plist-get anchor-sp :orig-beg)) limit-pos)
+          (dolist (sp gspans)
+            (when (macher-agent--span-deleted-p sp orig-buf)
+              (push sp to-prune)))
+          (setq stop-after-limit t))
+         ((not stop-after-limit)
+          (let ((turn-entries nil)
+                (turn-chars 0)
+                (turn-sbeg (plist-get (car gspans) :sbeg))
+                (turn-send (plist-get (car (last gspans)) :send)))
+            (when u-sp
+              (let ((u-beg (marker-position (plist-get u-sp :orig-beg)))
+                    (u-end (min limit-pos (marker-position (plist-get u-sp :orig-end)))))
+                (when (> u-beg prev-orig-pos)
+                  (when-let* ((gap-prompts
+                               (macher-agent--parse-buffer-slice
+                                orig-buf prev-orig-pos u-beg effective-backend t orig-buf id-tables-cell)))
+                    (push (list :entries gap-prompts
+                                :chars (macher-agent--wire-estimate-chars gap-prompts)
+                                :sbeg turn-sbeg :send turn-sbeg)
+                          turn-bundles)))
+                (let* ((cur-hash (macher-agent--wire-norm-hash orig-buf u-beg u-end))
+                       (hash-ok (eql cur-hash (plist-get u-sp :norm-hash)))
+                       (same-b (eq (plist-get u-sp :backend-type) target-btype))
+                       (u-entries
+                        (if (and same-b hash-ok)
+                            (macher-agent--deep-copy-wire-data (plist-get u-sp :entries))
+                          (let ((reparsed (macher-agent--parse-buffer-slice
+                                           orig-buf u-beg u-end effective-backend t orig-buf id-tables-cell)))
+                            (when (and same-b reparsed)
+                              (macher-agent--update-shadow-span wbuf u-sp reparsed cur-hash target-btype))
+                            reparsed))))
+                  (setq turn-entries (append turn-entries u-entries))
+                  (setq turn-chars (+ turn-chars
+                                      (if (and same-b hash-ok)
+                                          (plist-get u-sp :chars)
+                                        (macher-agent--wire-estimate-chars u-entries)))))
+                (setq prev-orig-pos (max prev-orig-pos u-end))))
+            (let ((asst-sp (or t-sp f-sp)))
+              (when (and asst-sp (<= (marker-position (plist-get asst-sp :orig-beg)) limit-pos))
+                (let ((a-beg (marker-position (plist-get asst-sp :orig-beg)))
+                      (f-deleted (and f-sp (macher-agent--span-deleted-p f-sp orig-buf))))
+                  (when (> a-beg prev-orig-pos)
+                    (when-let* ((gap-prompts
+                                 (macher-agent--parse-buffer-slice
+                                  orig-buf prev-orig-pos a-beg effective-backend t orig-buf id-tables-cell)))
+                      (setq turn-entries (append turn-entries gap-prompts))
+                      (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars gap-prompts))))
+                    (setq prev-orig-pos a-beg))
+                  (when t-sp
+                    (if (or (macher-agent--span-deleted-p t-sp orig-buf)
+                            (and f-deleted (not (plist-get t-sp :nonempty))))
+                        (push t-sp to-prune)
+                      (let* ((t-beg (marker-position (plist-get t-sp :orig-beg)))
+                             (t-end (marker-position (plist-get t-sp :orig-end)))
+                             (t-end-c (min limit-pos t-end))
+                             (t-cur-hash (macher-agent--wire-norm-hash orig-buf t-beg t-end-c))
+                             (t-hash-ok (eql t-cur-hash (plist-get t-sp :norm-hash)))
+                             (t-same-b (eq (plist-get t-sp :backend-type) target-btype)))
+                        (if (and t-same-b t-hash-ok)
+                            (progn
+                              (setq turn-entries
+                                    (append turn-entries
+                                            (macher-agent--deep-copy-wire-data (plist-get t-sp :entries))))
+                              (setq turn-chars (+ turn-chars (plist-get t-sp :chars))))
+                          (macher-agent--restore-response-props orig-buf t-beg t-end-c)
+                          (let ((t-reparsed (macher-agent--parse-buffer-slice
+                                             orig-buf t-beg t-end-c
+                                             effective-backend nil orig-buf id-tables-cell)))
+                            (setq turn-entries (append turn-entries t-reparsed))
+                            (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars t-reparsed)))
+                            (when (and t-same-b (= t-end-c t-end) t-reparsed)
+                              (macher-agent--update-shadow-span
+                               wbuf t-sp t-reparsed t-cur-hash target-btype))))
+                        (setq prev-orig-pos (max prev-orig-pos t-end-c)))))
+                  (when (and f-sp (<= (marker-position (plist-get f-sp :orig-beg)) limit-pos))
+                    (if f-deleted
+                        (push f-sp to-prune)
+                      (let* ((f-beg (marker-position (plist-get f-sp :orig-beg)))
+                             (f-end (marker-position (plist-get f-sp :orig-end)))
+                             (f-end-c (min limit-pos f-end)))
+                        (when (> f-beg prev-orig-pos)
+                          (when-let* ((gap-prompts
+                                       (macher-agent--parse-buffer-slice
+                                        orig-buf prev-orig-pos f-beg effective-backend t orig-buf id-tables-cell)))
+                            (setq turn-entries (append turn-entries gap-prompts))
+                            (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars gap-prompts))))
+                          (setq prev-orig-pos f-beg))
+                        (let* ((f-cur-hash (macher-agent--wire-norm-hash orig-buf f-beg f-end-c))
+                               (f-hash-ok (eql f-cur-hash (plist-get f-sp :norm-hash)))
+                               (f-same-b (eq (plist-get f-sp :backend-type) target-btype)))
+                          (if (and f-same-b f-hash-ok)
+                              (progn
+                                (setq turn-entries
+                                      (append turn-entries
+                                              (macher-agent--deep-copy-wire-data (plist-get f-sp :entries))))
+                                (setq turn-chars (+ turn-chars (plist-get f-sp :chars))))
+                            (macher-agent--restore-response-props orig-buf f-beg f-end-c)
+                            (let ((f-reparsed (macher-agent--parse-buffer-slice
+                                               orig-buf f-beg f-end-c
+                                               effective-backend nil orig-buf id-tables-cell)))
+                              (setq turn-entries (append turn-entries f-reparsed))
+                              (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars f-reparsed)))
+                              (when (and f-same-b (= f-end-c f-end) f-reparsed)
+                                (macher-agent--update-shadow-span
+                                 wbuf f-sp f-reparsed f-cur-hash target-btype))))
+                          (setq prev-orig-pos (max prev-orig-pos f-end-c)))))))))
+            (when turn-entries
+              (push (list :entries turn-entries
+                          :chars turn-chars
+                          :sbeg turn-sbeg
+                          :send turn-send)
+                    turn-bundles)))))))
+    (when (< prev-orig-pos limit-pos)
+      (when-let* ((tail-gap
+                   (macher-agent--parse-buffer-slice
+                    orig-buf prev-orig-pos limit-pos effective-backend t orig-buf id-tables-cell)))
+        (push (list :entries tail-gap
+                    :chars (macher-agent--wire-estimate-chars tail-gap)
+                    :sbeg (if wbuf (with-current-buffer wbuf (point-max)) 1)
+                    :send (if wbuf (with-current-buffer wbuf (point-max)) 1))
+              turn-bundles)))
+    (when (and wbuf to-prune)
+      (macher-agent--prune-shadow-spans wbuf (delete-dups to-prune)))
+    (setq turn-bundles (nreverse turn-bundles))
+    (when (and (integerp max-turns) (> max-turns 0))
+      (let ((keep (max 0 (1- max-turns))))
+        (when (> (length turn-bundles) keep)
+          (setq turn-bundles (last turn-bundles keep)))))
+    (let ((truncated-alert nil))
+      (when (and (integerp max-chars) (> max-chars 0) turn-bundles)
+        (let ((total-c (cl-loop for b in turn-bundles sum (plist-get b :chars)))
+              (dropped-send nil)
+              (first-sbeg (plist-get (car turn-bundles) :sbeg)))
+          (while (and (> total-c max-chars) turn-bundles)
+            (let ((dropped (pop turn-bundles)))
+              (setq total-c (- total-c (plist-get dropped :chars)))
+              (setq dropped-send (plist-get dropped :send))))
+          (when (and dropped-send wbuf)
+            (run-hook-with-args 'macher-agent-wire-pre-truncate-hook orig-buf dropped-send)
+            (let ((lines-del (with-current-buffer wbuf
+                               (count-lines (max (point-min) first-sbeg)
+                                            (min (point-max) dropped-send)))))
+              (setq truncated-alert
+                    (macher-agent--format-truncation-alert-prompt
+                     effective-backend (max 1 lines-del) disable-local-tools))))))
+      (let ((flat (cl-loop for b in turn-bundles append (plist-get b :entries))))
+        (when truncated-alert
+          (setq flat (cons truncated-alert flat)))
+        (if (and disable-local-tools
+                 (eq target-btype 'gptel-gemini))
+            (macher-agent--sanitize-prompts-for-toolless flat)
+          flat)))))
+
 (defun macher-agent--build-prompts-from-buffer (buf backend tool-use &optional info)
   "Build BACKEND prompt list from BUF and open TOOL-USE calls using FSM INFO."
   (let* ((tracking (and (macher-agent--plist-p info) (plist-get info :tracking-marker)))
@@ -1143,10 +1841,30 @@ Uses optional COUNTS and USED tables from prior buffer tool blocks."
                              (marker-position tracking))
                         (and (markerp pos) (eq (marker-buffer pos) buf)
                              (marker-position pos)))))
-         (id-tables nil)
+         (id-tables-cell (list nil))
+         (wbuf (and (bufferp buf) (buffer-live-p buf)
+                    (macher-agent--wire-buffer-for buf nil)))
          (prompts
-          (when (and (bufferp buf) (buffer-live-p buf)
-                     (fboundp 'gptel--create-prompt-buffer))
+          (cond
+           ((and wbuf
+                 (macher-agent--wire-has-spans-p buf)
+                 (eq backend (buffer-local-value 'macher-agent--wire-backend buf)))
+            (let* ((pbounds (and (macher-agent--plist-p info)
+                                 (plist-get info :macher-agent-prompt-bounds)))
+                   (limit (or (car-safe pbounds)
+                              (with-current-buffer buf
+                                (macher-agent--prompt-start-pos (or end-pos (point-max))))))
+                   (hist (macher-agent--reconcile-wire-history
+                          buf limit backend nil
+                          (with-current-buffer buf (bound-and-true-p gptel--num-messages-to-send))
+                          nil id-tables-cell))
+                   (active-tail
+                    (macher-agent--parse-buffer-slice
+                     buf limit (or end-pos (with-current-buffer buf (point-max)))
+                     backend t buf id-tables-cell)))
+              (append hist active-tail)))
+           ((and (bufferp buf) (buffer-live-p buf)
+                 (fboundp 'gptel--create-prompt-buffer))
             (with-current-buffer buf
               (save-excursion
                 (goto-char (or end-pos (point-max)))
@@ -1154,7 +1872,7 @@ Uses optional COUNTS and USED tables from prior buffer tool blocks."
                        (copy-buf (gptel--create-prompt-buffer (point))))
                   (unwind-protect
                       (with-current-buffer copy-buf
-                        (setq id-tables (macher-agent--assign-missing-buffer-tool-ids))
+                        (setcar id-tables-cell (macher-agent--assign-missing-buffer-tool-ids))
                         (setq-local gptel-track-response t)
                         (setq-local gptel-backend backend)
                         (goto-char (point-max))
@@ -1165,7 +1883,8 @@ Uses optional COUNTS and USED tables from prior buffer tool blocks."
                            (and (bound-and-true-p gptel--num-messages-to-send)
                                 (* 2 gptel--num-messages-to-send)))))
                     (when (buffer-live-p copy-buf)
-                      (kill-buffer copy-buf))))))))
+                      (kill-buffer copy-buf)))))))))
+         (id-tables (car id-tables-cell))
          (_ (macher-agent--ensure-tool-use-ids
              tool-use (car id-tables) (cdr id-tables)))
          (open-prompts
@@ -1207,44 +1926,545 @@ Deletes `'ignore' spans so adjacent `'response' regions coalesce."
       (delete-region (car rng) (cdr rng)))))
 
 (defun macher-agent--sanitize-prompts-for-toolless (prompts)
-  "Flatten `:functionCall' and `:functionResponse' parts in PROMPTS to `:text'."
+  "Flatten Gemini `:parts' tool structures in PROMPTS to plain text."
   (when (listp prompts)
     (macher-agent--merge-parallel-open-prompts
-     (mapcar
-      (lambda (msg)
-        (if (not (and (listp msg) (vectorp (plist-get msg :parts))))
-            msg
-          (let* ((parts (plist-get msg :parts))
-                 (changed nil)
-                 (new-parts
-                  (vconcat
-                   (mapcar
-                    (lambda (part)
-                      (cond
-                       ((and (listp part) (plist-member part :functionCall))
-                        (setq changed t)
-                        (let ((fc (plist-get part :functionCall)))
-                          (list :text
-                                (format "[Prior tool call %s(%S)]"
-                                        (or (plist-get fc :name) "tool")
-                                        (plist-get fc :args)))))
-                       ((and (listp part) (plist-member part :functionResponse))
-                        (setq changed t)
-                        (let* ((fr (plist-get part :functionResponse))
-                               (inner (plist-get fr :response))
-                               (content (if (listp inner)
-                                            (plist-get inner :content)
-                                          inner)))
-                          (list :text
-                                (format "[Prior tool result %s: %s]"
-                                        (or (plist-get fr :name) "tool")
-                                        (or content "")))))
-                       (t part)))
-                    parts))))
-            (if changed
-                (plist-put (copy-sequence msg) :parts new-parts)
-              msg))))
-      prompts))))
+     (delq nil
+           (mapcar
+            (lambda (msg)
+              (if (and (listp msg) (vectorp (plist-get msg :parts)))
+                  (let* ((parts (plist-get msg :parts))
+                         (changed nil)
+                         (new-parts
+                          (vconcat
+                           (delq nil
+                                 (mapcar
+                                  (lambda (part)
+                                    (cond
+                                     ((and (listp part) (plist-get part :thought))
+                                      (setq changed t)
+                                      nil)
+                                     ((and (listp part) (plist-member part :functionCall))
+                                      (setq changed t)
+                                      (let ((fc (plist-get part :functionCall)))
+                                        (list :text
+                                              (format "[Prior tool call %s(%S)]"
+                                                      (or (plist-get fc :name) "tool")
+                                                      (plist-get fc :args)))))
+                                     ((and (listp part) (plist-member part :functionResponse))
+                                      (setq changed t)
+                                      (let* ((fr (plist-get part :functionResponse))
+                                             (inner (plist-get fr :response))
+                                             (content (if (listp inner)
+                                                          (plist-get inner :content)
+                                                        inner)))
+                                        (list :text
+                                              (format "[Prior tool result %s: %s]"
+                                                      (or (plist-get fr :name) "tool")
+                                                      (or content "")))))
+                                     ((and (listp part) (plist-member part :thoughtSignature))
+                                      (setq changed t)
+                                      (let ((clean (copy-sequence part)))
+                                        (cl-remf clean :thoughtSignature)
+                                        (unless (string-empty-p (or (plist-get clean :text) ""))
+                                          clean)))
+                                     (t part)))
+                                  parts)))))
+                    (if changed
+                        (when (> (length new-parts) 0)
+                          (plist-put (copy-sequence msg) :parts new-parts))
+                      msg))
+                msg))
+            prompts)))))
+
+;;; Shadow Wire Buffer FSM Lifecycle
+
+(defun macher-agent--apply-wire-prefix-to-fsm (fsm)
+  "Splice pending `:macher-agent-wire-prefix' into FSM `:data' idempotently."
+  (when (and fsm (fboundp 'gptel-fsm-info))
+    (let ((info (gptel-fsm-info fsm)))
+      (when (and (macher-agent--plist-p info)
+                 (plist-member info :macher-agent-wire-prefix)
+                 (listp (plist-get info :data))
+                 (keywordp (car (plist-get info :data))))
+        (let* ((prefix (plist-get info :macher-agent-wire-prefix))
+               (backend (plist-get info :backend))
+               (data (plist-get info :data))
+               (new-info (copy-sequence info))
+               (user-len (length (macher-agent--existing-prompts-from-data data))))
+          (cl-remf new-info :macher-agent-wire-prefix)
+          (when (and prefix backend (fboundp 'gptel--inject-prompt))
+            (let* ((msgs (plist-get data :messages))
+                   (inject-pos
+                    (if (vectorp msgs)
+                        (cl-loop for m across msgs
+                                 while (and (listp m)
+                                            (member (plist-get m :role) '("system" "developer")))
+                                 count 1)
+                      0)))
+              (gptel--inject-prompt backend data (macher-agent--deep-copy-wire-data prefix) inject-pos)))
+          (setq new-info (plist-put new-info :macher-agent-wire-prefix-len (length prefix)))
+          (setq new-info (plist-put new-info :macher-agent-wire-user-len user-len))
+          (macher-agent--set-fsm-info fsm new-info)
+          (setf (gptel-fsm-info fsm) new-info)))))
+  fsm)
+
+(defun macher-agent--handle-wire-wait (fsm)
+  "Prepare shadow wire state and callback wrapping on FSM entry to `WAIT'."
+  (macher-agent--apply-wire-prefix-to-fsm fsm)
+  (when (and fsm (fboundp 'gptel-fsm-info))
+    (let* ((info (gptel-fsm-info fsm))
+           (target-buf (and (macher-agent--plist-p info) (plist-get info :buffer))))
+      (when (and (macher-agent--plist-p info)
+                 (not (plist-get info :macher-agent-wire-turn-invalidated))
+                 (macher-agent--wire-enabled-p target-buf info))
+        (if (plist-get info :macher-agent-turn-started)
+            (let* ((new-info (copy-sequence info))
+                   (data (plist-get new-info :data))
+                   (wait-len (length (macher-agent--existing-prompts-from-data data))))
+              (dolist (k '(:reasoning-block :reasoning-marker :partial_reasoning
+                                            :signature))
+                (when (plist-member new-info k)
+                  (setq new-info (plist-put new-info k nil))))
+              (setq new-info (plist-put new-info :macher-agent-wire-wait-len wait-len))
+              (macher-agent--set-fsm-info fsm new-info)
+              (setf (gptel-fsm-info fsm) new-info))
+          (let* ((wbuf (macher-agent--wire-buffer-for target-buf t))
+                 (data (plist-get info :data))
+                 (prefix-len (or (plist-get info :macher-agent-wire-prefix-len) 0))
+                 (total-now (length (macher-agent--existing-prompts-from-data data)))
+                 (user-len (or (plist-get info :macher-agent-wire-user-len)
+                               (max 0 (- total-now prefix-len))))
+                 (pbounds (plist-get info :macher-agent-prompt-bounds))
+                 (pos-m (plist-get info :position))
+                 (pbeg (or (car-safe pbounds)
+                           (with-current-buffer target-buf
+                             (macher-agent--prompt-start-pos
+                              (or (and (markerp pos-m) (eq (marker-buffer pos-m) target-buf)
+                                       (marker-position pos-m))
+                                  (point-max))))))
+                 (pend (or (cdr-safe pbounds)
+                           (and (markerp pos-m) (eq (marker-buffer pos-m) target-buf)
+                                (marker-position pos-m))
+                           (with-current-buffer target-buf (point-max))))
+                 (prompt-text
+                  (or (plist-get info :macher-agent-clean-prompt-text)
+                      (with-current-buffer target-buf
+                        (let ((b (max (point-min) (min (point-max) pbeg)))
+                              (e (max (point-min) (min (point-max) pend))))
+                          (if (< b e) (buffer-substring-no-properties b e) "")))))
+                 (pbeg-m (with-current-buffer target-buf
+                           (let ((m (set-marker (make-marker)
+                                                (max (point-min) (min (point-max) pbeg))
+                                                target-buf)))
+                             (set-marker-insertion-type m nil)
+                             m)))
+                 (pend-m (with-current-buffer target-buf
+                           (let ((m (set-marker (make-marker)
+                                                (max (point-min) (min (point-max) pend))
+                                                target-buf)))
+                             (set-marker-insertion-type m nil)
+                             m)))
+                 (shadow-start nil)
+                 (shadow-uend nil)
+                 (new-info (copy-sequence info)))
+            (with-current-buffer wbuf
+              (let ((inhibit-read-only t)
+                    (inhibit-modification-hooks t))
+                (save-excursion
+                  (goto-char (point-max))
+                  (setq shadow-start (point))
+                  (let ((txt (if (string-empty-p (string-trim prompt-text))
+                                 "### \n\n"
+                               (concat (string-trim-right prompt-text) "\n\n"))))
+                    (insert txt)
+                    (remove-text-properties shadow-start (point) '(gptel nil front-sticky nil)))
+                  (setq shadow-uend (point)))))
+            (setq new-info (plist-put new-info :macher-agent-turn-started t))
+            (setq new-info (plist-put new-info :macher-agent-wire-prefix-len prefix-len))
+            (setq new-info (plist-put new-info :macher-agent-wire-user-len user-len))
+            (setq new-info (plist-put new-info :macher-agent-wire-wait-len total-now))
+            (setq new-info (plist-put new-info :macher-agent-prompt-markers (cons pbeg-m pend-m)))
+            (setq new-info (plist-put new-info :macher-agent-orig-tools-end nil))
+            (setq new-info (plist-put new-info :macher-agent-wire-shadow-turn-start shadow-start))
+            (setq new-info (plist-put new-info :macher-agent-wire-shadow-user-end shadow-uend))
+            (setq new-info (plist-put new-info :macher-agent-wire-shadow-tools-end shadow-uend))
+            (setq new-info (plist-put new-info :macher-agent-wire-shadow-final-written nil))
+            (unless (plist-get new-info :macher-agent-cb-wrapped)
+              (let* ((default-cb (or (plist-get new-info :callback)
+                                     (if (and (plist-get new-info :stream)
+                                              (bound-and-true-p gptel-use-curl))
+                                         #'gptel-curl--stream-insert-response
+                                       #'gptel--insert-response)))
+                     (wrapped (macher-agent--make-wrapped-fsm-callback fsm target-buf default-cb)))
+                (setq new-info (plist-put new-info :callback wrapped))
+                (setq new-info (plist-put new-info :macher-agent-cb-wrapped t))))
+            (macher-agent--set-fsm-info fsm new-info)
+            (setf (gptel-fsm-info fsm) new-info)))))))
+
+(defun macher-agent--ensure-final-wire-entry (fsm final-text)
+  "Ensure FSM `:data' contains the final assistant message for FINAL-TEXT."
+  (let* ((info (gptel-fsm-info fsm))
+         (backend (and (macher-agent--plist-p info) (plist-get info :backend)))
+         (data (and (macher-agent--plist-p info) (plist-get info :data)))
+         (wait-len (or (plist-get info :macher-agent-wire-wait-len) 0))
+         (cur-len (length (macher-agent--existing-prompts-from-data data))))
+    (when (and backend
+               (listp data)
+               (keywordp (car data))
+               (<= cur-len wait-len)
+               (stringp final-text)
+               (not (string-empty-p final-text))
+               (fboundp 'gptel--parse-list)
+               (fboundp 'gptel--inject-prompt))
+      (let* ((gptel-backend backend)
+             (gptel-cache nil)
+             (parsed (ignore-errors (gptel--parse-list backend (list nil final-text))))
+             (asst-msg (car parsed)))
+        (when asst-msg
+          (gptel--inject-prompt backend data asst-msg))))))
+
+(defun macher-agent--extract-shadow-final-text (wbuf from-pos)
+  "Extract `'response'-propertised text in shadow buffer WBUF from FROM-POS."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf) (integerp from-pos))
+    (with-current-buffer wbuf
+      (let ((pos (max (point-min) (min (point-max) from-pos)))
+            (limit (point-max))
+            (parts nil))
+        (while (< pos limit)
+          (let ((prop (get-text-property pos 'gptel))
+                (next (next-single-property-change pos 'gptel wbuf limit)))
+            (when (eq prop 'response)
+              (push (buffer-substring-no-properties pos next) parts))
+            (setq pos next)))
+        (apply #'concat (nreverse parts))))))
+
+(defun macher-agent--annotate-shadow-span (wbuf sbeg send props)
+  "Attach PROPS plist with a fresh `macher-agent-span-id' on WBUF `[SBEG, SEND)'."
+  (with-current-buffer wbuf
+    (let ((inhibit-read-only t)
+          (inhibit-modification-hooks t)
+          (b (max (point-min) (min (point-max) sbeg)))
+          (e (max (point-min) (min (point-max) send))))
+      (when (<= b e)
+        (when (= b e)
+          (save-excursion
+            (goto-char b)
+            (insert "\n")
+            (put-text-property b (point) 'gptel 'ignore)
+            (setq e (point))))
+        (setq-local macher-agent--wire-span-counter (1+ macher-agent--wire-span-counter))
+        (add-text-properties
+         b e
+         (append (list 'macher-agent-span-id macher-agent--wire-span-counter)
+                 props)))
+      e)))
+
+(defun macher-agent--capture-wire-done (fsm)
+  "Commit lossless wire entries and markers for FSM into shadow wire buffer."
+  (when (and fsm (fboundp 'gptel-fsm-info))
+    (let* ((info (gptel-fsm-info fsm))
+           (target-buf (and (macher-agent--plist-p info) (plist-get info :buffer))))
+      (when (and (macher-agent--plist-p info)
+                 (plist-get info :macher-agent-turn-started)
+                 (not (plist-get info :macher-agent-wire-turn-invalidated))
+                 (not (plist-get info :macher-agent-wire-done-captured))
+                 (macher-agent--wire-enabled-p target-buf info))
+        (let* ((wbuf (macher-agent--wire-buffer-for target-buf t))
+               (backend (plist-get info :backend))
+               (btype (and backend (type-of backend)))
+               (start-m (plist-get info :position))
+               (track-m (or (plist-get info :tracking-marker) start-m))
+               (rbeg (if (and (markerp start-m) (eq (marker-buffer start-m) target-buf))
+                         (marker-position start-m)
+                       (with-current-buffer target-buf (point-max))))
+               (rend (if (and (markerp track-m) (eq (marker-buffer track-m) target-buf))
+                         (marker-position track-m)
+                       rbeg))
+               (s-start (plist-get info :macher-agent-wire-shadow-turn-start))
+               (s-uend (plist-get info :macher-agent-wire-shadow-user-end))
+               (s-tend (plist-get info :macher-agent-wire-shadow-tools-end))
+               (vis-text (with-current-buffer target-buf
+                           (let ((b (max (point-min) (min (point-max) rbeg)))
+                                 (e (max (point-min) (min (point-max) rend))))
+                             (if (< b e)
+                                 (macher-agent--extract-turn-response-text b e)
+                               ""))))
+               (raw-md-text (when (plist-get info :macher-agent-wire-shadow-final-written)
+                              (macher-agent--extract-shadow-final-text wbuf s-tend)))
+               (wire-final-text (if (and (stringp raw-md-text)
+                                         (not (string-empty-p raw-md-text)))
+                                    raw-md-text
+                                  vis-text)))
+          (macher-agent--shadow-close-reasoning-fence wbuf fsm)
+          (macher-agent--ensure-final-wire-entry fsm wire-final-text)
+          (let* ((data (plist-get (gptel-fsm-info fsm) :data))
+                 (all-prompts (macher-agent--existing-prompts-from-data data))
+                 (total-len (length all-prompts))
+                 (prefix-len (min total-len
+                                  (or (plist-get info :macher-agent-wire-prefix-len) 0)))
+                 (user-len (min (- total-len prefix-len)
+                                (or (plist-get info :macher-agent-wire-user-len) 0)))
+                 (tools-start (+ prefix-len user-len))
+                 (wait-len (max tools-start
+                                (min total-len
+                                     (or (plist-get info :macher-agent-wire-wait-len)
+                                         tools-start))))
+                 (user-entries (macher-agent--deep-copy-wire-data
+                                (seq-subseq all-prompts prefix-len tools-start)))
+                 (tool-entries (macher-agent--deep-copy-wire-data
+                                (seq-subseq all-prompts tools-start wait-len)))
+                 (final-entries (macher-agent--deep-copy-wire-data
+                                 (nthcdr wait-len all-prompts)))
+                 (orig-tend (cond
+                             ((and tool-entries final-entries)
+                              (max rbeg (min rend
+                                             (or (plist-get info :macher-agent-orig-tools-end)
+                                                 rbeg))))
+                             (tool-entries rend)
+                             (t rbeg)))
+                 (pmarkers (plist-get info :macher-agent-prompt-markers))
+                 (pbeg-m (car-safe pmarkers))
+                 (pend-m (cdr-safe pmarkers))
+                 (rbeg-m (with-current-buffer target-buf
+                           (let ((m (set-marker (make-marker)
+                                                (max (point-min) (min (point-max) rbeg))
+                                                target-buf)))
+                             (set-marker-insertion-type m nil)
+                             m)))
+                 (orig-tend-m (with-current-buffer target-buf
+                                (let ((m (set-marker (make-marker)
+                                                     (max (point-min) (min (point-max) orig-tend))
+                                                     target-buf)))
+                                  (set-marker-insertion-type m nil)
+                                  m)))
+                 (rend-m (with-current-buffer target-buf
+                           (let ((m (set-marker (make-marker)
+                                                (max (point-min) (min (point-max) rend))
+                                                target-buf)))
+                             (set-marker-insertion-type m nil)
+                             m)))
+                 (u-hash (and pbeg-m pend-m
+                              (macher-agent--wire-norm-hash target-buf pbeg-m pend-m)))
+                 (u-nonempty (and u-hash (not (eql u-hash (sxhash-equal "")))))
+                 (t-hash (macher-agent--wire-norm-hash target-buf rbeg-m orig-tend-m))
+                 (t-nonempty (not (eql t-hash (sxhash-equal ""))))
+                 (f-hash (macher-agent--wire-norm-hash target-buf orig-tend-m rend-m))
+                 (f-nonempty (not (eql f-hash (sxhash-equal ""))))
+                 (r-nonempty (or t-nonempty f-nonempty))
+                 (turn-id (with-current-buffer target-buf
+                            (setq-local macher-agent--wire-backend backend)
+                            (setq-local macher-agent--wire-turn-counter
+                                        (1+ macher-agent--wire-turn-counter)))))
+            (when (not r-nonempty)
+              (with-current-buffer target-buf
+                (let ((p (marker-position rend-m)))
+                  (when (and (> p (point-min)) (eq (char-before p) ?\n))
+                    (with-silent-modifications
+                      (add-text-properties
+                       (1- p) p '(gptel ignore rear-nonsticky (gptel))))))))
+            (when (and (= prefix-len 0)
+                       (with-current-buffer target-buf
+                         (and (bound-and-true-p gptel-context)
+                              (bound-and-true-p gptel-use-context)))
+                       (fboundp 'gptel-context--collect-media))
+              (with-current-buffer target-buf
+                (when-let* ((mlist (ignore-errors (gptel-context--collect-media))))
+                  (setq-local macher-agent--wire-last-media-hash (sxhash-equal mlist)))))
+            (with-current-buffer wbuf
+              (let ((inhibit-read-only t)
+                    (inhibit-modification-hooks t))
+                (when (and final-entries
+                           (not (plist-get info :macher-agent-wire-shadow-final-written))
+                           (not (string-empty-p wire-final-text)))
+                  (save-excursion
+                    (goto-char (point-max))
+                    (let ((pt (point)))
+                      (insert wire-final-text)
+                      (put-text-property pt (point) 'gptel 'response))))
+                (save-excursion
+                  (goto-char (point-max))
+                  (unless (eq (char-before) ?\n)
+                    (let ((pt (point)))
+                      (insert "\n\n")
+                      (put-text-property pt (point) 'gptel 'ignore))))))
+            (when (and user-entries (integerp s-start) (integerp s-uend) pbeg-m pend-m)
+              (let ((new-uend
+                     (macher-agent--annotate-shadow-span
+                      wbuf s-start s-uend
+                      (list 'macher-agent-turn-id turn-id
+                            'macher-agent-span-kind 'user-prompt
+                            'macher-agent-wire-entries user-entries
+                            'macher-agent-wire-backend-type btype
+                            'macher-agent-wire-chars (macher-agent--wire-estimate-chars user-entries)
+                            'macher-agent-orig-beg pbeg-m
+                            'macher-agent-orig-end pend-m
+                            'macher-agent-orig-nonempty u-nonempty
+                            'macher-agent-norm-hash u-hash))))
+                (when (= s-tend s-uend)
+                  (setq s-tend new-uend))
+                (setq s-uend new-uend)))
+            (when (and tool-entries (integerp s-uend) (integerp s-tend))
+              (setq s-tend
+                    (macher-agent--annotate-shadow-span
+                     wbuf s-uend s-tend
+                     (list 'macher-agent-turn-id turn-id
+                           'macher-agent-span-kind 'tool-step
+                           'macher-agent-wire-entries tool-entries
+                           'macher-agent-wire-backend-type btype
+                           'macher-agent-wire-chars (macher-agent--wire-estimate-chars tool-entries)
+                           'macher-agent-orig-beg rbeg-m
+                           'macher-agent-orig-end orig-tend-m
+                           'macher-agent-prompt-beg pbeg-m
+                           'macher-agent-prompt-end pend-m
+                           'macher-agent-orig-nonempty t-nonempty
+                           'macher-agent-norm-hash t-hash))))
+            (when (and final-entries (integerp s-tend))
+              (macher-agent--annotate-shadow-span
+               wbuf s-tend (with-current-buffer wbuf (point-max))
+               (list 'macher-agent-turn-id turn-id
+                     'macher-agent-span-kind 'model-final
+                     'macher-agent-wire-entries final-entries
+                     'macher-agent-wire-backend-type btype
+                     'macher-agent-wire-chars (macher-agent--wire-estimate-chars final-entries)
+                     'macher-agent-orig-beg orig-tend-m
+                     'macher-agent-orig-end rend-m
+                     'macher-agent-prompt-beg pbeg-m
+                     'macher-agent-prompt-end rend-m
+                     'macher-agent-orig-nonempty f-nonempty
+                     'macher-agent-norm-hash f-hash)))
+            (let* ((done-info (copy-sequence (gptel-fsm-info fsm))))
+              (setq done-info (plist-put done-info :macher-agent-wire-done-captured t))
+              (when r-nonempty
+                (setq done-info (plist-put done-info :macher-agent-response-end-marker rend-m)))
+              (macher-agent--set-fsm-info fsm done-info)
+              (setf (gptel-fsm-info fsm) done-info))))))))
+
+(defun macher-agent--rollback-wire-turn (fsm)
+  "Roll back uncommitted shadow wire turn output on FSM `ERRS' or `ABRT'."
+  (when (and fsm (fboundp 'gptel-fsm-info))
+    (let* ((info (gptel-fsm-info fsm))
+           (target-buf (and (macher-agent--plist-p info) (plist-get info :buffer))))
+      (when (and (macher-agent--plist-p info)
+                 (plist-get info :macher-agent-turn-started)
+                 (not (plist-get info :macher-agent-wire-done-captured)))
+        (when-let* ((pmarkers (plist-get info :macher-agent-prompt-markers)))
+          (when (markerp (car-safe pmarkers)) (set-marker (car pmarkers) nil))
+          (when (markerp (cdr-safe pmarkers)) (set-marker (cdr pmarkers) nil)))
+        (when-let* ((wbuf (and target-buf (macher-agent--wire-buffer-for target-buf nil)))
+                    (s-start (plist-get info :macher-agent-wire-shadow-turn-start)))
+          (with-current-buffer wbuf
+            (let ((inhibit-read-only t)
+                  (inhibit-modification-hooks t)
+                  (b (max (point-min) (min (point-max) s-start))))
+              (when (< b (point-max))
+                (macher-agent--wire-clear-buffer-markers wbuf b (point-max))
+                (delete-region b (point-max))))))
+        (let ((clean-info (plist-put (copy-sequence info)
+                                     :macher-agent-turn-started nil)))
+          (macher-agent--set-fsm-info fsm clean-info)
+          (setf (gptel-fsm-info fsm) clean-info))))))
+
+(defun macher-agent--clone-wire-buffer (parent-buf child-buf)
+  "Clone shadow wire buffer from PARENT-BUF into CHILD-BUF with fresh markers."
+  (when (and (bufferp parent-buf) (buffer-live-p parent-buf)
+             (bufferp child-buf) (buffer-live-p child-buf)
+             (macher-agent--wire-has-spans-p parent-buf))
+    (when-let* ((parent-wbuf (macher-agent--wire-buffer-for parent-buf nil))
+                (child-wbuf (macher-agent--wire-buffer-for child-buf t)))
+      (let ((raw-copy (with-current-buffer parent-wbuf (buffer-string)))
+            (turn-cnt (buffer-local-value 'macher-agent--wire-turn-counter parent-buf))
+            (span-cnt (buffer-local-value 'macher-agent--wire-span-counter parent-wbuf))
+            (media-h (buffer-local-value 'macher-agent--wire-last-media-hash parent-buf))
+            (wire-b (buffer-local-value 'macher-agent--wire-backend parent-buf))
+            (marker-map (make-hash-table :test 'eq)))
+        (with-current-buffer child-buf
+          (setq-local macher-agent--wire-turn-counter turn-cnt)
+          (setq-local macher-agent--wire-last-media-hash media-h)
+          (setq-local macher-agent--wire-backend wire-b))
+        (with-current-buffer child-wbuf
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t))
+            (erase-buffer)
+            (insert raw-copy)
+            (setq-local macher-agent--wire-span-counter span-cnt)
+            (let ((pos (point-min)))
+              (while (< pos (point-max))
+                (let ((next (next-single-property-change
+                             pos 'macher-agent-span-id child-wbuf (point-max))))
+                  (when (get-text-property pos 'macher-agent-span-id)
+                    (dolist (prop '(macher-agent-orig-beg
+                                    macher-agent-orig-end
+                                    macher-agent-prompt-beg
+                                    macher-agent-prompt-end))
+                      (let ((pm (get-text-property pos prop)))
+                        (when (and (markerp pm) (eq (marker-buffer pm) parent-buf))
+                          (let ((cm (or (gethash pm marker-map)
+                                        (with-current-buffer child-buf
+                                          (let ((m (set-marker
+                                                    (make-marker)
+                                                    (min (point-max)
+                                                         (max (point-min) (marker-position pm)))
+                                                    child-buf)))
+                                            (set-marker-insertion-type m (marker-insertion-type pm))
+                                            (puthash pm m marker-map)
+                                            m)))))
+                            (put-text-property pos next prop cm)))))
+                    (when-let* ((ents (get-text-property pos 'macher-agent-wire-entries)))
+                      (put-text-property
+                       pos next 'macher-agent-wire-entries
+                       (macher-agent--deep-copy-wire-data ents))))
+                  (setq pos next))))))))))
+
+(defun macher-agent-clear-wire-buffer (&optional buffer)
+  "Clear committed spans and markers in shadow wire buffer for BUFFER."
+  (interactive)
+  (let ((buf (or buffer (current-buffer))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (setq-local macher-agent--wire-last-media-hash nil)
+        (setq-local macher-agent--wire-backend nil)
+        (when-let* ((fsm (bound-and-true-p macher-agent--active-fsm))
+                    ((fboundp 'gptel-fsm-info))
+                    (info (ignore-errors (gptel-fsm-info fsm)))
+                    ((macher-agent--plist-p info)))
+          (let ((was-started (plist-get info :macher-agent-turn-started)))
+            (when-let* ((pmarkers (plist-get info :macher-agent-prompt-markers)))
+              (when (markerp (car-safe pmarkers)) (set-marker (car pmarkers) nil))
+              (when (markerp (cdr-safe pmarkers)) (set-marker (cdr pmarkers) nil)))
+            (dolist (k '(:macher-agent-turn-started
+                         :macher-agent-wire-prefix
+                         :macher-agent-wire-prefix-len
+                         :macher-agent-wire-user-len
+                         :macher-agent-wire-wait-len
+                         :macher-agent-prompt-markers
+                         :macher-agent-orig-tools-end
+                         :macher-agent-wire-shadow-turn-start
+                         :macher-agent-wire-shadow-user-end
+                         :macher-agent-wire-shadow-tools-end
+                         :macher-agent-wire-shadow-final-written
+                         :macher-agent-shadow-in-reasoning))
+              (when (plist-member info k)
+                (setq info (plist-put info k nil))))
+            (when was-started
+              (setq info (plist-put info :macher-agent-wire-turn-invalidated t)))
+            (macher-agent--set-fsm-info fsm info)
+            (setf (gptel-fsm-info fsm) info))))
+      (when-let* ((wbuf (macher-agent--wire-buffer-for buf nil)))
+        (macher-agent--wire-clear-buffer-markers wbuf)
+        (with-current-buffer wbuf
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t))
+            (erase-buffer)))))))
+
+(defun macher-agent-inspect-wire-buffer (&optional buffer)
+  "Display the hidden shadow wire buffer associated with BUFFER."
+  (interactive)
+  (let* ((buf (or buffer (current-buffer)))
+         (wbuf (macher-agent--wire-buffer-for buf nil)))
+    (if (not wbuf)
+        (user-error "No shadow wire buffer recorded for %s" (buffer-name buf))
+      (pop-to-buffer wbuf))))
 
 (defun macher-agent--resolve-backend-url (backend model info)
   "Resolve URL string for BACKEND and MODEL given FSM INFO, or nil."
@@ -1296,6 +2516,11 @@ NORMALIZED-TOOLS, MODEL, and BACKEND, tracking transitions from PREV-BACKEND."
            (effective-tools (unless disable-local-tools normalized-tools))
            (info-updated nil))
       (when is-plist
+        (when backend-changed-p
+          (let ((tbuf (plist-get info :buffer)))
+            (when (and (bufferp tbuf) (buffer-live-p tbuf))
+              (macher-agent-clear-wire-buffer tbuf)
+              (setq info (gptel-fsm-info fsm)))))
         (when (and backend (not (eq backend info-backend)))
           (unless info-updated (setq info (copy-sequence info)))
           (setq info (plist-put info :backend backend)
@@ -1631,7 +2856,27 @@ Invokes ASYNC-FN when transformation finishes."
                       (macher-agent-resolve-context orig-buf)))
          (_ (unless (eq temp-buf orig-buf)
               (macher-agent--strip-wire-local-variables)))
-         (prompt-start (macher-agent--prompt-start-pos)))
+         (prompt-start
+          (let ((base-ps (macher-agent--prompt-start-pos)))
+            (if (and (not (eq temp-buf orig-buf))
+                     (buffer-live-p orig-buf)
+                     (macher-agent--wire-has-spans-p orig-buf))
+                (let* ((pm (and (macher-agent--plist-p info) (plist-get info :position)))
+                       (s-end (if (and (markerp pm) (eq (marker-buffer pm) orig-buf))
+                                  (marker-position pm)
+                                (with-current-buffer orig-buf (point-max))))
+                       (o-beg (with-current-buffer orig-buf
+                                (macher-agent--prompt-start-pos s-end)))
+                       (o-tail (with-current-buffer orig-buf
+                                 (let ((b (max (point-min) (min (point-max) o-beg)))
+                                       (e (max (point-min) (min (point-max) s-end))))
+                                   (and (<= b e) (buffer-substring-no-properties b e)))))
+                       (t-str (buffer-substring-no-properties (point-min) (point-max))))
+                  (if (and o-tail (string-suffix-p o-tail t-str))
+                      (max base-ps (- (point-max) (length o-tail)))
+                    base-ps))
+              base-ps)))
+         (prompt-start-marker (copy-marker prompt-start nil)))
 
     (when (buffer-live-p orig-buf)
       (with-current-buffer orig-buf
@@ -1714,7 +2959,7 @@ Invokes ASYNC-FN when transformation finishes."
         (macher-agent--update-fsm-info-from-transmission-state active-fsm state))
 
       (when-let* ((redirect-text (macher-agent-transmission-state-redirect-prompt state)))
-        (let ((replace-from (macher-agent--skip-prompt-prefix prompt-start)))
+        (let ((replace-from (macher-agent--skip-prompt-prefix (marker-position prompt-start-marker))))
           (delete-region replace-from (point-max))
           (goto-char replace-from)
           (insert redirect-text))
@@ -1723,6 +2968,85 @@ Invokes ASYNC-FN when transformation finishes."
             (with-no-warnings (setf (gptel-fsm-prompt active-fsm) redirect-text)))
           (macher-agent--set-fsm-info active-fsm
                                       (plist-put (gptel-fsm-info active-fsm) :prompt redirect-text))))
+
+      (let* ((cur-info (and active-fsm (gptel-fsm-info active-fsm)))
+             (wire-ok (and active-fsm
+                           (not (eq temp-buf orig-buf))
+                           (macher-agent--wire-enabled-p orig-buf cur-info)
+                           (eq (buffer-local-value 'major-mode temp-buf)
+                               (buffer-local-value 'major-mode orig-buf))
+                           (not (with-current-buffer orig-buf (use-region-p)))))
+             (_ (when wire-ok
+                  (let ((eff-backend (plist-get payload :backend))
+                        (prev-wire-backend (buffer-local-value 'macher-agent--wire-backend orig-buf)))
+                    (when (and prev-wire-backend
+                               (not (eq eff-backend prev-wire-backend)))
+                      (macher-agent-clear-wire-buffer orig-buf))
+                    (when (or (not (plist-get cur-info :dry-run))
+                              (eq eff-backend (buffer-local-value 'gptel-backend orig-buf)))
+                      (with-current-buffer orig-buf
+                        (setq-local macher-agent--wire-backend eff-backend))))))
+             (pos-m (and (macher-agent--plist-p cur-info) (plist-get cur-info :position)))
+             (send-end (if (and (markerp pos-m) (eq (marker-buffer pos-m) orig-buf))
+                           (marker-position pos-m)
+                         (with-current-buffer orig-buf (point-max))))
+             (orig-prompt-beg (when wire-ok
+                                (with-current-buffer orig-buf
+                                  (macher-agent--prompt-start-pos send-end))))
+             (has-wire-spans (and wire-ok (macher-agent--wire-has-spans-p orig-buf)))
+             (has-untracked-pre
+              (and wire-ok
+                   (not has-wire-spans)
+                   (not (plist-get cur-info :dry-run))
+                   (with-current-buffer orig-buf
+                     (and (> orig-prompt-beg (point-min))
+                          (not (string-blank-p
+                                (buffer-substring-no-properties
+                                 (point-min) orig-prompt-beg))))))))
+        (when wire-ok
+          (when (null gptel-include-reasoning)
+            (setq-local gptel-include-reasoning t))
+          (let* ((ps-pos (marker-position prompt-start-marker))
+                 (clean-prompt-txt (buffer-substring-no-properties ps-pos (point-max)))
+                 (upd-info (copy-sequence (gptel-fsm-info active-fsm))))
+            (setq upd-info (plist-put upd-info :macher-agent-prompt-bounds
+                                      (cons orig-prompt-beg send-end)))
+            (setq upd-info (plist-put upd-info :macher-agent-clean-prompt-text
+                                      clean-prompt-txt))
+            (cond
+             ((or has-wire-spans has-untracked-pre)
+              (let ((wire-prefix
+                     (macher-agent--reconcile-wire-history
+                      orig-buf
+                      orig-prompt-beg
+                      (plist-get payload :backend)
+                      (macher-agent-transmission-state-disable-local-tools state)
+                      (with-current-buffer orig-buf
+                        (bound-and-true-p gptel--num-messages-to-send))
+                      (macher-agent--get-max-context-chars
+                       orig-buf (plist-get payload :model)))))
+                (when (> ps-pos (point-min))
+                  (delete-region (point-min) ps-pos))
+                (when wire-prefix
+                  (when (consp gptel-system-prompt)
+                    (setq-local gptel-system-prompt
+                                (car (gptel--parse-directive gptel-system-prompt 'raw))))
+                  (when (and (bound-and-true-p gptel-context)
+                             (bound-and-true-p gptel-use-context)
+                             (fboundp 'gptel-context--collect-media))
+                    (let ((prev-mh (buffer-local-value 'macher-agent--wire-last-media-hash orig-buf))
+                          (cur-mh (when-let* ((ml (ignore-errors (gptel-context--collect-media))))
+                                    (sxhash-equal ml))))
+                      (when (and prev-mh cur-mh (eql prev-mh cur-mh))
+                        (setq-local gptel-context nil)))))
+                (setq upd-info (plist-put upd-info :macher-agent-wire-prefix wire-prefix))))
+             ((> ps-pos (point-min))
+              (save-restriction
+                (narrow-to-region (point-min) ps-pos)
+                (macher-agent--extract-inline-skills (point-min) orig-buf))))
+            (macher-agent--set-fsm-info active-fsm upd-info)
+            (setf (gptel-fsm-info active-fsm) upd-info))))
+      (set-marker prompt-start-marker nil)
 
       (when (and (macher-agent-transmission-state-disable-local-tools state)
                  (not (eq temp-buf orig-buf)))
@@ -1733,7 +3057,9 @@ Invokes ASYNC-FN when transformation finishes."
 
     (when-let* ((fn async-fn)
                 ((functionp fn)))
-      (funcall fn))))
+      (funcall fn))
+    (when active-fsm
+      (macher-agent--apply-wire-prefix-to-fsm active-fsm))))
 
 ;;; Transmission Execution
 
@@ -1882,42 +3208,42 @@ scope submission and error checks to that task ID."
                               expected-task-id
                               (bound-and-true-p macher-agent--persistent-context)))))
              (if (not recovery-attempted)
-               (progn
-                 (setq recovery-attempted t)
-                 (setq-local macher-agent--submit-recovery-pending t)
-                 (save-excursion
+                 (progn
+                   (setq recovery-attempted t)
+                   (setq-local macher-agent--submit-recovery-pending t)
+                   (save-excursion
+                     (goto-char (point-max))
+                     (let* ((raw-prefix (or (and (boundp 'gptel-prompt-prefix-alist)
+                                                 (alist-get major-mode gptel-prompt-prefix-alist))
+                                            (when (fboundp 'gptel-prompt-prefix-string)
+                                              (ignore-errors (gptel-prompt-prefix-string)))
+                                            ""))
+                            (prefix (if (stringp raw-prefix) raw-prefix ""))
+                            (formatted-prefix
+                             (cond
+                              ((string-empty-p prefix) "")
+                              ((string-match-p "[ \t\r\n]\\'" prefix) prefix)
+                              (t (concat prefix " "))))
+                            (sep (cond
+                                  ((bobp) "")
+                                  ((looking-back "\n\n" (max (point-min) (- (point) 2))) "")
+                                  ((looking-back "\n" (max (point-min) (- (point) 1))) "\n")
+                                  (t "\n\n")))
+                            (msg-body "CRITICAL: You must submit your final answer using the `submit_task_result` tool. Do not reply with plain text. Call `submit_task_result` now.")
+                            (msg-text (concat sep formatted-prefix msg-body))
+                            (ins-beg (point)))
+                       (insert msg-text)
+                       (remove-text-properties ins-beg (point) '(gptel nil front-sticky nil))))
                    (goto-char (point-max))
-                   (let* ((raw-prefix (or (and (boundp 'gptel-prompt-prefix-alist)
-                                               (alist-get major-mode gptel-prompt-prefix-alist))
-                                          (when (fboundp 'gptel-prompt-prefix-string)
-                                            (ignore-errors (gptel-prompt-prefix-string)))
-                                          ""))
-                          (prefix (if (stringp raw-prefix) raw-prefix ""))
-                          (formatted-prefix
-                           (cond
-                            ((string-empty-p prefix) "")
-                            ((string-match-p "[ \t\r\n]\\'" prefix) prefix)
-                            (t (concat prefix " "))))
-                          (sep (cond
-                                ((bobp) "")
-                                ((looking-back "\n\n" (max (point-min) (- (point) 2))) "")
-                                ((looking-back "\n" (max (point-min) (- (point) 1))) "\n")
-                                (t "\n\n")))
-                          (msg-body "CRITICAL: You must submit your final answer using the `submit_task_result` tool. Do not reply with plain text. Call `submit_task_result` now.")
-                          (msg-text (concat sep formatted-prefix msg-body))
-                          (ins-beg (point)))
-                     (insert msg-text)
-                     (remove-text-properties ins-beg (point) '(gptel nil front-sticky nil))))
-                 (goto-char (point-max))
-                 (condition-case send-err
-                     (gptel-send)
-                   (error
-                    (setq-local macher-agent--submit-recovery-pending nil)
-                    (remove-hook 'gptel-post-response-functions hook-fn t)
-                    (funcall on-error (error-message-string send-err)))))
-             (setq-local macher-agent--submit-recovery-pending nil)
-             (remove-hook 'gptel-post-response-functions hook-fn t)
-             (funcall on-error "Agent halted without invoking submit_task_result."))))))))
+                   (condition-case send-err
+                       (gptel-send)
+                     (error
+                      (setq-local macher-agent--submit-recovery-pending nil)
+                      (remove-hook 'gptel-post-response-functions hook-fn t)
+                      (funcall on-error (error-message-string send-err)))))
+               (setq-local macher-agent--submit-recovery-pending nil)
+               (remove-hook 'gptel-post-response-functions hook-fn t)
+               (funcall on-error "Agent halted without invoking submit_task_result."))))))))
     hook-fn))
 
 (defun macher-agent-gptel-transmit (task-context callbacks)
@@ -2220,6 +3546,18 @@ Checks whether a resolvable tool is absent from `gptel-tools'."
           (setq-local macher-agent--persistent-context cloned)))
       (setq-local macher-agent-presets (with-current-buffer parent-buf macher-agent-presets))
       (setq-local gptel-tools (with-current-buffer parent-buf gptel-tools))
+      (when (local-variable-p 'gptel-include-reasoning parent-buf)
+        (setq-local gptel-include-reasoning
+                    (buffer-local-value 'gptel-include-reasoning parent-buf)))
+      (when (local-variable-p 'gptel-include-tool-results parent-buf)
+        (setq-local gptel-include-tool-results
+                    (buffer-local-value 'gptel-include-tool-results parent-buf)))
+      (when (or (buffer-local-value 'macher-agent--is-workspace parent-buf)
+                (and (boundp 'macher-agent-mode)
+                     (buffer-local-value 'macher-agent-mode parent-buf)))
+        (setq-local macher-agent--is-workspace t)
+        (macher-agent-setup-gptel-buffer))
+      (macher-agent--clone-wire-buffer parent-buf (current-buffer))
       (switch-to-buffer (current-buffer)))))
 
 (defun macher-agent-clear-context ()
@@ -2262,6 +3600,12 @@ Checks whether a resolvable tool is absent from `gptel-tools'."
              (agent-ctx (when (macher-agent-valid-context-p raw-ctx) raw-ctx)))
         (if (buffer-live-p target-buf)
             (with-current-buffer target-buf
+              (when (eq (gptel-fsm-state fsm) 'DONE)
+                (let ((rend-m (plist-get info :macher-agent-response-end-marker)))
+                  (when (and (markerp rend-m)
+                             (eq (marker-buffer rend-m) target-buf)
+                             (< (marker-position rend-m) (point-max)))
+                    (set-marker-insertion-type rend-m t))))
               (when (memq (gptel-fsm-state fsm) '(ERRS ABRT))
                 (setq-local macher-agent--staged-submission nil))
               (when (eq macher-agent--active-fsm fsm)

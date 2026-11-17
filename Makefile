@@ -5,6 +5,9 @@ EMACS ?= emacs
 # Find source files while ignoring hidden files, tests, package descriptors, and generated autoloads
 EL_FILES := $(shell find . -maxdepth 2 -name "*.el" \
 	! -path "./bench/*" \
+	! -path "./gptel/*" \
+	! -path "./macher/*" \
+	! -path "./tests/*" \
 	! -name "*test.el" \
 	! -name ".*" \
 	! -name "*-pkg.el" \
@@ -19,7 +22,12 @@ define SETUP_DEPS
   (dolist (pkg '(gptel macher package-lint)) \
     (unless (package-installed-p pkg) \
       (unless package-archive-contents (package-refresh-contents)) \
-      (package-install pkg))))
+      (package-install pkg))) \
+  (when (file-directory-p (expand-file-name "macher" default-directory)) \
+    (push (expand-file-name "macher" default-directory) load-path)) \
+  (when (file-directory-p (expand-file-name "gptel" default-directory)) \
+    (push (expand-file-name "gptel" default-directory) load-path)) \
+  (push (expand-file-name default-directory) load-path))
 endef
 export SETUP_DEPS
 
@@ -77,6 +85,7 @@ define PACKAGE_LINT_ELISP
   (let ((errors 0)) \
     (dolist (file command-line-args-left) \
       (with-current-buffer (find-file-noselect file) \
+        (setq-local package-lint-main-file (expand-file-name "macher-agent.el" default-directory)) \
         (let ((lint-errors (package-lint-buffer))) \
           (when lint-errors \
             (message "\n--- package-lint issues in %s ---" file) \

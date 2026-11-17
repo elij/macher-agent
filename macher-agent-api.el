@@ -43,6 +43,7 @@
 
   (add-hook 'macher-agent-buffer-flush-hook #'macher-agent--flush-sweep-buffer)
   (add-hook 'gptel-prompt-transform-functions #'macher-agent--fsm-hijack-transform)
+  (add-hook 'gptel-prompt-transform-functions #'macher-agent--finalize-wire-transform 90)
   (add-hook 'hack-local-variables-hook #'macher-agent--restore-local-state)
   (add-hook 'gptel-save-state-hook #'macher-agent--sync-preset-before-save)
   (add-hook 'before-save-hook #'macher-agent--persist-missing-preset-tools 90)

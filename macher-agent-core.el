@@ -19,6 +19,7 @@
 (declare-function vc-root-dir "vc-hooks" ())
 
 (defvar gptel-directives)
+(defvar gptel-track-response)
 
 (cl-defstruct (macher-agent-session
                (:constructor make-macher-agent-session)
@@ -198,6 +199,17 @@ When nil or non-positive, no timeout timer is armed."
   :type '(choice (const :tag "No timeout" nil) number)
   :group 'macher-agent)
 
+(defcustom macher-agent-wire-buffer-mode t
+  "When non-nil, maintain a lossless shadow wire buffer for multi-turn replay.
+Captures provider wire entries (`thoughtSignature', reasoning blocks,
+tool calls, and full tool results) in a hidden shadow buffer and replays
+them across turns independently of user-buffer display settings such as
+`gptel-include-reasoning' and `gptel-include-tool-results'.  When nil,
+the shadow wire buffer is disabled and `gptel' parses the visible chat
+buffer directly."
+  :type 'boolean
+  :group 'macher-agent)
+
 (defvar macher-agent--active-sandbox-dir nil
   "Dynamically bound temporary VFS sandbox directory during sandbox execution.")
 
@@ -344,7 +356,19 @@ When nil or non-positive, no timeout timer is armed."
 (defvar-local macher-agent--preset-request-params nil
   "Last `gptel--request-params' value installed locally by a skill or preset.")
 
+(defvar-local macher-agent--wire-buffer nil
+  "Hidden shadow buffer storing lossless wire entries and verbose transcripts.")
+
+(defvar-local macher-agent--wire-origin-buffer nil
+  "User-facing chat buffer associated with the current shadow wire buffer.")
+
+(defvar-local macher-agent--wire-turn-counter 0
+  "Monotonic turn counter assigning `macher-agent-turn-id' values.")
+
 (put 'macher-agent--active-fsm 'permanent-local t)
+(put 'macher-agent--wire-buffer 'permanent-local t)
+(put 'macher-agent--wire-origin-buffer 'permanent-local t)
+(put 'macher-agent--wire-turn-counter 'permanent-local t)
 (put 'macher-agent--disable-local-tools 'permanent-local t)
 (put 'macher-agent--preset-request-params 'permanent-local t)
 (put 'macher-agent--current-task-id 'permanent-local t)
@@ -433,7 +457,7 @@ When nil or non-positive, no timeout timer is armed."
   `(macher-agent--set-context-parent-buffer ,ctx ,val))
 
 (defun macher-agent-context-from-buffer (buffer-or-name)
-  "Extract the context object strictly from a live buffer or string name."
+  "Extract context object from live buffer or string BUFFER-OR-NAME."
   (let ((buf (if (bufferp buffer-or-name) buffer-or-name (and (stringp buffer-or-name) (get-buffer buffer-or-name)))))
     (when (and buf (buffer-live-p buf))
       (buffer-local-value 'macher-agent--persistent-context buf))))
@@ -632,7 +656,7 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
   (macher-agent-context-project-root ws))
 
 (defun macher-agent--set-workspace-project-root (workspace path)
-  "Update the absolute project root in WORKSPACE struct."
+  "Update the absolute project root in WORKSPACE struct to PATH."
   (cl-check-type workspace macher-agent-context)
   (setf (macher-agent-context-project-root workspace) path))
 
@@ -759,6 +783,80 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
         (concat "Agent: " name)
       "Agent: Workspace")))
 
+(defun macher-agent--wire-clear-buffer-markers (wbuf &optional beg end)
+  "Detach markers stored on text properties in WBUF between BEG and END."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf))
+    (with-current-buffer wbuf
+      (let ((pos (or beg (point-min)))
+            (limit (or end (point-max))))
+        (while (< pos limit)
+          (dolist (prop '(macher-agent-orig-beg
+                          macher-agent-orig-end
+                          macher-agent-prompt-beg
+                          macher-agent-prompt-end))
+            (let ((m (get-text-property pos prop)))
+              (when (markerp m)
+                (set-marker m nil))))
+          (setq pos (next-property-change pos wbuf limit)))))))
+
+(defun macher-agent--cleanup-wire-buffer ()
+  "Detach markers and kill the shadow wire buffer owned by `current-buffer'."
+  (let ((wbuf (bound-and-true-p macher-agent--wire-buffer)))
+    (setq-local macher-agent--wire-buffer nil)
+    (when (and (bufferp wbuf) (buffer-live-p wbuf))
+      (macher-agent--wire-clear-buffer-markers wbuf)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer wbuf)))))
+
+(defun macher-agent--wire-buffer-for (buf &optional create)
+  "Return live shadow wire buffer for BUF, creating it when CREATE is non-nil."
+  (when (and (bufferp buf) (buffer-live-p buf))
+    (let ((existing (buffer-local-value 'macher-agent--wire-buffer buf)))
+      (cond
+       ((and (bufferp existing) (buffer-live-p existing))
+        existing)
+       (create
+        (let ((wbuf (generate-new-buffer
+                     (format " *macher-agent-wire:%s*" (buffer-name buf)))))
+          (with-current-buffer wbuf
+            (fundamental-mode)
+            (buffer-disable-undo)
+            (setq-local bidi-display-reordering nil)
+            (setq-local bidi-paragraph-direction 'left-to-right)
+            (setq-local font-lock-mode nil)
+            (setq-local jit-lock-mode nil)
+            (setq-local gptel-track-response t)
+            (setq-local macher-agent--wire-origin-buffer buf))
+          (with-current-buffer buf
+            (setq-local macher-agent--wire-buffer wbuf)
+            (add-hook 'kill-buffer-hook #'macher-agent--cleanup-wire-buffer nil t))
+          wbuf))
+       (t nil)))))
+
+(defun macher-agent--wire-has-spans-p (buf)
+  "Return non-nil when BUF owns a shadow wire buffer with committed spans."
+  (when-let* ((wbuf (macher-agent--wire-buffer-for buf nil)))
+    (with-current-buffer wbuf
+      (and (> (buffer-size) 0)
+           (not (null (text-property-not-all
+                       (point-min) (point-max) 'macher-agent-turn-id nil)))))))
+
+(defun macher-agent--wire-total-chars (buf)
+  "Return total wire character count tracked in shadow buffer for BUF."
+  (if-let* ((wbuf (macher-agent--wire-buffer-for buf nil)))
+      (with-current-buffer wbuf
+        (let ((pos (point-min))
+              (total 0))
+          (while (< pos (point-max))
+            (let ((next (next-single-property-change
+                         pos 'macher-agent-wire-chars wbuf (point-max)))
+                  (chars (get-text-property pos 'macher-agent-wire-chars)))
+              (when (integerp chars)
+                (setq total (+ total chars)))
+              (setq pos next)))
+          (if (> total 0) total (buffer-size))))
+    0))
+
 (defun macher-agent-search-glob (orig-buf query &optional ctx-lines)
   "Search QUERY in live ORIG-BUF with optional CTX-LINES context."
   (cl-check-type orig-buf buffer)
@@ -768,32 +866,35 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
         (invalid-re nil))
     (if (not (buffer-live-p orig-buf))
         "Error: Cannot locate original conversation buffer."
-      (with-current-buffer orig-buf
-        (save-excursion
-          (goto-char (point-min))
-          (condition-case err
-              (let ((continue t))
-                (while (and continue (re-search-forward query nil t))
-                  (let* ((match-beg (match-beginning 0))
-                         (match-end (match-end 0))
-                         (start-pt (save-excursion
+      (let ((search-buf (or (and (macher-agent--wire-has-spans-p orig-buf)
+                                 (macher-agent--wire-buffer-for orig-buf nil))
+                            orig-buf)))
+        (with-current-buffer search-buf
+          (save-excursion
+            (goto-char (point-min))
+            (condition-case err
+                (let ((continue t))
+                  (while (and continue (re-search-forward query nil t))
+                    (let* ((match-beg (match-beginning 0))
+                           (match-end (match-end 0))
+                           (start-pt (save-excursion
+                                       (goto-char match-beg)
+                                       (forward-line (- ctx-lines))
+                                       (line-beginning-position)))
+                           (end-pt (save-excursion
                                      (goto-char match-beg)
-                                     (forward-line (- ctx-lines))
-                                     (line-beginning-position)))
-                         (end-pt (save-excursion
-                                   (goto-char match-beg)
-                                   (forward-line ctx-lines)
-                                   (line-end-position)))
-                         (snippet (buffer-substring-no-properties start-pt end-pt)))
-                    (push (format "--- Match near line %d ---\n%s\n"
-                                  (line-number-at-pos match-beg) snippet)
-                          results)
-                    (when (= match-beg match-end)
-                      (if (eobp)
-                          (setq continue nil)
-                        (forward-char 1))))))
-            (invalid-regexp
-             (setq invalid-re (error-message-string err))))))
+                                     (forward-line ctx-lines)
+                                     (line-end-position)))
+                           (snippet (buffer-substring-no-properties start-pt end-pt)))
+                      (push (format "--- Match near line %d ---\n%s\n"
+                                    (line-number-at-pos match-beg) snippet)
+                            results)
+                      (when (= match-beg match-end)
+                        (if (eobp)
+                            (setq continue nil)
+                          (forward-char 1))))))
+              (invalid-regexp
+               (setq invalid-re (error-message-string err)))))))
       (cond
        (invalid-re
         (format "Error: Invalid regular expression: %s" invalid-re))

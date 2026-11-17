@@ -18,6 +18,8 @@
 (defvar gptel--known-presets)
 (defvar gptel--known-tools)
 (defvar gptel-directives)
+(defvar gptel-include-reasoning)
+(defvar gptel-include-tool-results)
 
 (defvar macher-agent-submit-task-result-tool nil
   "Store the tool object for task result submission.")
@@ -165,7 +167,10 @@ Inherits model and preset tables from PARENT-BUF and sets TARGET-DIR."
     (when (and (bufferp parent-buf) (buffer-live-p parent-buf) (not (eq parent-buf buf)))
       (dolist (var '(gptel-model gptel-backend gptel-temperature gptel-max-tokens
                      gptel--known-presets gptel--known-tools gptel-directives))
-        (set (make-local-variable var) (buffer-local-value var parent-buf))))
+        (set (make-local-variable var) (buffer-local-value var parent-buf)))
+      (dolist (var '(gptel-include-reasoning gptel-include-tool-results))
+        (when (local-variable-p var parent-buf)
+          (set (make-local-variable var) (buffer-local-value var parent-buf)))))
     (when (bound-and-true-p gptel-mode)
       (macher-agent--install-subagent-hooks))))
 
