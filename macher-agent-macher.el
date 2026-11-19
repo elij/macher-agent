@@ -92,7 +92,8 @@
   (cl-check-type ctx macher-agent-context)
   (let* ((raw-root (macher-agent-context-project-root ctx))
          (canonical-root (when raw-root
-                           (file-truename (expand-file-name raw-root))))
+                           (file-name-as-directory
+                            (file-truename (expand-file-name raw-root)))))
          (ws (cons 'project canonical-root))
          (mapped-contents
           (mapcar (lambda (entry)
