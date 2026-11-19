@@ -62,6 +62,9 @@
 (defvar macher-agent-wire-pre-truncate-hook nil
   "Hook run with `(ORIG-BUF SHADOW-OFFSET)' before wire horizon truncation.")
 
+(defvar macher-agent-wire-invalidated-hook nil
+  "Hook run with `(ORIG-BUF REASON)' when shadow wire spans are invalidated.")
+
 (defvar-local macher-agent--wire-backend nil
   "Backend instance associated with committed spans in the shadow wire buffer.")
 (put 'macher-agent--wire-backend 'permanent-local t)
@@ -277,16 +280,27 @@ Strips optional PROMPT-PFX and RESPONSE-PFX before collapsing whitespace."
   "Return largest committed `macher-agent-orig-end' in BUF at or before BEFORE-POS."
   (when-let* ((wbuf (macher-agent--wire-buffer-for buf nil)))
     (let ((limit (or before-pos (with-current-buffer buf (point-max))))
+          (dead-turns (make-hash-table :test 'equal))
           (best nil))
       (with-current-buffer wbuf
         (let ((pos (point-min)))
           (while (< pos (point-max))
             (let ((next (next-single-property-change
                          pos 'macher-agent-span-id wbuf (point-max)))
+                  (tid (get-text-property pos 'macher-agent-turn-id))
+                  (kind (get-text-property pos 'macher-agent-span-kind))
                   (end-m (get-text-property pos 'macher-agent-orig-end))
                   (beg-m (get-text-property pos 'macher-agent-orig-beg))
                   (nonempty (get-text-property pos 'macher-agent-orig-nonempty)))
-              (when (and (markerp end-m)
+              (when (and tid (memq kind '(user-prompt gap))
+                         nonempty
+                         (or (not (and (markerp beg-m) (markerp end-m)
+                                       (eq (marker-buffer beg-m) buf)
+                                       (eq (marker-buffer end-m) buf)))
+                             (>= (marker-position beg-m) (marker-position end-m))))
+                (puthash tid t dead-turns))
+              (when (and (not (and tid (gethash tid dead-turns)))
+                         (markerp end-m)
                          (eq (marker-buffer end-m) buf)
                          (<= (marker-position end-m) limit)
                          (or (not nonempty)
@@ -1538,69 +1552,254 @@ in its car."
             (setq pos next)))
         (nreverse spans)))))
 
-(defun macher-agent--prune-shadow-spans (wbuf spans)
-  "Delete SPANS from shadow wire buffer WBUF and detach unreferenced markers."
-  (when (and spans (bufferp wbuf) (buffer-live-p wbuf))
+(defun macher-agent--find-shadow-span-bounds (wbuf span-id)
+  "Return live `(SBEG . SEND)' bounds for SPAN-ID in shadow buffer WBUF."
+  (when (and span-id (bufferp wbuf) (buffer-live-p wbuf))
     (with-current-buffer wbuf
-      (let ((inhibit-read-only t)
-            (inhibit-modification-hooks t)
-            (candidate-markers nil)
-            (still-used (make-hash-table :test 'eq))
-            (sorted (sort (copy-sequence spans)
-                          (lambda (a b) (> (plist-get a :sbeg) (plist-get b :sbeg))))))
-        (dolist (sp sorted)
-          (let ((sb (max (point-min) (min (point-max) (plist-get sp :sbeg))))
-                (se (max (point-min) (min (point-max) (plist-get sp :send)))))
-            (when (< sb se)
-              (let ((pos sb))
-                (while (< pos se)
-                  (dolist (prop '(macher-agent-orig-beg
-                                  macher-agent-orig-end
-                                  macher-agent-prompt-beg
-                                  macher-agent-prompt-end))
-                    (let ((m (get-text-property pos prop)))
-                      (when (markerp m)
-                        (push m candidate-markers))))
-                  (setq pos (next-property-change pos wbuf se))))
-              (delete-region sb se))))
-        (when candidate-markers
-          (let ((pos (point-min)))
-            (while (< pos (point-max))
-              (dolist (prop '(macher-agent-orig-beg
-                              macher-agent-orig-end
-                              macher-agent-prompt-beg
-                              macher-agent-prompt-end))
-                (let ((m (get-text-property pos prop)))
-                  (when (markerp m)
-                    (puthash m t still-used))))
-              (setq pos (next-property-change pos wbuf (point-max)))))
-          (dolist (m candidate-markers)
-            (unless (gethash m still-used)
-              (set-marker m nil))))))))
+      (let ((pos (point-min))
+            (found nil))
+        (while (and (not found) (< pos (point-max)))
+          (let ((sid (get-text-property pos 'macher-agent-span-id))
+                (next (next-single-property-change
+                       pos 'macher-agent-span-id wbuf (point-max))))
+            (when (eql sid span-id)
+              (setq found (cons pos next)))
+            (setq pos next)))
+        found))))
 
-(defun macher-agent--update-shadow-span (wbuf span new-entries new-hash backend-type)
-  "Update SPAN in WBUF with NEW-ENTRIES, NEW-HASH, and BACKEND-TYPE."
-  (when (and (bufferp wbuf) (buffer-live-p wbuf))
+(defun macher-agent--prune-shadow-spans (wbuf spans &optional orig-buf)
+  "Delete SPANS from shadow wire buffer WBUF and detach unreferenced markers.
+When ORIG-BUF (or `macher-agent--wire-origin-buffer') is live and any
+span is removed, run `macher-agent-wire-invalidated-hook' with `pruned'."
+  (when (and spans (bufferp wbuf) (buffer-live-p wbuf))
+    (let ((target-orig (or orig-buf
+                           (buffer-local-value 'macher-agent--wire-origin-buffer wbuf)))
+          (removed nil))
+      (with-current-buffer wbuf
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t)
+              (candidate-markers nil)
+              (still-used (make-hash-table :test 'eq))
+              (ranges nil))
+          (dolist (sp spans)
+            (let* ((live (when-let* ((sid (plist-get sp :span-id)))
+                           (macher-agent--find-shadow-span-bounds wbuf sid)))
+                   (sb (max (point-min) (min (point-max)
+                                             (or (car-safe live) (plist-get sp :sbeg)))))
+                   (se (max (point-min) (min (point-max)
+                                             (or (cdr-safe live) (plist-get sp :send))))))
+              (when (< sb se)
+                (push (cons sb se) ranges))))
+          (setq ranges (sort ranges (lambda (a b) (> (car a) (car b)))))
+          (dolist (rng ranges)
+            (let ((sb (max (point-min) (min (point-max) (car rng))))
+                  (se (max (point-min) (min (point-max) (cdr rng)))))
+              (when (< sb se)
+                (setq removed t)
+                (let ((pos sb))
+                  (while (< pos se)
+                    (dolist (prop '(macher-agent-orig-beg
+                                    macher-agent-orig-end
+                                    macher-agent-prompt-beg
+                                    macher-agent-prompt-end))
+                      (let ((m (get-text-property pos prop)))
+                        (when (markerp m)
+                          (push m candidate-markers))))
+                    (setq pos (next-property-change pos wbuf se))))
+                (delete-region sb se))))
+          (when candidate-markers
+            (let ((pos (point-min)))
+              (while (< pos (point-max))
+                (dolist (prop '(macher-agent-orig-beg
+                                macher-agent-orig-end
+                                macher-agent-prompt-beg
+                                macher-agent-prompt-end))
+                  (let ((m (get-text-property pos prop)))
+                    (when (markerp m)
+                      (puthash m t still-used))))
+                (setq pos (next-property-change pos wbuf (point-max)))))
+            (dolist (m candidate-markers)
+              (unless (gethash m still-used)
+                (set-marker m nil))))))
+      (when (and removed (bufferp target-orig) (buffer-live-p target-orig))
+        (unless (macher-agent--wire-has-spans-p target-orig)
+          (with-current-buffer target-orig
+            (setq-local macher-agent--wire-horizon-turn-id nil)
+            (setq-local macher-agent--wire-horizon-lines-deleted nil)
+            (setq-local macher-agent--wire-dedup-turn-id nil)))
+        (run-hook-with-args 'macher-agent-wire-invalidated-hook target-orig 'pruned)))))
+
+(defun macher-agent--insert-slice-with-shadow-props (wbuf orig-buf beg end kind)
+  "Insert ORIG-BUF `[BEG, END)' text into WBUF at point for span KIND.
+Preserves `gptel' response/tool semantics and ensures trailing newline
+separation.  Returns `(INS-BEG . INS-END)' in WBUF."
+  (let* ((raw-str (with-current-buffer orig-buf
+                    (let ((b (max (point-min) (min (point-max) beg)))
+                          (e (max (point-min) (min (point-max) end))))
+                      (if (< b e) (buffer-substring b e) ""))))
+         (trimmed (string-trim-right raw-str))
+         (is-resp-kind (memq kind '(model-final tool-step)))
+         (ins-beg nil)
+         (ins-end nil))
     (with-current-buffer wbuf
-      (let ((inhibit-read-only t)
-            (inhibit-modification-hooks t)
-            (sb (max (point-min) (min (point-max) (plist-get span :sbeg))))
-            (se (max (point-min) (min (point-max) (plist-get span :send))))
-            (copied (macher-agent--deep-copy-wire-data new-entries)))
-        (when (< sb se)
-          (add-text-properties
-           sb se
-           (list 'macher-agent-wire-entries copied
-                 'macher-agent-norm-hash new-hash
-                 'macher-agent-wire-backend-type backend-type
-                 'macher-agent-wire-chars (macher-agent--wire-estimate-chars copied))))))))
+      (setq ins-beg (point))
+      (unless (string-empty-p trimmed)
+        (insert trimmed)
+        (let ((pos ins-beg)
+              (lim (point)))
+          (while (< pos lim)
+            (let ((gp (get-text-property pos 'gptel))
+                  (next (next-single-property-change pos 'gptel wbuf lim)))
+              (cond
+               ((eq kind 'user-prompt)
+                (set-text-properties pos next nil))
+               (is-resp-kind
+                (if (or (eq gp 'ignore) (and (consp gp) (eq (car gp) 'tool)))
+                    (set-text-properties pos next (list 'gptel gp))
+                  (set-text-properties pos next '(gptel response))))
+               (t
+                (if (or (eq gp 'response)
+                        (eq gp 'ignore)
+                        (and (consp gp) (eq (car gp) 'tool)))
+                    (set-text-properties pos next (list 'gptel gp))
+                  (set-text-properties pos next nil))))
+              (setq pos next)))))
+      (let ((sep-start (point)))
+        (insert "\n\n")
+        (if is-resp-kind
+            (set-text-properties sep-start (point) '(gptel ignore))
+          (set-text-properties sep-start (point) nil)))
+      (setq ins-end (point)))
+    (cons ins-beg ins-end)))
+
+(defun macher-agent--update-shadow-span (wbuf span new-entries new-hash backend-type &optional orig-buf)
+  "Update SPAN in WBUF with edited ORIG-BUF text and NEW-ENTRIES.
+Stores NEW-HASH and BACKEND-TYPE on the updated span."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf))
+    (let* ((target-orig (or orig-buf
+                            (buffer-local-value 'macher-agent--wire-origin-buffer wbuf)))
+           (live (when-let* ((sid (plist-get span :span-id)))
+                   (macher-agent--find-shadow-span-bounds wbuf sid)))
+           (copied (macher-agent--deep-copy-wire-data new-entries))
+           (updated nil))
+      (with-current-buffer wbuf
+        (let* ((inhibit-read-only t)
+               (inhibit-modification-hooks t)
+               (sb (max (point-min) (min (point-max)
+                                         (or (car-safe live) (plist-get span :sbeg)))))
+               (se (max (point-min) (min (point-max)
+                                         (or (cdr-safe live) (plist-get span :send))))))
+          (when (< sb se)
+            (let* ((sid (or (plist-get span :span-id)
+                            (get-text-property sb 'macher-agent-span-id)))
+                   (tid (or (plist-get span :turn-id)
+                            (get-text-property sb 'macher-agent-turn-id)))
+                   (kind (or (plist-get span :kind)
+                             (get-text-property sb 'macher-agent-span-kind)))
+                   (ob-m (or (plist-get span :orig-beg)
+                             (get-text-property sb 'macher-agent-orig-beg)))
+                   (oe-m (or (plist-get span :orig-end)
+                             (get-text-property sb 'macher-agent-orig-end)))
+                   (pb-m (or (plist-get span :prompt-beg)
+                             (get-text-property sb 'macher-agent-prompt-beg)))
+                   (pe-m (or (plist-get span :prompt-end)
+                             (get-text-property sb 'macher-agent-prompt-end)))
+                   (nonempty (not (eql new-hash (sxhash-equal ""))))
+                   (span-props
+                    (append
+                     (list 'macher-agent-span-id sid
+                           'macher-agent-turn-id tid
+                           'macher-agent-span-kind kind
+                           'macher-agent-wire-entries copied
+                           'macher-agent-norm-hash new-hash
+                           'macher-agent-wire-backend-type backend-type
+                           'macher-agent-wire-chars (macher-agent--wire-estimate-chars copied)
+                           'macher-agent-orig-beg ob-m
+                           'macher-agent-orig-end oe-m
+                           'macher-agent-orig-nonempty nonempty)
+                     (when pb-m (list 'macher-agent-prompt-beg pb-m))
+                     (when pe-m (list 'macher-agent-prompt-end pe-m)))))
+              (if (and (bufferp target-orig) (buffer-live-p target-orig)
+                       (markerp ob-m) (markerp oe-m)
+                       (eq (marker-buffer ob-m) target-orig)
+                       (eq (marker-buffer oe-m) target-orig))
+                  (save-excursion
+                    (delete-region sb se)
+                    (goto-char sb)
+                    (pcase-let ((`(,nb . ,ne)
+                                 (macher-agent--insert-slice-with-shadow-props
+                                  wbuf target-orig
+                                  (marker-position ob-m)
+                                  (marker-position oe-m)
+                                  kind)))
+                      (when (< nb ne)
+                        (add-text-properties nb ne span-props))))
+                (add-text-properties sb se span-props))
+              (setq updated t)))))
+      (when (and updated (bufferp target-orig) (buffer-live-p target-orig))
+        (run-hook-with-args 'macher-agent-wire-invalidated-hook target-orig 'updated)))))
+
+(defun macher-agent--insert-shadow-gap-span (wbuf orig-buf beg end insert-pos entries turn-id &optional kind backend-type)
+  "Insert untracked ORIG-BUF `[BEG, END)' gap span into WBUF at INSERT-POS.
+Uses ENTRIES, TURN-ID (or `(gap . span-id)' when nil), KIND, and BACKEND-TYPE.
+Fires `macher-agent-wire-invalidated-hook' with `updated'."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf)
+             (bufferp orig-buf) (buffer-live-p orig-buf)
+             entries (< beg end))
+    (let* ((ob-m (with-current-buffer orig-buf
+                   (let ((m (set-marker (make-marker)
+                                        (max (point-min) (min (point-max) beg))
+                                        orig-buf)))
+                     (set-marker-insertion-type m nil)
+                     m)))
+           (oe-m (with-current-buffer orig-buf
+                   (let ((m (set-marker (make-marker)
+                                        (max (point-min) (min (point-max) end))
+                                        orig-buf)))
+                     (set-marker-insertion-type m nil)
+                     m)))
+           (norm-h (macher-agent--wire-norm-hash orig-buf beg end))
+           (nonempty (not (eql norm-h (sxhash-equal ""))))
+           (copied (macher-agent--deep-copy-wire-data entries))
+           (eff-kind (or kind 'gap))
+           (chars (macher-agent--wire-estimate-chars copied)))
+      (with-current-buffer wbuf
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t))
+          (save-excursion
+            (goto-char (max (point-min) (min (point-max) (or insert-pos (point-max)))))
+            (unless (or (bobp) (eq (char-before) ?\n))
+              (let ((nl-pt (point)))
+                (insert "\n")
+                (set-text-properties nl-pt (point) nil)))
+            (setq-local macher-agent--wire-span-counter
+                        (1+ macher-agent--wire-span-counter))
+            (let* ((sid macher-agent--wire-span-counter)
+                   (eff-tid (or turn-id (cons 'gap sid))))
+              (pcase-let ((`(,nb . ,ne)
+                           (macher-agent--insert-slice-with-shadow-props
+                            wbuf orig-buf beg end eff-kind)))
+                (when (< nb ne)
+                  (add-text-properties
+                   nb ne
+                   (list 'macher-agent-span-id sid
+                         'macher-agent-turn-id eff-tid
+                         'macher-agent-span-kind eff-kind
+                         'macher-agent-wire-entries copied
+                         'macher-agent-wire-backend-type backend-type
+                         'macher-agent-wire-chars chars
+                         'macher-agent-orig-beg ob-m
+                         'macher-agent-orig-end oe-m
+                         'macher-agent-orig-nonempty nonempty
+                         'macher-agent-norm-hash norm-h))))))))
+      (run-hook-with-args 'macher-agent-wire-invalidated-hook orig-buf 'updated))))
 
 (defun macher-agent--group-wire-spans-by-turn (spans)
   "Group ordered SPANS list into chronological `(TURN-ID . SPAN-LIST)' cells."
   (let ((groups nil))
     (dolist (sp spans)
       (let* ((tid (plist-get sp :turn-id))
-             (cell (assq tid groups)))
+             (cell (assoc tid groups)))
         (if cell
             (setcdr cell (append (cdr cell) (list sp)))
           (push (cons tid (list sp)) groups))))
@@ -1654,183 +1853,465 @@ Adjusts wording when TOOLLESS is non-nil."
                  p nx '(gptel response rear-nonsticky (gptel))))
               (setq p nx))))))))
 
+(defun macher-agent--sync-shadow-spans (orig-buf limit-pos effective-backend &optional id-tables-cell)
+  "Synchronise shadow wire spans of ORIG-BUF up to LIMIT-POS.
+Prunes deleted spans, updates edited spans in place, and materialises
+manual gap insertions for EFFECTIVE-BACKEND into `wbuf'.  Optionally
+records parsed ID tables in ID-TABLES-CELL."
+  (when (and (bufferp orig-buf) (buffer-live-p orig-buf))
+    (let* ((wbuf (macher-agent--wire-buffer-for orig-buf nil))
+           (target-btype (and effective-backend (type-of effective-backend)))
+           (spans (and wbuf (macher-agent--collect-wire-spans wbuf)))
+           (groups (macher-agent--group-wire-spans-by-turn spans))
+           (to-prune nil)
+           (prev-orig-pos (with-current-buffer orig-buf (point-min)))
+           (stop-after-limit nil))
+      (dolist (grp groups)
+        (let* ((tid (car grp))
+               (gspans (cdr grp))
+               (u-sp (cl-find 'user-prompt gspans :key (lambda (s) (plist-get s :kind))))
+               (t-sp (cl-find 'tool-step gspans :key (lambda (s) (plist-get s :kind))))
+               (f-sp (cl-find 'model-final gspans :key (lambda (s) (plist-get s :kind))))
+               (g-sp (cl-find 'gap gspans :key (lambda (s) (plist-get s :kind))))
+               (standalone-gap-p (and g-sp (not u-sp) (not t-sp) (not f-sp)))
+               (anchor-sp (or u-sp t-sp f-sp g-sp)))
+          (cond
+           ((not (and anchor-sp (macher-agent--span-live-in-buf-p anchor-sp orig-buf)))
+            (setq to-prune (append to-prune gspans)))
+           ((and u-sp (macher-agent--span-deleted-p u-sp orig-buf))
+            (setq to-prune (append to-prune gspans)))
+           ((and standalone-gap-p (macher-agent--span-deleted-p g-sp orig-buf))
+            (setq to-prune (append to-prune gspans)))
+           ((>= (marker-position (plist-get anchor-sp :orig-beg)) limit-pos)
+            (dolist (sp gspans)
+              (when (macher-agent--span-deleted-p sp orig-buf)
+                (push sp to-prune)))
+            (setq stop-after-limit t))
+           ((not stop-after-limit)
+            (let ((f-deleted (and f-sp (macher-agent--span-deleted-p f-sp orig-buf))))
+              (dolist (sp gspans)
+                (let* ((sp-kind (plist-get sp :kind))
+                       (sp-live (macher-agent--span-live-in-buf-p sp orig-buf))
+                       (sp-deleted
+                        (or (not sp-live)
+                            (macher-agent--span-deleted-p sp orig-buf)
+                            (and (eq sp-kind 'tool-step)
+                                 f-deleted
+                                 (not (plist-get sp :nonempty)))))
+                       (sp-beg (and sp-live (marker-position (plist-get sp :orig-beg))))
+                       (sp-end (and sp-live (marker-position (plist-get sp :orig-end)))))
+                  (cond
+                   (sp-deleted
+                    (push sp to-prune))
+                   ((or stop-after-limit
+                        (and (not (eq sp-kind 'user-prompt))
+                             (not standalone-gap-p)
+                             (> sp-beg limit-pos)))
+                    (setq stop-after-limit t))
+                   (t
+                    (let* ((sp-end-c (min limit-pos sp-end))
+                           (is-prompt-like (memq sp-kind '(user-prompt gap)))
+                           (gap-tid (unless (or standalone-gap-p (eq sp-kind 'user-prompt))
+                                      tid)))
+                      (when (> sp-beg prev-orig-pos)
+                        (when-let* ((gap-prompts
+                                     (macher-agent--parse-buffer-slice
+                                      orig-buf prev-orig-pos sp-beg effective-backend t orig-buf id-tables-cell))
+                                    (ins-pos (or (car-safe (macher-agent--find-shadow-span-bounds
+                                                            wbuf (plist-get sp :span-id)))
+                                                 (plist-get sp :sbeg))))
+                          (macher-agent--insert-shadow-gap-span
+                           wbuf orig-buf prev-orig-pos sp-beg ins-pos gap-prompts gap-tid 'gap target-btype))
+                        (setq prev-orig-pos sp-beg))
+                      (when (and (= sp-end-c sp-end)
+                                 (eq (plist-get sp :backend-type) target-btype))
+                        (let ((cur-hash (macher-agent--wire-norm-hash orig-buf sp-beg sp-end-c)))
+                          (unless (eql cur-hash (plist-get sp :norm-hash))
+                            (unless is-prompt-like
+                              (macher-agent--restore-response-props orig-buf sp-beg sp-end-c))
+                            (when-let* ((reparsed (macher-agent--parse-buffer-slice
+                                                   orig-buf sp-beg sp-end-c
+                                                   effective-backend is-prompt-like orig-buf id-tables-cell)))
+                              (macher-agent--update-shadow-span
+                               wbuf sp reparsed cur-hash target-btype orig-buf)))))
+                      (setq prev-orig-pos (max prev-orig-pos sp-end-c))))))))))))
+      (when (< prev-orig-pos limit-pos)
+        (when-let* ((tail-gap (macher-agent--parse-buffer-slice
+                               orig-buf prev-orig-pos limit-pos effective-backend t orig-buf id-tables-cell)))
+          (unless wbuf
+            (setq wbuf (macher-agent--wire-buffer-for orig-buf t)))
+          (macher-agent--insert-shadow-gap-span
+           wbuf orig-buf prev-orig-pos limit-pos (with-current-buffer wbuf (point-max))
+           tail-gap nil 'gap target-btype)))
+      (when (and wbuf to-prune)
+        (macher-agent--prune-shadow-spans wbuf (delete-dups to-prune) orig-buf)))))
+
+(defun macher-agent--canonical-tool-args (args)
+  "Return canonicalised representation of tool ARGS with sorted keys."
+  (let ((parsed
+         (if (stringp args)
+             (or (ignore-errors
+                   (json-parse-string args :object-type 'plist
+                                      :null-object :null :false-object :json-false))
+                 (string-trim args))
+           args)))
+    (cl-labels
+        ((canon (obj)
+           (cond
+            ((and (consp obj) (keywordp (car obj)))
+             (let ((pairs nil)
+                   (cur obj))
+               (while (consp cur)
+                 (let ((k (pop cur))
+                       (v (when (consp cur) (pop cur))))
+                   (push (cons k (canon v)) pairs)))
+               (sort pairs (lambda (a b)
+                             (string< (symbol-name (car a))
+                                      (symbol-name (car b)))))))
+            ((vectorp obj)
+             (mapcar #'canon (append obj nil)))
+            ((consp obj)
+             (mapcar #'canon obj))
+            (t obj))))
+      (canon parsed))))
+
+(defun macher-agent--collect-dedup-sites (entries)
+  "Collect `(SIG . MUTATOR)' tool-result deduplication sites in ENTRIES."
+  (let ((omitted "{\"status\": \"omitted\", \"reason\": \"duplicate\"}")
+        (sites nil)
+        (id-sigs (make-hash-table :test 'equal))
+        (vec (vconcat entries))
+        (i 0)
+        (len (length entries)))
+    (while (< i len)
+      (let ((msg (aref vec i)))
+        (when (listp msg)
+          (cond
+           ;; Gemini: model :parts (:functionCall) paired with next user :parts (:functionResponse)
+           ((and (equal (plist-get msg :role) "model")
+                 (vectorp (plist-get msg :parts))
+                 (< (1+ i) len)
+                 (listp (aref vec (1+ i)))
+                 (equal (plist-get (aref vec (1+ i)) :role) "user")
+                 (vectorp (plist-get (aref vec (1+ i)) :parts)))
+            (let ((fc-parts
+                   (cl-remove-if-not (lambda (p) (and (listp p) (plist-member p :functionCall)))
+                                     (append (plist-get msg :parts) nil)))
+                  (fr-parts
+                   (cl-remove-if-not (lambda (p) (and (listp p) (plist-member p :functionResponse)))
+                                     (append (plist-get (aref vec (1+ i)) :parts) nil))))
+              (cl-loop for fc-p in fc-parts
+                       for fr-p in fr-parts
+                       do (let* ((fc (plist-get fc-p :functionCall))
+                                 (fr (plist-get fr-p :functionResponse))
+                                 (fname (and (listp fc) (plist-get fc :name)))
+                                 (rname (and (listp fr) (plist-get fr :name))))
+                            (when (and fname (or (null rname) (equal fname rname)))
+                              (let ((sig (cons fname (macher-agent--canonical-tool-args
+                                                      (plist-get fc :args))))
+                                    (target-fr fr))
+                                (push (cons sig
+                                            (lambda ()
+                                              (let ((resp (plist-get target-fr :response)))
+                                                (when (listp resp)
+                                                  (plist-put resp :content omitted)))))
+                                      sites)))))))
+           ;; Anthropic: assistant :content vector (tool_use) -> user :content vector (tool_result)
+           ((and (equal (plist-get msg :role) "assistant")
+                 (vectorp (plist-get msg :content)))
+            (cl-loop for blk across (plist-get msg :content)
+                     when (and (listp blk) (equal (plist-get blk :type) "tool_use"))
+                     do (when-let* ((id (plist-get blk :id))
+                                    (name (plist-get blk :name)))
+                          (puthash id (cons name (macher-agent--canonical-tool-args
+                                                  (plist-get blk :input)))
+                                   id-sigs))))
+           ((and (equal (plist-get msg :role) "user")
+                 (vectorp (plist-get msg :content)))
+            (cl-loop for blk across (plist-get msg :content)
+                     when (and (listp blk) (equal (plist-get blk :type) "tool_result"))
+                     do (when-let* ((uid (plist-get blk :tool_use_id))
+                                    (sig (gethash uid id-sigs)))
+                          (let ((target-blk blk))
+                            (push (cons sig (lambda () (plist-put target-blk :content omitted)))
+                                  sites)))))
+           ;; OpenAI Chat: assistant :tool_calls -> :role "tool"
+           ((and (equal (plist-get msg :role) "assistant")
+                 (vectorp (plist-get msg :tool_calls)))
+            (cl-loop for tc across (plist-get msg :tool_calls)
+                     when (listp tc)
+                     do (let* ((id (plist-get tc :id))
+                               (fn (plist-get tc :function))
+                               (name (and (listp fn) (plist-get fn :name)))
+                               (args (and (listp fn) (plist-get fn :arguments))))
+                          (when (and id name)
+                            (puthash id (cons name (macher-agent--canonical-tool-args args))
+                                     id-sigs)))))
+           ((equal (plist-get msg :role) "tool")
+            (when-let* ((tid (plist-get msg :tool_call_id))
+                        (sig (gethash tid id-sigs)))
+              (let ((target-msg msg))
+                (push (cons sig (lambda () (plist-put target-msg :content omitted)))
+                      sites))))
+           ;; OpenAI Responses: function_call -> function_call_output
+           ((equal (plist-get msg :type) "function_call")
+            (when-let* ((cid (plist-get msg :call_id))
+                        (name (plist-get msg :name)))
+              (puthash cid (cons name (macher-agent--canonical-tool-args
+                                       (plist-get msg :arguments)))
+                       id-sigs)))
+           ((equal (plist-get msg :type) "function_call_output")
+            (when-let* ((cid (plist-get msg :call_id))
+                        (sig (gethash cid id-sigs)))
+              (let ((target-msg msg))
+                (push (cons sig (lambda () (plist-put target-msg :output omitted)))
+                      sites)))))))
+      (setq i (1+ i)))
+    sites))
+
+(defun macher-agent--deduplicate-wire-bundles (bundles up-to-turn-id)
+  "Deduplicate older duplicate tool results in BUNDLES up to UP-TO-TURN-ID.
+Deep-copies modified bundle `:entries' without mutating shadow buffer
+properties and returns the updated bundle list."
+  (if (or (null bundles)
+          (null up-to-turn-id)
+          (not (integerp up-to-turn-id))
+          (null macher-agent-max-duplicate-tools)
+          (<= macher-agent-max-duplicate-tools 0))
+      bundles
+    (let ((seen-tools (make-hash-table :test 'equal))
+          (copied-bundles
+           (mapcar (lambda (b)
+                     (let ((tid (plist-get b :turn-id)))
+                       (if (and (integerp tid) (<= tid up-to-turn-id))
+                           (let ((nb (copy-sequence b)))
+                             (plist-put nb :entries
+                                        (macher-agent--deep-copy-wire-data
+                                         (plist-get b :entries))))
+                         b)))
+                   bundles)))
+      (dolist (b (reverse copied-bundles))
+        (let ((tid (plist-get b :turn-id)))
+          (when (and (integerp tid) (<= tid up-to-turn-id))
+            (let ((sites (macher-agent--collect-dedup-sites (plist-get b :entries)))
+                  (dirty nil))
+              (dolist (site sites)
+                (let* ((sig (car site))
+                       (mutator (cdr site))
+                       (cnt (gethash sig seen-tools 0)))
+                  (if (>= cnt macher-agent-max-duplicate-tools)
+                      (progn
+                        (funcall mutator)
+                        (setq dirty t))
+                    (puthash sig (1+ cnt) seen-tools))))
+              (when dirty
+                (plist-put b :chars
+                           (macher-agent--wire-estimate-chars
+                            (plist-get b :entries))))))))
+      copied-bundles)))
+
+(defun macher-agent--build-wire-turn-bundles (wbuf &optional orig-buf limit-pos effective-backend id-tables-cell)
+  "Build chronological turn bundles from WBUF up to LIMIT-POS in ORIG-BUF.
+Each bundle is a plist `(:turn-id :entries :chars :sbeg :send)'.  When
+EFFECTIVE-BACKEND is nil, reuses stored span entries directly and passes
+optional ID-TABLES-CELL when re-parsing slices."
+  (when (and (bufferp wbuf) (buffer-live-p wbuf))
+    (let* ((spans (macher-agent--collect-wire-spans wbuf))
+           (groups (macher-agent--group-wire-spans-by-turn spans))
+           (target-btype (and effective-backend (type-of effective-backend)))
+           (bundles nil)
+           (stop-after-limit nil))
+      (dolist (grp groups)
+        (let* ((tid (car grp))
+               (gspans (cdr grp))
+               (u-sp (cl-find 'user-prompt gspans :key (lambda (s) (plist-get s :kind))))
+               (t-sp (cl-find 'tool-step gspans :key (lambda (s) (plist-get s :kind))))
+               (f-sp (cl-find 'model-final gspans :key (lambda (s) (plist-get s :kind))))
+               (g-sp (cl-find 'gap gspans :key (lambda (s) (plist-get s :kind))))
+               (anchor-sp (or u-sp t-sp f-sp g-sp))
+               (anchor-beg (and anchor-sp (marker-position (plist-get anchor-sp :orig-beg)))))
+          (cond
+           ((not (and anchor-sp
+                      (or (null orig-buf)
+                          (macher-agent--span-live-in-buf-p anchor-sp orig-buf))))
+            nil)
+           ((and limit-pos anchor-beg (>= anchor-beg limit-pos))
+            (setq stop-after-limit t))
+           ((not stop-after-limit)
+            (let ((turn-entries nil)
+                  (turn-chars 0)
+                  (turn-sbeg (plist-get (car gspans) :sbeg))
+                  (turn-send (plist-get (car (last gspans)) :send)))
+              (dolist (sp gspans)
+                (let* ((sp-kind (plist-get sp :kind))
+                       (sp-ob (plist-get sp :orig-beg))
+                       (sp-oe (plist-get sp :orig-end))
+                       (ob-pos (and (markerp sp-ob) (marker-position sp-ob)))
+                       (oe-pos (and (markerp sp-oe) (marker-position sp-oe)))
+                       (oe-clamped (if (and limit-pos oe-pos) (min limit-pos oe-pos) oe-pos))
+                       (deleted (and orig-buf (macher-agent--span-deleted-p sp orig-buf))))
+                  (when (and (not deleted)
+                             (or (null limit-pos) (null ob-pos) (<= ob-pos limit-pos)))
+                    (let* ((same-b (or (null target-btype)
+                                       (eq (plist-get sp :backend-type) target-btype)))
+                           (full-slice (or (null limit-pos) (null oe-pos) (= oe-clamped oe-pos)))
+                           (hash-ok (or (null orig-buf)
+                                        (null ob-pos)
+                                        (null oe-clamped)
+                                        (eql (macher-agent--wire-norm-hash orig-buf ob-pos oe-clamped)
+                                             (plist-get sp :norm-hash)))))
+                      (if (and same-b full-slice hash-ok)
+                          (progn
+                            (setq turn-entries
+                                  (append turn-entries
+                                          (macher-agent--deep-copy-wire-data
+                                           (plist-get sp :entries))))
+                            (setq turn-chars (+ turn-chars (or (plist-get sp :chars) 0))))
+                        (when (and orig-buf effective-backend ob-pos oe-clamped)
+                          (when (memq sp-kind '(tool-step model-final))
+                            (macher-agent--restore-response-props orig-buf ob-pos oe-clamped))
+                          (let ((reparsed
+                                 (macher-agent--parse-buffer-slice
+                                  orig-buf ob-pos oe-clamped effective-backend
+                                  (not (memq sp-kind '(tool-step model-final)))
+                                  orig-buf id-tables-cell)))
+                            (setq turn-entries (append turn-entries reparsed))
+                            (setq turn-chars
+                                  (+ turn-chars
+                                     (macher-agent--wire-estimate-chars reparsed))))))))))
+              (when turn-entries
+                (push (list :turn-id tid
+                            :entries turn-entries
+                            :chars turn-chars
+                            :sbeg turn-sbeg
+                            :send turn-send)
+                      bundles)))))))
+      (nreverse bundles))))
+
+(defun macher-agent--resolve-wire-horizon (orig-buf bundles max-chars)
+  "Resolve quantised truncation horizon and dedup epoch for ORIG-BUF.
+Inspects chronological BUNDLES against MAX-CHARS and returns
+`(:retained :horizon-send :lines-deleted)'."
+  (if (or (null bundles) (null max-chars) (<= max-chars 0))
+      (list :retained bundles :horizon-send nil :lines-deleted nil)
+    (let* ((wbuf (macher-agent--wire-buffer-for orig-buf nil))
+           (total-all (cl-loop for b in bundles sum (or (plist-get b :chars) 0)))
+           (horizon (buffer-local-value 'macher-agent--wire-horizon-turn-id orig-buf))
+           (pinned-lines (buffer-local-value 'macher-agent--wire-horizon-lines-deleted orig-buf))
+           (dedup-tid (buffer-local-value 'macher-agent--wire-dedup-turn-id orig-buf))
+           (match-horizon-p
+            (lambda (tid h)
+              (cond
+               ((integerp h) (and (integerp tid) (<= tid h)))
+               ((consp h) (equal tid h))
+               (t nil)))))
+      (when (or (<= total-all max-chars)
+                (and horizon
+                     (not (cl-some (lambda (b)
+                                     (funcall match-horizon-p (plist-get b :turn-id) horizon))
+                                   bundles))))
+        (setq horizon nil
+              pinned-lines nil
+              dedup-tid nil)
+        (with-current-buffer orig-buf
+          (setq-local macher-agent--wire-horizon-turn-id nil)
+          (setq-local macher-agent--wire-horizon-lines-deleted nil)
+          (setq-local macher-agent--wire-dedup-turn-id nil)))
+      ;; Step 1: drop prefix matching pinned horizon and record dropped-send
+      (let ((retained (copy-sequence bundles))
+            (dropped-send nil))
+        (when horizon
+          (let ((last-idx nil)
+                (idx 0))
+            (dolist (b retained)
+              (when (funcall match-horizon-p (plist-get b :turn-id) horizon)
+                (setq last-idx idx))
+              (setq idx (1+ idx)))
+            (when last-idx
+              (let ((last-dropped (nth last-idx retained)))
+                (setq dropped-send (plist-get last-dropped :send))
+                (setq retained (nthcdr (1+ last-idx) retained))))))
+        ;; Step 2: apply pinned deduplication boundary unconditionally
+        (when (and dedup-tid
+                   macher-agent-max-duplicate-tools
+                   (> macher-agent-max-duplicate-tools 0))
+          (setq retained (macher-agent--deduplicate-wire-bundles retained dedup-tid)))
+        ;; Step 3: advance epoch only when remaining chars exceed max-chars
+        (let ((rem (cl-loop for b in retained sum (or (plist-get b :chars) 0))))
+          (when (> rem max-chars)
+            (let ((max-int-tid
+                   (cl-loop for b in retained
+                            for tid = (plist-get b :turn-id)
+                            when (integerp tid) maximize tid into mx
+                            finally return (and (integerp mx) mx))))
+              (when (and max-int-tid
+                         macher-agent-max-duplicate-tools
+                         (> macher-agent-max-duplicate-tools 0)
+                         (not (eql max-int-tid dedup-tid)))
+                (setq dedup-tid max-int-tid)
+                (with-current-buffer orig-buf
+                  (setq-local macher-agent--wire-dedup-turn-id dedup-tid))
+                (setq retained (macher-agent--deduplicate-wire-bundles retained dedup-tid))
+                (setq rem (cl-loop for b in retained sum (or (plist-get b :chars) 0)))))
+            (when (> rem max-chars)
+              (let* ((ratio (max 0.0 (min 0.99 (float (or macher-agent-context-compaction-ratio 0.25)))))
+                     (target-chars (floor (* max-chars (- 1.0 ratio))))
+                     (last-popped nil))
+                (while (and (> rem target-chars) retained)
+                  (let ((dropped (pop retained)))
+                    (setq rem (- rem (or (plist-get dropped :chars) 0)))
+                    (setq last-popped dropped)))
+                (when last-popped
+                  (setq dropped-send (plist-get last-popped :send))
+                  (let* ((new-horizon (plist-get last-popped :turn-id))
+                         (new-lines
+                          (if (and wbuf (buffer-live-p wbuf) (integerp dropped-send))
+                              (with-current-buffer wbuf
+                                (max 1 (count-lines (point-min)
+                                                    (max (point-min) (min (point-max) dropped-send)))))
+                            1)))
+                    (setq horizon new-horizon
+                          pinned-lines new-lines)
+                    (with-current-buffer orig-buf
+                      (setq-local macher-agent--wire-horizon-turn-id new-horizon)
+                      (setq-local macher-agent--wire-horizon-lines-deleted new-lines)
+                      (setq-local macher-agent--wire-dedup-turn-id dedup-tid))
+                    (run-hook-with-args 'macher-agent-wire-pre-truncate-hook orig-buf dropped-send)))))))
+        (list :retained retained
+              :horizon-send dropped-send
+              :lines-deleted (or pinned-lines
+                                 (buffer-local-value 'macher-agent--wire-horizon-lines-deleted orig-buf)))))))
+
 (defun macher-agent--reconcile-wire-history (orig-buf limit-pos effective-backend disable-local-tools &optional max-turns max-chars id-tables-cell)
   "Reconcile shadow wire history of ORIG-BUF up to LIMIT-POS.
 Formats prompts for EFFECTIVE-BACKEND, flattening tools when
 DISABLE-LOCAL-TOOLS is non-nil, and bounding turns by MAX-TURNS and
 MAX-CHARS.  Stores parsed ID tables in ID-TABLES-CELL when provided."
+  (macher-agent--sync-shadow-spans orig-buf limit-pos effective-backend id-tables-cell)
   (let* ((wbuf (macher-agent--wire-buffer-for orig-buf nil))
          (target-btype (and effective-backend (type-of effective-backend)))
-         (spans (and wbuf (macher-agent--collect-wire-spans wbuf)))
-         (groups (macher-agent--group-wire-spans-by-turn spans))
-         (to-prune nil)
-         (turn-bundles nil)
-         (prev-orig-pos (with-current-buffer orig-buf (point-min)))
-         (stop-after-limit nil))
-    (dolist (grp groups)
-      (let* ((gspans (cdr grp))
-             (u-sp (cl-find 'user-prompt gspans :key (lambda (s) (plist-get s :kind))))
-             (t-sp (cl-find 'tool-step gspans :key (lambda (s) (plist-get s :kind))))
-             (f-sp (cl-find 'model-final gspans :key (lambda (s) (plist-get s :kind))))
-             (anchor-sp (or u-sp t-sp f-sp)))
-        (cond
-         ((not (and anchor-sp (macher-agent--span-live-in-buf-p anchor-sp orig-buf)))
-          (setq to-prune (append to-prune gspans)))
-         ((and u-sp (macher-agent--span-deleted-p u-sp orig-buf))
-          (setq to-prune (append to-prune gspans)))
-         ((>= (marker-position (plist-get anchor-sp :orig-beg)) limit-pos)
-          (dolist (sp gspans)
-            (when (macher-agent--span-deleted-p sp orig-buf)
-              (push sp to-prune)))
-          (setq stop-after-limit t))
-         ((not stop-after-limit)
-          (let ((turn-entries nil)
-                (turn-chars 0)
-                (turn-sbeg (plist-get (car gspans) :sbeg))
-                (turn-send (plist-get (car (last gspans)) :send)))
-            (when u-sp
-              (let ((u-beg (marker-position (plist-get u-sp :orig-beg)))
-                    (u-end (min limit-pos (marker-position (plist-get u-sp :orig-end)))))
-                (when (> u-beg prev-orig-pos)
-                  (when-let* ((gap-prompts
-                               (macher-agent--parse-buffer-slice
-                                orig-buf prev-orig-pos u-beg effective-backend t orig-buf id-tables-cell)))
-                    (push (list :entries gap-prompts
-                                :chars (macher-agent--wire-estimate-chars gap-prompts)
-                                :sbeg turn-sbeg :send turn-sbeg)
-                          turn-bundles)))
-                (let* ((cur-hash (macher-agent--wire-norm-hash orig-buf u-beg u-end))
-                       (hash-ok (eql cur-hash (plist-get u-sp :norm-hash)))
-                       (same-b (eq (plist-get u-sp :backend-type) target-btype))
-                       (u-entries
-                        (if (and same-b hash-ok)
-                            (macher-agent--deep-copy-wire-data (plist-get u-sp :entries))
-                          (let ((reparsed (macher-agent--parse-buffer-slice
-                                           orig-buf u-beg u-end effective-backend t orig-buf id-tables-cell)))
-                            (when (and same-b reparsed)
-                              (macher-agent--update-shadow-span wbuf u-sp reparsed cur-hash target-btype))
-                            reparsed))))
-                  (setq turn-entries (append turn-entries u-entries))
-                  (setq turn-chars (+ turn-chars
-                                      (if (and same-b hash-ok)
-                                          (plist-get u-sp :chars)
-                                        (macher-agent--wire-estimate-chars u-entries)))))
-                (setq prev-orig-pos (max prev-orig-pos u-end))))
-            (let ((asst-sp (or t-sp f-sp)))
-              (when (and asst-sp (<= (marker-position (plist-get asst-sp :orig-beg)) limit-pos))
-                (let ((a-beg (marker-position (plist-get asst-sp :orig-beg)))
-                      (f-deleted (and f-sp (macher-agent--span-deleted-p f-sp orig-buf))))
-                  (when (> a-beg prev-orig-pos)
-                    (when-let* ((gap-prompts
-                                 (macher-agent--parse-buffer-slice
-                                  orig-buf prev-orig-pos a-beg effective-backend t orig-buf id-tables-cell)))
-                      (setq turn-entries (append turn-entries gap-prompts))
-                      (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars gap-prompts))))
-                    (setq prev-orig-pos a-beg))
-                  (when t-sp
-                    (if (or (macher-agent--span-deleted-p t-sp orig-buf)
-                            (and f-deleted (not (plist-get t-sp :nonempty))))
-                        (push t-sp to-prune)
-                      (let* ((t-beg (marker-position (plist-get t-sp :orig-beg)))
-                             (t-end (marker-position (plist-get t-sp :orig-end)))
-                             (t-end-c (min limit-pos t-end))
-                             (t-cur-hash (macher-agent--wire-norm-hash orig-buf t-beg t-end-c))
-                             (t-hash-ok (eql t-cur-hash (plist-get t-sp :norm-hash)))
-                             (t-same-b (eq (plist-get t-sp :backend-type) target-btype)))
-                        (if (and t-same-b t-hash-ok)
-                            (progn
-                              (setq turn-entries
-                                    (append turn-entries
-                                            (macher-agent--deep-copy-wire-data (plist-get t-sp :entries))))
-                              (setq turn-chars (+ turn-chars (plist-get t-sp :chars))))
-                          (macher-agent--restore-response-props orig-buf t-beg t-end-c)
-                          (let ((t-reparsed (macher-agent--parse-buffer-slice
-                                             orig-buf t-beg t-end-c
-                                             effective-backend nil orig-buf id-tables-cell)))
-                            (setq turn-entries (append turn-entries t-reparsed))
-                            (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars t-reparsed)))
-                            (when (and t-same-b (= t-end-c t-end) t-reparsed)
-                              (macher-agent--update-shadow-span
-                               wbuf t-sp t-reparsed t-cur-hash target-btype))))
-                        (setq prev-orig-pos (max prev-orig-pos t-end-c)))))
-                  (when (and f-sp (<= (marker-position (plist-get f-sp :orig-beg)) limit-pos))
-                    (if f-deleted
-                        (push f-sp to-prune)
-                      (let* ((f-beg (marker-position (plist-get f-sp :orig-beg)))
-                             (f-end (marker-position (plist-get f-sp :orig-end)))
-                             (f-end-c (min limit-pos f-end)))
-                        (when (> f-beg prev-orig-pos)
-                          (when-let* ((gap-prompts
-                                       (macher-agent--parse-buffer-slice
-                                        orig-buf prev-orig-pos f-beg effective-backend t orig-buf id-tables-cell)))
-                            (setq turn-entries (append turn-entries gap-prompts))
-                            (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars gap-prompts))))
-                          (setq prev-orig-pos f-beg))
-                        (let* ((f-cur-hash (macher-agent--wire-norm-hash orig-buf f-beg f-end-c))
-                               (f-hash-ok (eql f-cur-hash (plist-get f-sp :norm-hash)))
-                               (f-same-b (eq (plist-get f-sp :backend-type) target-btype)))
-                          (if (and f-same-b f-hash-ok)
-                              (progn
-                                (setq turn-entries
-                                      (append turn-entries
-                                              (macher-agent--deep-copy-wire-data (plist-get f-sp :entries))))
-                                (setq turn-chars (+ turn-chars (plist-get f-sp :chars))))
-                            (macher-agent--restore-response-props orig-buf f-beg f-end-c)
-                            (let ((f-reparsed (macher-agent--parse-buffer-slice
-                                               orig-buf f-beg f-end-c
-                                               effective-backend nil orig-buf id-tables-cell)))
-                              (setq turn-entries (append turn-entries f-reparsed))
-                              (setq turn-chars (+ turn-chars (macher-agent--wire-estimate-chars f-reparsed)))
-                              (when (and f-same-b (= f-end-c f-end) f-reparsed)
-                                (macher-agent--update-shadow-span
-                                 wbuf f-sp f-reparsed f-cur-hash target-btype))))
-                          (setq prev-orig-pos (max prev-orig-pos f-end-c)))))))))
-            (when turn-entries
-              (push (list :entries turn-entries
-                          :chars turn-chars
-                          :sbeg turn-sbeg
-                          :send turn-send)
-                    turn-bundles)))))))
-    (when (< prev-orig-pos limit-pos)
-      (when-let* ((tail-gap
-                   (macher-agent--parse-buffer-slice
-                    orig-buf prev-orig-pos limit-pos effective-backend t orig-buf id-tables-cell)))
-        (push (list :entries tail-gap
-                    :chars (macher-agent--wire-estimate-chars tail-gap)
-                    :sbeg (if wbuf (with-current-buffer wbuf (point-max)) 1)
-                    :send (if wbuf (with-current-buffer wbuf (point-max)) 1))
-              turn-bundles)))
-    (when (and wbuf to-prune)
-      (macher-agent--prune-shadow-spans wbuf (delete-dups to-prune)))
-    (setq turn-bundles (nreverse turn-bundles))
+         (turn-bundles (and wbuf
+                            (macher-agent--build-wire-turn-bundles
+                             wbuf orig-buf limit-pos effective-backend id-tables-cell)))
+         (horizon-res (macher-agent--resolve-wire-horizon orig-buf turn-bundles max-chars))
+         (retained (plist-get horizon-res :retained))
+         (horizon-send (plist-get horizon-res :horizon-send))
+         (lines-del (plist-get horizon-res :lines-deleted)))
     (when (and (integerp max-turns) (> max-turns 0))
       (let ((keep (max 0 (1- max-turns))))
-        (when (> (length turn-bundles) keep)
-          (setq turn-bundles (last turn-bundles keep)))))
-    (let ((truncated-alert nil))
-      (when (and (integerp max-chars) (> max-chars 0) turn-bundles)
-        (let ((total-c (cl-loop for b in turn-bundles sum (plist-get b :chars)))
-              (dropped-send nil)
-              (first-sbeg (plist-get (car turn-bundles) :sbeg)))
-          (while (and (> total-c max-chars) turn-bundles)
-            (let ((dropped (pop turn-bundles)))
-              (setq total-c (- total-c (plist-get dropped :chars)))
-              (setq dropped-send (plist-get dropped :send))))
-          (when (and dropped-send wbuf)
-            (run-hook-with-args 'macher-agent-wire-pre-truncate-hook orig-buf dropped-send)
-            (let ((lines-del (with-current-buffer wbuf
-                               (count-lines (max (point-min) first-sbeg)
-                                            (min (point-max) dropped-send)))))
-              (setq truncated-alert
-                    (macher-agent--format-truncation-alert-prompt
-                     effective-backend (max 1 lines-del) disable-local-tools))))))
-      (let ((flat (cl-loop for b in turn-bundles append (plist-get b :entries))))
-        (when truncated-alert
-          (setq flat (cons truncated-alert flat)))
-        (if (and disable-local-tools
-                 (eq target-btype 'gptel-gemini))
-            (macher-agent--sanitize-prompts-for-toolless flat)
-          flat)))))
+        (when (> (length retained) keep)
+          (setq retained (last retained keep)))))
+    (let* ((truncated-alert
+            (when (and horizon-send lines-del)
+              (macher-agent--format-truncation-alert-prompt
+               effective-backend (max 1 lines-del) disable-local-tools)))
+           (flat (cl-loop for b in retained append (plist-get b :entries))))
+      (when truncated-alert
+        (setq flat (cons truncated-alert flat)))
+      (if (and disable-local-tools
+               (eq target-btype 'gptel-gemini))
+          (macher-agent--sanitize-prompts-for-toolless flat)
+        flat))))
 
 (defun macher-agent--build-prompts-from-buffer (buf backend tool-use &optional info)
   "Build BACKEND prompt list from BUF and open TOOL-USE calls using FSM INFO."
@@ -2374,12 +2855,18 @@ Deletes `'ignore' spans so adjacent `'response' regions coalesce."
                 (child-wbuf (macher-agent--wire-buffer-for child-buf t)))
       (let ((raw-copy (with-current-buffer parent-wbuf (buffer-string)))
             (turn-cnt (buffer-local-value 'macher-agent--wire-turn-counter parent-buf))
+            (horizon-tid (buffer-local-value 'macher-agent--wire-horizon-turn-id parent-buf))
+            (horizon-lines (buffer-local-value 'macher-agent--wire-horizon-lines-deleted parent-buf))
+            (dedup-tid (buffer-local-value 'macher-agent--wire-dedup-turn-id parent-buf))
             (span-cnt (buffer-local-value 'macher-agent--wire-span-counter parent-wbuf))
             (media-h (buffer-local-value 'macher-agent--wire-last-media-hash parent-buf))
             (wire-b (buffer-local-value 'macher-agent--wire-backend parent-buf))
             (marker-map (make-hash-table :test 'eq)))
         (with-current-buffer child-buf
           (setq-local macher-agent--wire-turn-counter turn-cnt)
+          (setq-local macher-agent--wire-horizon-turn-id horizon-tid)
+          (setq-local macher-agent--wire-horizon-lines-deleted horizon-lines)
+          (setq-local macher-agent--wire-dedup-turn-id dedup-tid)
           (setq-local macher-agent--wire-last-media-hash media-h)
           (setq-local macher-agent--wire-backend wire-b))
         (with-current-buffer child-wbuf
@@ -2424,6 +2911,9 @@ Deletes `'ignore' spans so adjacent `'response' regions coalesce."
       (with-current-buffer buf
         (setq-local macher-agent--wire-last-media-hash nil)
         (setq-local macher-agent--wire-backend nil)
+        (setq-local macher-agent--wire-horizon-turn-id nil)
+        (setq-local macher-agent--wire-horizon-lines-deleted nil)
+        (setq-local macher-agent--wire-dedup-turn-id nil)
         (when-let* ((fsm (bound-and-true-p macher-agent--active-fsm))
                     ((fboundp 'gptel-fsm-info))
                     (info (ignore-errors (gptel-fsm-info fsm)))
@@ -2455,7 +2945,8 @@ Deletes `'ignore' spans so adjacent `'response' regions coalesce."
         (with-current-buffer wbuf
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t))
-            (erase-buffer)))))))
+            (erase-buffer))))
+      (run-hook-with-args 'macher-agent-wire-invalidated-hook buf 'cleared))))
 
 (defun macher-agent-inspect-wire-buffer (&optional buffer)
   "Display the hidden shadow wire buffer associated with BUFFER."
@@ -2911,6 +3402,44 @@ Invokes ASYNC-FN when transformation finishes."
     (when (and active-fsm context)
       (macher-agent--set-fsm-info active-fsm
                                   (plist-put (gptel-fsm-info active-fsm) :macher-agent-context context)))
+
+    (when (and active-fsm
+               (not (eq temp-buf orig-buf))
+               (buffer-live-p orig-buf)
+               (macher-agent--wire-enabled-p orig-buf info)
+               (eq (buffer-local-value 'major-mode temp-buf)
+                   (buffer-local-value 'major-mode orig-buf))
+               (not (with-current-buffer orig-buf (use-region-p))))
+      (let ((prev-wire-backend (buffer-local-value 'macher-agent--wire-backend orig-buf))
+            (cur-buf-backend (or (and info (plist-get info :backend))
+                                 (buffer-local-value 'gptel-backend orig-buf))))
+        (when (and prev-wire-backend cur-buf-backend
+                   (not (eq cur-buf-backend prev-wire-backend)))
+          (macher-agent-clear-wire-buffer orig-buf))
+        (let* ((pm (and (macher-agent--plist-p info) (plist-get info :position)))
+               (send-end (if (and (markerp pm) (eq (marker-buffer pm) orig-buf))
+                             (marker-position pm)
+                           (with-current-buffer orig-buf (point-max))))
+               (orig-prompt-beg (with-current-buffer orig-buf
+                                  (macher-agent--prompt-start-pos send-end)))
+               (has-spans (macher-agent--wire-has-spans-p orig-buf))
+               (has-untracked
+                (and (not has-spans)
+                     (not (plist-get info :dry-run))
+                     (with-current-buffer orig-buf
+                       (and (> orig-prompt-beg (point-min))
+                            (not (string-blank-p
+                                  (buffer-substring-no-properties
+                                   (point-min) orig-prompt-beg))))))))
+          (when (or has-spans has-untracked)
+            (when (and has-untracked cur-buf-backend
+                       (not (buffer-local-value 'macher-agent--wire-backend orig-buf)))
+              (with-current-buffer orig-buf
+                (setq-local macher-agent--wire-backend cur-buf-backend)))
+            (macher-agent--sync-shadow-spans
+             orig-buf orig-prompt-beg
+             (or (buffer-local-value 'macher-agent--wire-backend orig-buf)
+                 cur-buf-backend))))))
 
     (let* ((buffer-presets (when (buffer-live-p orig-buf)
                              (buffer-local-value 'macher-agent-presets orig-buf)))

@@ -188,6 +188,14 @@ SHARED-STATE, PAYLOAD, and METADATA."
   :type '(alist :key-type symbol :value-type integer)
   :group 'macher-agent)
 
+(defcustom macher-agent-context-compaction-ratio 0.25
+  "Fraction of `max-chars' reclaimed on a quantised truncation epoch.
+When a conversation exceeds `max-chars', truncation advances the event
+horizon until remaining history is at or below `(* max-chars (- 1.0 ratio))'
+so subsequent turns retain an identical prefix until the next epoch."
+  :type 'number
+  :group 'macher-agent)
+
 (defcustom macher-agent-max-tool-output-chars 30000
   "Maximum character length for sandbox tool output before middle truncation."
   :type 'integer
@@ -365,10 +373,22 @@ buffer directly."
 (defvar-local macher-agent--wire-turn-counter 0
   "Monotonic turn counter assigning `macher-agent-turn-id' values.")
 
+(defvar-local macher-agent--wire-horizon-turn-id nil
+  "Pinned truncation epoch horizon (`turn-id' integer or `(gap . span-id)').")
+
+(defvar-local macher-agent--wire-horizon-lines-deleted nil
+  "Pinned truncated line count for the active quantised compaction epoch.")
+
+(defvar-local macher-agent--wire-dedup-turn-id nil
+  "Upper `turn-id' boundary pinned for epoch wire tool-result deduplication.")
+
 (put 'macher-agent--active-fsm 'permanent-local t)
 (put 'macher-agent--wire-buffer 'permanent-local t)
 (put 'macher-agent--wire-origin-buffer 'permanent-local t)
 (put 'macher-agent--wire-turn-counter 'permanent-local t)
+(put 'macher-agent--wire-horizon-turn-id 'permanent-local t)
+(put 'macher-agent--wire-horizon-lines-deleted 'permanent-local t)
+(put 'macher-agent--wire-dedup-turn-id 'permanent-local t)
 (put 'macher-agent--disable-local-tools 'permanent-local t)
 (put 'macher-agent--preset-request-params 'permanent-local t)
 (put 'macher-agent--current-task-id 'permanent-local t)
@@ -848,10 +868,11 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
         (let ((pos (point-min))
               (total 0))
           (while (< pos (point-max))
-            (let ((next (next-single-property-change
-                         pos 'macher-agent-wire-chars wbuf (point-max)))
+            (let ((sid (get-text-property pos 'macher-agent-span-id))
+                  (next (next-single-property-change
+                         pos 'macher-agent-span-id wbuf (point-max)))
                   (chars (get-text-property pos 'macher-agent-wire-chars)))
-              (when (integerp chars)
+              (when (and sid (integerp chars))
                 (setq total (+ total chars)))
               (setq pos next)))
           (if (> total 0) total (buffer-size))))
