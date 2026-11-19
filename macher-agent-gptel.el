@@ -4029,23 +4029,29 @@ Checks whether a resolvable tool is absent from `gptel-tools'."
                   (and (fboundp 'vc-root-dir)
                        (let ((default-directory default-directory))
                          (vc-root-dir)))))))
-    (if (not is-workspace)
-        (progn
-          (macher-agent--teardown-gptel-buffer)
-          (user-error "Macher-Agent: Directory '%s' is not in a recognised project workspace" default-directory))
-      (make-local-variable 'gptel--preset)
-      (make-local-variable 'gptel-tools)
-      (make-local-variable 'gptel-model)
-      (make-local-variable 'gptel-backend)
-      (make-local-variable 'gptel-system-prompt)
-      (make-local-variable 'gptel-temperature)
-      (make-local-variable 'gptel-max-tokens)
-      (make-local-variable 'gptel--tool-names)
-      (make-local-variable 'gptel--backend-name)
-      (setq-local gptel--set-buffer-locally t)
-      (macher-agent--init-workspace-state
-       (file-name-as-directory (macher-agent-root default-directory)))
-      t)))
+    (unless is-workspace
+      (if (not (and default-directory (file-directory-p default-directory)))
+          (progn
+            (macher-agent--teardown-gptel-buffer)
+            (user-error "Macher-Agent: Directory '%s' is not in a recognised project workspace" default-directory))
+        (condition-case err
+            (setq is-workspace (macher-agent--ensure-git-root default-directory))
+          (error
+           (macher-agent--teardown-gptel-buffer)
+           (user-error "%s" (error-message-string err))))))
+    (make-local-variable 'gptel--preset)
+    (make-local-variable 'gptel-tools)
+    (make-local-variable 'gptel-model)
+    (make-local-variable 'gptel-backend)
+    (make-local-variable 'gptel-system-prompt)
+    (make-local-variable 'gptel-temperature)
+    (make-local-variable 'gptel-max-tokens)
+    (make-local-variable 'gptel--tool-names)
+    (make-local-variable 'gptel--backend-name)
+    (setq-local gptel--set-buffer-locally t)
+    (macher-agent--init-workspace-state
+     (file-name-as-directory (macher-agent-root default-directory)))
+    t))
 
 (defun macher-agent-branch-chat (new-name)
   "Clone current chat buffer into NEW-NAME, inheriting agent state."

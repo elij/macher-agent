@@ -17,6 +17,7 @@
 (declare-function project-current "project" (&optional maybe-prompt dir))
 (declare-function project-root "project" (project))
 (declare-function vc-root-dir "vc-hooks" ())
+(declare-function vc-file-clearprops "vc-hooks" (file))
 
 (defvar gptel-directives)
 (defvar gptel-track-response)
@@ -746,6 +747,45 @@ Records TASK-ID, ORIGINATOR-NAME, and optional SUPPRESS-PATCH."
       (when (functionp step)
         (setq state (funcall step state))))
     state))
+
+(defun macher-agent--ensure-git-root (dir)
+  "Return canonical git root for DIR, prompting to initialise DIR if absent.
+Signals an error when DIR is not git-backed and the user declines
+initialisation or Emacs runs in non-interactive batch mode."
+  (let* ((target-dir (file-name-as-directory (expand-file-name dir)))
+         (_ (unless (file-directory-p target-dir)
+              (error "Directory does not exist: %s" target-dir)))
+         (root (or (locate-dominating-file target-dir ".git")
+                   (let ((default-directory target-dir))
+                     (and (fboundp 'vc-root-dir) (vc-root-dir))))))
+    (cond
+     (root
+      (file-name-as-directory (file-truename root)))
+     ((and (not noninteractive)
+           (y-or-n-p (format "Git init directory %s? "
+                             (abbreviate-file-name target-dir))))
+      (with-temp-buffer
+        (let ((exit-code (call-process "git" nil (current-buffer) t
+                                       "-C" (directory-file-name target-dir)
+                                       "init" "-q")))
+          (unless (zerop exit-code)
+            (error "Failed to initialise git repository in %s: %s"
+                   target-dir (string-trim (buffer-string))))))
+      (let ((true-dir (file-name-as-directory (file-truename target-dir))))
+        (when (fboundp 'vc-file-clearprops)
+          (dolist (path (delete-dups
+                         (delq nil
+                               (list dir
+                                     (and (stringp dir) (directory-file-name dir))
+                                     target-dir
+                                     (directory-file-name target-dir)
+                                     true-dir
+                                     (directory-file-name true-dir)
+                                     buffer-file-name))))
+            (vc-file-clearprops path)))
+        true-dir))
+     (t
+      (error "Directory '%s' requires a git-backed workspace" target-dir)))))
 
 (defun macher-agent-root (&optional path)
   "Return the canonical project root for a specific string PATH."
