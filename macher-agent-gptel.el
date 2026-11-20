@@ -983,6 +983,68 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
           (append tools (list tool))
         tools))))
 
+(defun macher-agent--stale-server-tool-request-params-p (request-params &optional context target-buf)
+  "Return non-nil when REQUEST-PARAMS matches a `:disable-local-tools' skill.
+Inspects CONTEXT and TARGET-BUF preset and skill registries."
+  (when request-params
+    (let* ((buf (or (and (bufferp target-buf) (buffer-live-p target-buf) target-buf)
+                    (current-buffer)))
+           (ctx (or (and (macher-agent-valid-context-p context) context)
+                    (macher-agent-resolve-context buf)))
+           (known (if (local-variable-p 'gptel--known-presets buf)
+                      (buffer-local-value 'gptel--known-presets buf)
+                    (bound-and-true-p gptel--known-presets)))
+           (ws-skills (when (macher-agent-valid-context-p ctx)
+                        (ignore-errors (macher-agent-workspace-skills-alist ctx))))
+           (global-skills (bound-and-true-p macher-agent-global-skills-alist)))
+      (cl-some
+       (lambda (entry)
+         (let* ((sym (car-safe entry))
+                (raw-spec (cdr-safe entry))
+                (spec (if (and (symbolp sym) (listp raw-spec))
+                          (macher-agent--merge-preset-meta sym raw-spec)
+                        raw-spec)))
+           (and (listp spec)
+                (plist-get spec :disable-local-tools)
+                (equal request-params (plist-get spec :request-params)))))
+       (append known ws-skills global-skills)))))
+
+(defun macher-agent--reconcile-diverged-presets (orig-buf &optional context)
+  "Clear stale `macher-agent-presets' on ORIG-BUF when `gptel--preset' diverges.
+Returns the effective `macher-agent-presets' list for ORIG-BUF in CONTEXT."
+  (when (and (bufferp orig-buf) (buffer-live-p orig-buf))
+    (with-current-buffer orig-buf
+      (let* ((buffer-presets (bound-and-true-p macher-agent-presets))
+             (buf-gptel-preset (macher-normalise-preset-name (bound-and-true-p gptel--preset)))
+             (primary (when buffer-presets
+                        (macher-agent--primary-preset-symbol buffer-presets context orig-buf))))
+        (if (and buffer-presets buf-gptel-preset (not (eq buf-gptel-preset primary)))
+            (let* ((flv (bound-and-true-p file-local-variables-alist))
+                   (preset-rp (bound-and-true-p macher-agent--preset-request-params))
+                   (was-server-tool-disabled
+                    (or (bound-and-true-p macher-agent--disable-local-tools)
+                        (macher-agent--stale-server-tool-request-params-p
+                         (bound-and-true-p gptel--request-params) context orig-buf)))
+                   (new-spec (macher-agent--lookup-skill-spec buf-gptel-preset context orig-buf)))
+              (when (and preset-rp
+                         (local-variable-p 'gptel--request-params orig-buf)
+                         (equal gptel--request-params preset-rp)
+                         (not (assq 'gptel--request-params flv)))
+                (kill-local-variable 'gptel--request-params))
+              (when (and was-server-tool-disabled
+                         (null (bound-and-true-p gptel-use-tools))
+                         (not (plist-get new-spec :disable-local-tools)))
+                (setq-local gptel-use-tools (default-value 'gptel-use-tools)))
+              (setq-local macher-agent-presets nil)
+              (setq-local macher-agent--active-ptc-primitives nil)
+              (setq-local macher-agent--boot-directive nil)
+              (setq-local macher-agent--force-boot-directive nil)
+              (setq-local macher-agent--disable-local-tools nil)
+              (setq-local macher-agent--preset-request-params nil)
+              (run-hook-with-args 'macher-agent-preset-cleared-hook orig-buf context)
+              nil)
+          buffer-presets)))))
+
 (defun macher-agent-pipe--hydrate-base-state (state)
   "Extract pristine local variables from target buffer into STATE."
   (cl-check-type state macher-agent-transmission-state)
@@ -1031,6 +1093,15 @@ Resolves TOOL-NAME via CTX, TARGET-BUF `gptel-get-tool', or FALLBACK-VAR."
           (setf (macher-agent-transmission-state-known-presets state)
                 (when (local-variable-p 'gptel--known-presets target-buf)
                   (buffer-local-value 'gptel--known-presets target-buf)))
+          (when (and (null buf-presets)
+                     (null (macher-agent-transmission-state-presets state))
+                     (not (assq 'gptel--request-params flv))
+                     (not (plist-member preset-spec :request-params))
+                     (not (plist-get preset-spec :disable-local-tools))
+                     (macher-agent--stale-server-tool-request-params-p
+                      (macher-agent-transmission-state-request-params state)
+                      active-context target-buf))
+            (setf (macher-agent-transmission-state-request-params state) nil))
           (when preset-spec
             (when (and (macher-agent-transmission-state-disable-local-tools state)
                        (not (plist-get preset-spec :disable-local-tools)))
@@ -3173,7 +3244,7 @@ Leaves the buffer prompt unmodified."
               (when matching-fsm
                 (let ((d (plist-get fsm-info :data)))
                   (and (listp d) (keywordp (car d))))))
-             (buffer-presets (bound-and-true-p macher-agent-presets))
+             (buffer-presets (macher-agent--reconcile-diverged-presets target-buf ctx))
              (active-preset-sym (macher-agent--resolve-active-preset-for-buffer
                                  buffer-presets ctx target-buf))
              (active-preset-spec (when active-preset-sym
@@ -3441,8 +3512,13 @@ Invokes ASYNC-FN when transformation finishes."
              (or (buffer-local-value 'macher-agent--wire-backend orig-buf)
                  cur-buf-backend))))))
 
-    (let* ((buffer-presets (when (buffer-live-p orig-buf)
-                             (buffer-local-value 'macher-agent-presets orig-buf)))
+    (let* ((had-stale-server-params
+            (when (buffer-live-p orig-buf)
+              (or (buffer-local-value 'macher-agent--disable-local-tools orig-buf)
+                  (macher-agent--stale-server-tool-request-params-p
+                   (buffer-local-value 'gptel--request-params orig-buf)
+                   context orig-buf))))
+           (buffer-presets (macher-agent--reconcile-diverged-presets orig-buf context))
            (known (when (buffer-live-p orig-buf)
                     (buffer-local-value 'gptel--known-presets orig-buf)))
            (extraction (macher-agent--extract-inline-skills prompt-start orig-buf))
@@ -3472,9 +3548,16 @@ Invokes ASYNC-FN when transformation finishes."
 
       (setf (macher-agent-transmission-state-tools state) normalized-tools)
       (macher-agent--apply-payload-locally payload)
-      (when (and (macher-agent-transmission-state-disable-local-tools state)
-                 (not (eq temp-buf orig-buf)))
+      (cond
+       ((and (macher-agent-transmission-state-disable-local-tools state)
+             (not (eq temp-buf orig-buf)))
         (setq-local gptel-use-tools nil))
+       ((and (not (macher-agent-transmission-state-disable-local-tools state))
+             (macher-agent-transmission-state-tools state)
+             (not (eq temp-buf orig-buf))
+             (null gptel-use-tools)
+             had-stale-server-params)
+        (setq-local gptel-use-tools (default-value 'gptel-use-tools))))
 
       (when-let* ((compiled (macher-agent-transmission-state-compiled-prompt state)))
         (setq-local gptel-system-prompt compiled))

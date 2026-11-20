@@ -412,6 +412,9 @@ buffer directly."
 (put 'macher-agent--persistent-context 'permanent-local t)
 (put 'macher-agent-fsm-id 'permanent-local t)
 
+(defvar macher-agent-preset-cleared-hook nil
+  "Hook run with `(BUF CONTEXT)' when diverged `macher-agent-presets' are cleared.")
+
 (defvar macher-agent--a2a-ownership (make-hash-table :test 'equal)
   "Global ownership registry tracking sub-agents associated with an originator.")
 

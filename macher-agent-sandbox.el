@@ -1129,16 +1129,25 @@ Evaluates inside TARGET-BUF using CONTEXT."
                       (let ((sb (macher-agent-sandbox-get-state ctx)))
                         (when (listp sb) (plist-get sb :ptc-primitives)))))
          (skill-prims nil))
-    (dolist (s skills)
-      (let* ((spec (if (listp s) s
-                     (macher-agent--lookup-skill-spec s ctx target-buf known t)))
-             (p (plist-get spec :ptc-primitives)))
-        (when (plist-get spec :exclusive)
-          (setq buf-prims nil
-                ctx-prims nil
-                skill-prims nil))
-        (when p
-          (setq skill-prims (append skill-prims (if (listp p) p (list p)))))))
+    (if skills
+        (dolist (s skills)
+          (let* ((spec (if (listp s) s
+                         (macher-agent--lookup-skill-spec s ctx target-buf known t)))
+                 (p (plist-get spec :ptc-primitives)))
+            (when (plist-get spec :exclusive)
+              (setq buf-prims nil
+                    ctx-prims nil
+                    skill-prims nil))
+            (when p
+              (setq skill-prims (append skill-prims (if (listp p) p (list p)))))))
+      (when-let* ((active-preset (when (and target-buf (buffer-live-p target-buf))
+                                   (with-current-buffer target-buf
+                                     (bound-and-true-p gptel--preset))))
+                  (spec (macher-agent--lookup-skill-spec active-preset ctx target-buf known))
+                  ((not (plist-get spec :is-command)))
+                  ((plist-get spec :exclusive)))
+        (setq buf-prims nil
+              ctx-prims nil)))
     (cl-delete-duplicates
      (append tx-prims
              skill-prims
@@ -1259,13 +1268,22 @@ ON-SUCCESS and ON-ERROR are single-argument callbacks."
               (funcall cleanup-fn)))
           nil)))))
 
+(defun macher-agent-sandbox--clear-context-ptc (_buf ctx)
+  "Clear cached `:ptc-primitives' on CTX sandbox state after preset reset."
+  (when (macher-agent-valid-context-p ctx)
+    (let ((sb (macher-agent-sandbox-get-state ctx)))
+      (when (and (listp sb) (plist-member sb :ptc-primitives))
+        (macher-agent-sandbox-set-state ctx (plist-put (copy-sequence sb) :ptc-primitives nil))))))
+
 (defun macher-agent-sandbox-install ()
   "Install sandbox execution capabilities and pipeline steps."
+  (add-hook 'macher-agent-preset-cleared-hook #'macher-agent-sandbox--clear-context-ptc)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-sandbox-append-ptc-to-transmission 60)
   (macher-agent-register-pipeline-step 'preset-composition #'macher-agent-ptc--inject-tool 40))
 
 (defun macher-agent-sandbox-uninstall ()
   "Uninstall sandbox execution capabilities and pipeline steps."
+  (remove-hook 'macher-agent-preset-cleared-hook #'macher-agent-sandbox--clear-context-ptc)
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-sandbox-append-ptc-to-transmission)
   (macher-agent-unregister-pipeline-step 'preset-composition #'macher-agent-ptc--inject-tool))
 

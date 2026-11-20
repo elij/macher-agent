@@ -15,6 +15,7 @@
 (require 'macher-agent-tools)
 (require 'macher-agent-presets)
 
+(defvar gptel--preset)
 (defvar gptel--known-presets)
 (defvar gptel--known-tools)
 (defvar gptel-directives)
@@ -205,8 +206,18 @@ When SKIP-CLONE is non-nil, preserves existing context in BUF."
       (when-let* ((v (plist-get meta :presets)))
         (let ((preset-list (if (vectorp v) (append v nil) (ensure-list v))))
           (setq-local macher-agent-presets preset-list)
-          (unless skip-clone
-            (macher-agent--apply-preset preset-list))))
+          (if (not skip-clone)
+              (macher-agent--apply-preset preset-list)
+            (let* ((primary (macher-agent--primary-preset-symbol preset-list parent-ctx buf))
+                   (spec (when primary
+                           (macher-agent--lookup-skill-spec primary parent-ctx buf))))
+              (if (and primary
+                       (not (plist-get spec :is-command))
+                       (or (alist-get primary (bound-and-true-p gptel--known-presets))
+                           (and (fboundp 'gptel-get-preset)
+                                (ignore-errors (gptel-get-preset primary)))))
+                  (setq-local gptel--preset primary)
+                (setq-local gptel--preset nil))))))
       (if (and skip-clone (macher-agent-valid-context-p macher-agent--persistent-context))
           (run-hook-with-args 'macher-agent-peer-sync-hook parent-ctx macher-agent--persistent-context)
         (let ((cloned (macher-agent--clone-context parent-ctx)))

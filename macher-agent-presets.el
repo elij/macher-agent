@@ -1151,8 +1151,13 @@ Also registers resolved tools in `gptel--known-tools'."
                             when (and tname (not (member tname acc)))
                             collect tname into acc
                             finally return acc)))
-              (when tool-names
-                (setq preset-plist (plist-put preset-plist :tools tool-names))))
+              (cond
+               (tool-names
+                (setq preset-plist (plist-put preset-plist :tools tool-names)))
+               ((and (not (plist-get spec :disable-local-tools))
+                     (or (plist-get spec :exclusive)
+                         (plist-get spec :has-tools)))
+                (setq preset-plist (plist-put preset-plist :tools nil)))))
             (setf (alist-get sym gptel--known-presets) preset-plist)
             (when sys-text
               (setf (alist-get sym gptel-directives) sys-text)))))))
@@ -1990,7 +1995,11 @@ only defaults to the first preset when PRESETS has length 1."
          (cur-spec (and cur-sym
                         (fboundp 'gptel-get-preset)
                         (ignore-errors (gptel-get-preset cur-sym)))))
-    (unless (and cur-spec (macher-agent--preset-matches-system-p cur-spec parsed-sys cur-sym))
+    (if (and cur-spec (macher-agent--preset-matches-system-p cur-spec parsed-sys cur-sym))
+        (when (and (bound-and-true-p macher-agent-presets)
+                   (not (eq (macher-normalise-preset-name cur-sym)
+                            (macher-agent--primary-preset-symbol macher-agent-presets))))
+          (setq-local macher-agent-presets nil))
       (let* ((lead-sym (car-safe (bound-and-true-p macher-agent-presets)))
              (lead-spec (and (symbolp lead-sym)
                              (fboundp 'gptel-get-preset)
@@ -2056,12 +2065,13 @@ spec lacks `:tools', causing `gptel--save-state' to drop active tools."
                      (macher-agent--lookup-skill-spec primary-sym)))
              (raw-sys (or (plist-get spec :system) (plist-get spec :system-message)))
              (boot-dir (plist-get spec :boot-directive)))
-        (when (and primary-sym
-                   (not (plist-get spec :is-command))
-                   (or (alist-get primary-sym known)
-                       (and (fboundp 'gptel-get-preset)
-                            (ignore-errors (gptel-get-preset primary-sym)))))
-          (setq-local gptel--preset primary-sym))
+        (if (and primary-sym
+                 (not (plist-get spec :is-command))
+                 (or (alist-get primary-sym known)
+                     (and (fboundp 'gptel-get-preset)
+                          (ignore-errors (gptel-get-preset primary-sym)))))
+            (setq-local gptel--preset primary-sym)
+          (setq-local gptel--preset nil))
         (when (stringp raw-sys)
           (setq payload (plist-put payload :system raw-sys)))
         (when (and boot-dir (not (plist-member payload :boot-directive)))
