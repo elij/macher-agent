@@ -33,7 +33,8 @@
 (put 'macher-agent-delegate-tasks-to-subagents-tool 'ptc-function
      (lambda (tasks &optional context)
        (let ((ctx (or (macher-agent-resolve-context context)
-                      (macher-agent-resolve-context (current-buffer)))))
+                      (macher-agent-resolve-context (current-buffer))))
+             (in-ptc (bound-and-true-p macher-agent--active-ptc-execution)))
          (lambda (resolve-fn)
            (if (not (vectorp tasks))
                (funcall resolve-fn "ERROR: Tasks parameter must be a vector of task specifications.")
@@ -83,7 +84,7 @@
                                     (t (format "%s" r))))
                                  (append results nil))))
                     (funcall resolve-fn
-                             (if macher-agent--active-ptc-execution
+                             (if in-ptc
                                  extracted
                                (string-join extracted "\n\n")))))
                 ctx)))))))

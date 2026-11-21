@@ -19,6 +19,8 @@
 (require 'macher)
 (require 'macher-agent-core)
 
+(defvar macher-tools)
+(defvar macher-tool-prefix)
 (defvar macher-workspace-types-alist)
 (defvar macher-workspace-functions)
 (defvar macher--workspace)
@@ -26,6 +28,36 @@
 
 (defvar macher-agent-macher-entry-converter-function nil
   "Function called with (ENTRY ROOT) to convert an entry into a Macher cell.")
+
+(defun macher-agent-macher-search-tool-name ()
+  "Return the active upstream Macher workspace search tool name."
+  (let* ((entry (and (boundp 'macher-tools)
+                     (listp macher-tools)
+                     (or (cl-find-if
+                          (lambda (spec)
+                            (and (listp spec)
+                                 (eq (plist-get spec :function) 'macher--tool-search)))
+                          macher-tools)
+                         (cl-find-if
+                          (lambda (spec)
+                            (and (listp spec)
+                                 (member (plist-get spec :name)
+                                         '("search" "search_in_workspace" "macher_search"))))
+                          macher-tools))))
+         (raw-name (plist-get entry :name)))
+    (cond
+     ((equal raw-name "search")
+      (concat (if (and (boundp 'macher-tool-prefix)
+                       (stringp macher-tool-prefix))
+                  macher-tool-prefix
+                "macher_")
+              raw-name))
+     ((and (stringp raw-name) (not (string-empty-p raw-name)))
+      raw-name)
+     ((and (boundp 'macher-tool-prefix)
+           (stringp macher-tool-prefix))
+      (concat macher-tool-prefix "search"))
+     (t "search_in_workspace"))))
 
 (defun macher-agent-macher-safe-workspace-hash (context)
   "Generate a safe 16-character hash strictly from the CONTEXT struct."
@@ -96,14 +128,17 @@
 
 (defun macher-agent-macher-run-with-proxy-context (orphaned-context ws marshalled-files prompt target-buf orig-fn callback args)
   "Execute upstream tool ORIG-FN in TARGET-BUF using a proxy Macher context.
-Validates ORPHANED-CONTEXT, constructs a proxy with WS, MARSHALLED-FILES, and
-PROMPT, invokes ORIG-FN with CALLBACK and ARGS, and returns (RESULT . FILES)."
-  (unless (and (fboundp 'macher-context-p) (macher-context-p orphaned-context))
-    (error "Macher Agent: Tool called without an upstream context"))
-  (let* ((effective-ws (or ws
-                           (when (fboundp 'macher-context-workspace)
-                             (ignore-errors (macher-context-workspace orphaned-context)))))
-         (proxy (when (fboundp 'macher--make-context)
+ORPHANED-CONTEXT may be an upstream `macher-context' or nil when WS is
+supplied.  Constructs a proxy with WS, MARSHALLED-FILES, and PROMPT,
+invokes ORIG-FN with CALLBACK and ARGS, and returns (result . files)."
+  (let* ((effective-ws
+          (or ws
+              (when (and orphaned-context
+                         (fboundp 'macher-context-p)
+                         (macher-context-p orphaned-context)
+                         (fboundp 'macher-context-workspace))
+                (ignore-errors (macher-context-workspace orphaned-context)))))
+         (proxy (when (and effective-ws (fboundp 'macher--make-context))
                   (let ((macher-agent--persistent-context nil))
                     (macher--make-context
                      :workspace effective-ws
@@ -118,9 +153,20 @@ PROMPT, invokes ORIG-FN with CALLBACK and ARGS, and returns (RESULT . FILES)."
                               marshalled-files)))
       (cons res raw-after-files))))
 
-(defun macher-agent-macher-install (&optional get-files-fn)
+(defun macher-agent-macher-expand-system-placeholder (prompt &optional buffer)
+  "Replace `macher-context-string-placeholder' in PROMPT using BUFFER."
+  (if (and (stringp prompt)
+           (stringp macher-context-string-placeholder)
+           (not (string-empty-p macher-context-string-placeholder))
+           (string-search macher-context-string-placeholder prompt)
+           (fboundp 'macher--system-replace-placeholder))
+      (macher--system-replace-placeholder prompt buffer)
+    prompt))
+
+(defun macher-agent-macher-install (&optional get-files-fn wrap-tools-fn)
   "Install Macher Core integration and workspace hooks idempotently.
-Optional GET-FILES-FN provides the `:get-files' workspace callback."
+Optional GET-FILES-FN provides the `:get-files' workspace callback.
+Optional WRAP-TOOLS-FN wraps or replaces upstream Macher tools."
   (let ((register-fn
          (lambda ()
            (when (boundp 'macher-workspace-types-alist)
@@ -131,7 +177,9 @@ Optional GET-FILES-FN provides the `:get-files' workspace callback."
                  (setq merged (plist-put merged :get-files get-files-fn)))
                (setf (alist-get 'agent macher-workspace-types-alist) merged)))
            (when (boundp 'macher-workspace-functions)
-             (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent)))))
+             (add-hook 'macher-workspace-functions #'macher-agent-workspace-agent))
+           (when (functionp wrap-tools-fn)
+             (funcall wrap-tools-fn)))))
     (funcall register-fn)
     (with-eval-after-load 'macher
       (funcall register-fn))))

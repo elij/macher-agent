@@ -20,5 +20,7 @@
        (let* ((root (when (macher-agent-valid-context-p context)
                       (macher-agent-context-project-root context)))
               (buf (macher-agent-add-subagent name presets (current-buffer) root context)))
-         (when (bufferp buf)
+         (when (and (bufferp buf) (buffer-live-p buf))
+           (with-current-buffer buf
+             (setq-local macher-agent--is-ephemeral nil))
            (buffer-name buf)))))

@@ -13,18 +13,19 @@
 
 (put 'macher-agent-submit-task-result-tool 'ptc-function
      (lambda (final-answer &optional task-id context)
-       (let* ((fsm (macher-agent-get-active-fsm))
-              (resolved-ctx (or (macher-agent-resolve-context context)
-                                (macher-agent-resolve-context (current-buffer))))
-              (target-buf (or (when fsm
-                                (or (ignore-errors (plist-get (gptel-fsm-info fsm) :buffer))
+       (let* ((explicit-ctx (macher-agent-resolve-context context))
+              (caller-fsm (macher-agent-get-active-fsm))
+              (target-buf (or (when (and explicit-ctx (fboundp 'macher-agent-context-owner-buffer))
+                                (let ((ob (macher-agent-context-owner-buffer explicit-ctx)))
+                                  (when (and (bufferp ob) (buffer-live-p ob)) ob)))
+                              (when caller-fsm
+                                (or (ignore-errors (plist-get (gptel-fsm-info caller-fsm) :buffer))
                                     (when (fboundp 'gptel-fsm-buffer)
-                                      (ignore-errors (gptel-fsm-buffer fsm)))))
-                              (when (and resolved-ctx (fboundp 'macher-agent-context-owner-buffer))
-                                (macher-agent-context-owner-buffer resolved-ctx))
+                                      (ignore-errors (gptel-fsm-buffer caller-fsm)))))
                               (current-buffer)))
               (ctx (or (macher-agent-resolve-context target-buf)
-                       resolved-ctx)))
+                       explicit-ctx
+                       (macher-agent-resolve-context (current-buffer)))))
          (with-current-buffer target-buf
            (let* ((route-frame (car-safe (bound-and-true-p macher-agent--routing-stack)))
                   (target-name (plist-get route-frame :originator-name))
@@ -33,7 +34,8 @@
                                    task-id))
                   (suppress (plist-get route-frame :suppress-patch))
                   (meta (list :suppress-patch suppress
-                              :ephemeral (bound-and-true-p macher-agent--is-ephemeral))))
+                              :ephemeral (and (bound-and-true-p macher-agent--is-ephemeral)
+                                              (not (bound-and-true-p macher-agent--explicitly-persistent))))))
 
              (unless callback-id
                (error "STRICT CONTRACT VIOLATION: Payload missing required task-id"))
@@ -63,22 +65,25 @@
                                   :child-context valid-ctx
                                   :shared-state (list :task-id callback-id)
                                   :payload msg-payload
-                                  :metadata meta)))
-
-               (macher-agent-a2a-dispatch (list a2a-payload) nil valid-ctx)
-
-               (when (fboundp 'macher-agent--pop-routing)
-                 (macher-agent--pop-routing))
-
-               (unless (bound-and-true-p macher-agent--routing-stack)
-                 (setq-local macher-agent-task-finished t)
-                 (when (macher-agent-valid-context-p ctx)
-                   (setf (macher-agent-session-state (macher-agent-context-session ctx)) :finished))
-                 (when suppress
-                   (setq-local macher-agent--suppress-patch t)
-                   (when (bound-and-true-p macher-agent--is-ephemeral)
-                     (setq-local macher-agent--ready-to-reap t)
-                     (when (macher-agent-valid-context-p ctx)
-                       (setf (macher-agent-session-state (macher-agent-context-session ctx)) :reapable)))))
-
-               "SUCCESS: Result submitted. STOP NOW."))))))
+                                  :metadata meta))
+                    (buf-fsm (bound-and-true-p macher-agent--active-fsm))
+                    (active-tool-fsm
+                     (and buf-fsm
+                          (fboundp 'gptel-fsm-state)
+                          (memq (ignore-errors (gptel-fsm-state buf-fsm)) '(TOOL TPRE))
+                          (let ((inf (ignore-errors (gptel-fsm-info buf-fsm))))
+                            (eq (plist-get inf :buffer) target-buf)))))
+               (setq-local macher-agent--staged-submission
+                           (list :a2a-payload a2a-payload
+                                 :context valid-ctx
+                                 :suppress suppress
+                                 :task-id callback-id))
+               (if active-tool-fsm
+                   (progn
+                     (when (fboundp 'macher-agent--install-tret-done-edge)
+                       (macher-agent--install-tret-done-edge buf-fsm))
+                     (setq-local macher-agent-task-finished
+                                 (<= (length (bound-and-true-p macher-agent--routing-stack)) 1))
+                     "SUCCESS: Result submitted.")
+                 (macher-agent--deliver-staged-submission target-buf t)
+                 "SUCCESS: Result submitted. STOP NOW.")))))))
