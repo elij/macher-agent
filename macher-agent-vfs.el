@@ -313,23 +313,22 @@ directory string (with trailing slash) for ROOT."
       (error "SECURITY ERROR: Path traversal jailbreak detected: %s" unsafe-path))))
 
 (defun macher-agent--read-content-from-disk-or-buffer (path)
-  "Extract content string guaranteed by PATH string structure."
+  "Extract content string for virtual buffer or physical file PATH."
   (cl-check-type path string)
   (cl-assert (not (string-empty-p path)))
-  (let* ((buf (or (get-file-buffer path) (get-buffer path)))
-         (is-media (and (file-exists-p path) (macher-agent-media-file-p path)))
-         (file-exists (file-exists-p path))
-         (trust-buffer (and buf (buffer-live-p buf)
-                            (or (buffer-modified-p buf)
-                                (not (buffer-file-name buf))
-                                (verify-visited-file-modtime buf)))))
+  (let* ((buf (get-buffer path))
+         (virtual-buf (and buf (buffer-live-p buf) (not (buffer-file-name buf))))
+         (file-exists (and (not virtual-buf) (file-exists-p path)))
+         (is-media (and file-exists (macher-agent-media-file-p path))))
     (cond
-     (trust-buffer
+     (virtual-buf
       (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))
      (file-exists
       (with-temp-buffer
         (if is-media (insert-file-contents-literally path) (insert-file-contents path))
         (buffer-string)))
+     ((and buf (buffer-live-p buf))
+      (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))
      (t nil))))
 
 (defun macher-agent--read-string (offset limit &optional text show-line-numbers)
@@ -367,7 +366,7 @@ When REPLACE-ALL is non-nil, replace every occurrence."
      ((= count 0)
       (error "Text not found: %s" old-text))
      ((and (> count 1) (not replace-all))
-      (error "Multiple matches found for text. Set replace_all to true or provide more context: %s" old-text))
+      (error "Multiple matches found for text.  Set replace_all to true or provide more context: %s" old-text))
      (t
       (replace-regexp-in-string (regexp-quote old-text) new-text content t t)))))
 
@@ -437,25 +436,23 @@ physical file was deleted externally."
   (cl-check-type entry macher-agent-vfs-entry)
   (cl-check-type root string)
   (let* ((path (macher-agent-vfs-entry-path entry))
-         (abs-path (if (not (file-name-absolute-p path)) (expand-file-name path root) path))
+         (is-buf (eq (macher-agent--classify-file-path path root) 'buffer))
+         (abs-path (if (or is-buf (file-name-absolute-p path))
+                       path
+                     (expand-file-name path root)))
          (orig (macher-agent-vfs-entry-orig entry))
          (new (macher-agent-vfs-entry-curr entry))
-         (buf (or (get-file-buffer path) (get-file-buffer abs-path) (get-buffer path)))
-         (live-buf (and buf (buffer-live-p buf)))
-         (buf-content (when live-buf
-                        (with-current-buffer buf
-                          (buffer-substring-no-properties (point-min) (point-max)))))
-         (disk-content (when (file-exists-p abs-path)
-                         (ignore-errors
-                           (with-temp-buffer
-                             (insert-file-contents abs-path)
-                             (buffer-string)))))
-         (current-state (cond
-                         ((and live-buf (buffer-modified-p buf)) buf-content)
-                         (disk-content disk-content)
-                         (live-buf buf-content)
-                         (t nil)))
-         (is-buf (eq (macher-agent--classify-file-path path root) 'buffer))
+         (current-state
+          (if is-buf
+              (let ((buf (get-buffer path)))
+                (when (and buf (buffer-live-p buf))
+                  (with-current-buffer buf
+                    (buffer-substring-no-properties (point-min) (point-max)))))
+            (when (file-exists-p abs-path)
+              (ignore-errors
+                (with-temp-buffer
+                  (insert-file-contents abs-path)
+                  (buffer-string))))))
          (ctx (cond
                ((macher-agent-context-p context-or-mtime) context-or-mtime)
                ((bound-and-true-p macher-agent--persistent-context)
@@ -478,7 +475,8 @@ physical file was deleted externally."
      ((and (not is-buf) orig (null current-state))
       (let ((has-pending (and (fboundp 'macher-agent-vfs-entry-pending-patch)
                               (macher-agent-vfs-entry-pending-patch entry)
-                              (not (equal orig new)))))
+                              (not (equal orig new))
+                              (not (null new)))))
         (if has-pending
             nil
           (when (and ctx (macher-agent-valid-context-p ctx))
@@ -1745,8 +1743,8 @@ callback receives the final result."
 Manages the output buffer, `make-process', sentinel cleanup, and
 output truncation for `skills/scripts/*.el'.  Accepts CTX-OR-COMMAND,
 COMMAND-OR-RESOLVE, RESOLVE-OR-FORMAT, and MAYBE-FORMAT-FN, supporting
-both (command resolve-fn &optional format-fn) and
-(ctx command resolve-fn &optional format-fn).  The command may be a
+both `(command resolve-fn &optional format-fn)' and
+`(ctx command resolve-fn &optional format-fn)'.  The command may be a
 shell string or list of program and arguments.  The format function,
 when non-nil, is called as `(funcall format-fn exit-code output)'."
   (let* ((has-ctx (not (functionp command-or-resolve)))
@@ -1833,7 +1831,7 @@ when non-nil, is called as `(funcall format-fn exit-code output)'."
                                   (error-message-string err))))))))))
 
 (defmacro macher-agent-with-strict-vfs-pipeline (context callback &rest body)
-  "Hydrate CONTEXT VFS sandbox asynchronously, exposing `done' inside BODY."
+  "Hydrate CONTEXT VFS sandbox with CALLBACK, exposing `done' in BODY."
   (declare (indent 2) (debug t))
   `(macher-agent-call-with-strict-vfs-pipeline
     ,context

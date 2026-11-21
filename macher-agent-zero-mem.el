@@ -528,25 +528,60 @@ ARGS is a property list supporting `:top-k', `:iterations', `:max-line',
             (setq safe-pt (prop-match-end match) found t))))
       (cons safe-min safe-pt))))
 
-(defun macher-agent-zero-mem--calculate-event-horizon (orig-buf)
-  "Extract event index marker explicitly from ORIG-BUF live state."
+(defun macher-agent-zero-mem--trace-source-buffer (orig-buf)
+  "Return shadow wire buffer for ORIG-BUF when populated, else ORIG-BUF."
+  (if (and (bufferp orig-buf) (buffer-live-p orig-buf)
+           (macher-agent--wire-has-spans-p orig-buf))
+      (or (macher-agent--wire-buffer-for orig-buf nil) orig-buf)
+    orig-buf))
+
+(defun macher-agent-zero-mem--combined-tick (orig-buf)
+  "Return combined modification tick of ORIG-BUF and its shadow wire buffer."
+  (if (not (and (bufferp orig-buf) (buffer-live-p orig-buf)))
+      0
+    (let ((wbuf (and (macher-agent--wire-has-spans-p orig-buf)
+                     (macher-agent--wire-buffer-for orig-buf nil))))
+      (if (and wbuf (buffer-live-p wbuf))
+          (+ (buffer-chars-modified-tick orig-buf)
+             (buffer-chars-modified-tick wbuf))
+        (buffer-chars-modified-tick orig-buf)))))
+
+(defun macher-agent-zero-mem--calculate-event-horizon (orig-buf &optional max-chars-override)
+  "Extract event index marker explicitly from ORIG-BUF live state.
+Optional MAX-CHARS-OVERRIDE supplies the active model's character budget."
   (cl-check-type orig-buf buffer)
   (when (buffer-live-p orig-buf)
-    (with-current-buffer orig-buf
-      (let ((max-chars (macher-agent--get-max-context-chars orig-buf))
-            (tick (buffer-chars-modified-tick orig-buf)))
-        (if (<= (buffer-size) max-chars)
-            (list :line 1 :offset (point-min) :tick tick)
-          (let ((safe-pt (cdr (macher-agent-zero-mem--find-truncation-bounds max-chars))))
-            (list :line (line-number-at-pos safe-pt)
-                  :offset safe-pt
-                  :tick tick)))))))
+    (let ((max-chars (or max-chars-override
+                         (macher-agent--get-max-context-chars orig-buf)))
+          (tick (macher-agent-zero-mem--combined-tick orig-buf)))
+      (if (macher-agent--wire-has-spans-p orig-buf)
+          (let* ((wbuf (macher-agent--wire-buffer-for orig-buf nil))
+                 (wire-backend (buffer-local-value 'macher-agent--wire-backend orig-buf))
+                 (bundles (and wbuf
+                               (macher-agent--build-wire-turn-bundles
+                                wbuf orig-buf nil wire-backend)))
+                 (horizon-res (macher-agent--resolve-wire-horizon orig-buf bundles max-chars))
+                 (horizon-send (plist-get horizon-res :horizon-send)))
+            (if (and wbuf (buffer-live-p wbuf) (integerp horizon-send))
+                (with-current-buffer wbuf
+                  (let ((clamped (max (point-min) (min (point-max) horizon-send))))
+                    (list :line (line-number-at-pos clamped)
+                          :offset clamped
+                          :tick tick)))
+              (list :line 1 :offset 1 :tick tick)))
+        (with-current-buffer orig-buf
+          (if (<= (buffer-size) max-chars)
+              (list :line 1 :offset (point-min) :tick tick)
+            (let ((safe-pt (cdr (macher-agent-zero-mem--find-truncation-bounds max-chars))))
+              (list :line (line-number-at-pos safe-pt)
+                    :offset safe-pt
+                    :tick tick))))))))
 
 (defun macher-agent-zero-mem--get-event-horizon (orig-buf &optional context)
   "Correlate index marker linking ORIG-BUF against optional CONTEXT struct."
   (cl-check-type orig-buf buffer)
   (when (buffer-live-p orig-buf)
-    (let* ((current-tick (buffer-chars-modified-tick orig-buf))
+    (let* ((current-tick (macher-agent-zero-mem--combined-tick orig-buf))
            (local-horizon (buffer-local-value 'macher-agent-zero-mem--event-horizon orig-buf))
            (ctx-horizon (when (macher-agent-valid-context-p context)
                           (plist-get (macher-agent-context-plugins context) :event-horizon))))
@@ -565,6 +600,10 @@ ARGS is a property list supporting `:top-k', `:iterations', `:max-line',
 (defconst macher-agent-zero-mem--tool-fence-open-re
   "^[ \t]*\\(```[ \t]*tool\\b\\|#\\+begin_tool\\b\\|#\\+begin_src[ \t]+tool\\b\\)"
   "Regexp matching the opening fence of a Markdown or Org tool block.")
+
+(defconst macher-agent-zero-mem--reasoning-fence-open-re
+  "^[ \t]*\\(```[ \t]*reasoning\\b\\|#\\+begin_reasoning\\b\\)"
+  "Regexp matching the opening fence of a Markdown or Org reasoning block.")
 
 (defconst macher-agent-zero-mem--speaker-boundary-re
   "^[ \t]*\\(?:User:\\|Assistant:\\|System:\\|Turn [0-9]+:\\|###+ \\|\\*+ \\)"
@@ -630,6 +669,43 @@ Optionally stops at BEFORE-OFFSET or BEFORE-LINE."
                                                 :type :tool-block))
                           traces))
                   (setq line-num (+ line-num lines-spanned))))
+               ((let ((case-fold-search t))
+                  (looking-at macher-agent-zero-mem--reasoning-fence-open-re))
+                (let* ((fence-head (downcase (match-string 1)))
+                       (end-re (if (string-prefix-p "```" fence-head)
+                                   "^[ \t]*```[ \t]*$"
+                                 "^[ \t]*#\\+end_reasoning[ \t]*$"))
+                       (seg-start line-beg)
+                       (seg-line line-num)
+                       (lines-spanned 1))
+                  (setq turn-idx (1+ turn-idx))
+                  (setq last-role :reasoning-block)
+                  (forward-line 1)
+                  (let ((case-fold-search t)
+                        (closed nil))
+                    (while (and (< (point) max-pos) (not closed))
+                      (setq lines-spanned (1+ lines-spanned))
+                      (if (looking-at end-re)
+                          (progn
+                            (setq closed t)
+                            (forward-line 1))
+                        (forward-line 1))))
+                  (let* ((seg-end (min max-pos
+                                       (if (and (> (point) seg-start)
+                                                (eq (char-before (point)) ?\n))
+                                           (1- (point))
+                                         (point))))
+                         (seg-text (buffer-substring-no-properties seg-start seg-end)))
+                    (push (list :id seg-line
+                                :text seg-text
+                                :timestamp (float seg-line)
+                                :metadata (list :buffer buf-name
+                                                :line seg-line
+                                                :offset seg-start
+                                                :turn turn-idx
+                                                :type :reasoning-block))
+                          traces))
+                  (setq line-num (+ line-num lines-spanned))))
                (t
                 (let* ((is-resp (eq (get-text-property line-beg 'gptel) 'response))
                        (role (if is-resp :response :prompt))
@@ -648,6 +724,8 @@ Optionally stops at BEFORE-OFFSET or BEFORE-LINE."
                                      (not (looking-at "^\\[\\.\\.\\. SYSTEM ALERT: macher-agent truncated"))
                                      (not (let ((case-fold-search t))
                                             (looking-at macher-agent-zero-mem--tool-fence-open-re)))
+                                     (not (let ((case-fold-search t))
+                                            (looking-at macher-agent-zero-mem--reasoning-fence-open-re)))
                                      (not (looking-at macher-agent-zero-mem--speaker-boundary-re))
                                      (eq (eq (get-text-property next-beg 'gptel) 'response) is-resp))))
                     (setq chunk-lines (1+ chunk-lines))
@@ -678,7 +756,7 @@ Optionally stops at BEFORE-OFFSET or BEFORE-LINE."
   (plist-get (macher-agent-context-plugins context) :zero-mem))
 
 (defun macher-agent-zero-mem-set-state (context state)
-  "Update mapping registry bounds natively against CONTEXT struct."
+  "Update mapping registry STATE natively against CONTEXT struct."
   (cl-check-type context macher-agent-context)
   (setf (macher-agent-context-plugins context)
         (plist-put (copy-sequence (macher-agent-context-plugins context)) :zero-mem state))
@@ -696,25 +774,28 @@ hashes."
                    (t nil))))
     (when (and buf (buffer-live-p buf))
       (let* ((buf-name (buffer-name buf))
+             (source-buf (macher-agent-zero-mem--trace-source-buffer buf))
              (ctx (or (when (macher-agent-valid-context-p context) context)
                       (macher-agent-resolve-context buf)))
-             (current-tick (buffer-chars-modified-tick buf))
+             (current-tick (macher-agent-zero-mem--combined-tick buf))
              (cached-graph (or (when ctx (macher-agent-zero-mem-get-state ctx))
                                (gethash buf-name macher-agent-memory-vector-storage))))
         (if (and cached-graph
                  (eql (macher-agent-zero-mem-graph-modified-tick cached-graph) current-tick))
             cached-graph
-          (let ((current-hash (with-current-buffer buf
+          (let ((current-hash (with-current-buffer source-buf
                                 (sxhash-equal (buffer-substring-no-properties (point-min) (point-max))))))
             (if (and cached-graph
                      (eql (macher-agent-zero-mem-graph-content-hash cached-graph) current-hash))
                 (progn
                   (setf (macher-agent-zero-mem-graph-modified-tick cached-graph) current-tick)
                   cached-graph)
-              (let* ((prev-graph (or cached-graph (gethash buf-name macher-agent-memory-vector-storage)))
-                 (raw-traces (macher-agent-zero-mem--buffer-to-traces buf))
-                 (new-texts (make-hash-table :test 'equal))
-                 (archived-raw-traces nil))
+              (let* ((has-shadow (macher-agent--wire-has-spans-p buf))
+                     (prev-graph (unless has-shadow
+                                   (or cached-graph (gethash buf-name macher-agent-memory-vector-storage))))
+                     (raw-traces (macher-agent-zero-mem--buffer-to-traces source-buf))
+                     (new-texts (make-hash-table :test 'equal))
+                     (archived-raw-traces nil))
             (remhash buf-name macher-agent-memory-vector-storage)
             (when ctx
               (macher-agent-zero-mem-set-state ctx nil))
@@ -857,7 +938,8 @@ hashes."
            (max-chars (macher-agent--get-max-context-chars
                        buf (macher-agent-transmission-state-model state)))
            (buf-size (if (and buf (buffer-live-p buf))
-                         (with-current-buffer buf (buffer-size))
+                         (max (with-current-buffer buf (buffer-size))
+                              (macher-agent--wire-total-chars buf))
                        0)))
       (when (> buf-size max-chars)
         (let* ((tools (macher-agent-transmission-state-tools state))
@@ -895,6 +977,22 @@ hashes."
                   (append tools (list parent-tool))))))))
   state)
 
+(defun macher-agent-zero-mem--on-wire-pre-truncate (orig-buf shadow-offset)
+  "Index ORIG-BUF in Zero-Mem and update horizon to SHADOW-OFFSET."
+  (when (and (bufferp orig-buf) (buffer-live-p orig-buf))
+    (macher-agent-zero-mem--get-graph orig-buf)
+    (let ((wbuf (macher-agent--wire-buffer-for orig-buf nil))
+          (tick (macher-agent-zero-mem--combined-tick orig-buf)))
+      (when (and wbuf (buffer-live-p wbuf) (integerp shadow-offset))
+        (let ((hline (with-current-buffer wbuf
+                       (line-number-at-pos
+                        (max (point-min) (min (point-max) shadow-offset))))))
+          (with-current-buffer orig-buf
+            (setq-local macher-agent-zero-mem--event-horizon
+                        (list :line hline
+                              :offset shadow-offset
+                              :tick tick))))))))
+
 (defun macher-agent-memory-pipe--truncate-buffer (state)
   "Truncate transmission wire buffer defined in STATE struct."
   (cl-check-type state macher-agent-transmission-state)
@@ -902,7 +1000,20 @@ hashes."
          (ref-buf (or (macher-agent-transmission-state-target-buffer state) tx-buf))
          (max-chars (macher-agent--get-max-context-chars
                      ref-buf (macher-agent-transmission-state-model state))))
-    (when (> (buffer-size tx-buf) max-chars)
+    (cond
+     ((and (buffer-live-p ref-buf)
+           (macher-agent--wire-has-spans-p ref-buf)
+           (or (> (macher-agent--wire-total-chars ref-buf) max-chars)
+               (buffer-local-value 'macher-agent-zero-mem--event-horizon ref-buf)
+               (buffer-local-value 'macher-agent--wire-horizon-turn-id ref-buf)
+               (buffer-local-value 'macher-agent--wire-dedup-turn-id ref-buf)))
+      (macher-agent-zero-mem--get-graph ref-buf)
+      (let ((hz (macher-agent-zero-mem--calculate-event-horizon ref-buf max-chars)))
+        (with-current-buffer ref-buf
+          (setq-local macher-agent-zero-mem--event-horizon hz))))
+     ((and (not (and (buffer-live-p ref-buf)
+                     (macher-agent--wire-has-spans-p ref-buf)))
+           (> (buffer-size tx-buf) max-chars))
       (save-excursion
         (pcase-let ((`(,safe-min . ,safe-pt)
                      (macher-agent-zero-mem--find-truncation-bounds max-chars)))
@@ -917,7 +1028,7 @@ hashes."
                   (setq-local macher-agent-zero-mem--event-horizon
                               (list :line horizon-line
                                     :offset safe-pt
-                                    :tick (buffer-chars-modified-tick target-buf)))))
+                                    :tick (macher-agent-zero-mem--combined-tick target-buf)))))
               (delete-region safe-min safe-pt)
               (goto-char safe-min)
               (insert (if (macher-agent-transmission-state-disable-local-tools state)
@@ -926,7 +1037,7 @@ hashes."
                         (format "\n[... SYSTEM ALERT: macher-agent truncated %d lines of early history to conserve tokens. If you need this context, use the `search_conversation_history` tool ...]\n\n"
                                 lines-deleted)))
               (when (looking-at "^[ \t\n\r]+")
-                (replace-match ""))))))))
+                (replace-match "")))))))))
   state)
 
 (defun macher-agent-pipe--inject-zero-mem (state)
@@ -1007,11 +1118,12 @@ Returns trimmed non-empty string or nil."
              (query (macher-agent-zero-mem--extract-clean-prompt target-buf ctx)))
         (when (and parent-graph query (not (string-empty-p query)))
           (let* ((traces (macher-agent-zero-mem-retrieve
-                          query parent-graph :top-k 5 :exclude-types '(:tool-block)))
+                          query parent-graph :top-k 5
+                          :exclude-types '(:tool-block :reasoning-block)))
                  (formatted-traces nil))
             (dolist (tr traces)
               (let ((meta (macher-agent-zero-mem-trace-metadata tr)))
-                (unless (eq (plist-get meta :type) :tool-block)
+                (unless (memq (plist-get meta :type) '(:tool-block :reasoning-block))
                   (when-let* ((sanitized (macher-agent-zero-mem--sanitize-parent-trace-text
                                           (macher-agent-zero-mem-trace-text tr))))
                     (let ((line (or (plist-get meta :line)
@@ -1073,6 +1185,36 @@ Returns trimmed non-empty string or nil."
              (is-truncated (and is-self-query
                                 horizon-offset
                                 (> horizon-offset (with-current-buffer orig-buf (point-min)))))
+             (dedup-tid (and is-self-query
+                             (buffer-local-value 'macher-agent--wire-dedup-turn-id orig-buf)))
+             (dedup-bounds
+              (when (and (integerp dedup-tid)
+                         (macher-agent--wire-has-spans-p orig-buf))
+                (when-let* ((wbuf (macher-agent--wire-buffer-for orig-buf nil)))
+                  (with-current-buffer wbuf
+                    (let ((pos (point-min))
+                          (max-end nil))
+                      (while (< pos (point-max))
+                        (let ((tid (get-text-property pos 'macher-agent-turn-id))
+                              (next (next-single-property-change
+                                     pos 'macher-agent-span-id wbuf (point-max))))
+                          (when (and (integerp tid) (<= tid dedup-tid))
+                            (setq max-end next))
+                          (setq pos next)))
+                      (when (integerp max-end)
+                        (let ((clamped (max (point-min) (min (point-max) max-end))))
+                          (cons (line-number-at-pos clamped) clamped))))))))
+             (dedup-line (car-safe dedup-bounds))
+             (dedup-offset (cdr-safe dedup-bounds))
+             (has-dedup (and is-self-query dedup-offset (> dedup-offset 1)))
+             (max-search-offset
+              (when (or is-truncated has-dedup)
+                (max (or (and is-truncated horizon-offset) 0)
+                     (or (and has-dedup dedup-offset) 0))))
+             (max-search-line
+              (when (or is-truncated has-dedup)
+                (max (or (and is-truncated horizon-line) 0)
+                     (or (and has-dedup dedup-line) 0))))
              (graph (macher-agent-zero-mem--get-graph orig-buf context))
              (has-archived (when graph
                              (let ((found nil)
@@ -1083,13 +1225,14 @@ Returns trimmed non-empty string or nil."
                                               (setq found t)))
                                           traces))
                                found))))
-        (if (or (null graph) (and is-self-query (not is-truncated) (not has-archived)))
+        (if (or (null graph)
+                (and is-self-query (not is-truncated) (not has-archived) (not has-dedup)))
             (format "No matches found in history for: %s" (string-join kws ", "))
           (let* ((retrieved (macher-agent-zero-mem-retrieve
                              kws graph
                              :top-k top-k
-                             :max-line (when is-truncated horizon-line)
-                             :max-offset (when is-truncated horizon-offset)))
+                             :max-line max-search-line
+                             :max-offset max-search-offset))
                  (results nil))
             (dolist (tr retrieved)
               (let* ((meta (macher-agent-zero-mem-trace-metadata tr))
@@ -1103,6 +1246,11 @@ Returns trimmed non-empty string or nil."
 
 ;;;; Plugin Lifecycle Management
 
+(defun macher-agent-zero-mem--on-wire-invalidated (orig-buf &optional _reason)
+  "Quietly clear Zero-Mem cache and horizon for ORIG-BUF on wire invalidation."
+  (when (and (bufferp orig-buf) (buffer-live-p orig-buf))
+    (macher-agent-clear-zero-mem orig-buf t)))
+
 (defun macher-agent-zero-mem-install ()
   "Install zero-token memory hooks and dynamic pipeline steps."
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-tool 45)
@@ -1113,6 +1261,8 @@ Returns trimmed non-empty string or nil."
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-directive 85)
   (macher-agent-register-pipeline-step 'transmission #'macher-agent-parent-memory-pipe--inject-directive 86)
   (add-hook 'macher-agent-task-flush-hook #'macher-agent-memory--persist-interaction)
+  (add-hook 'macher-agent-wire-pre-truncate-hook #'macher-agent-zero-mem--on-wire-pre-truncate)
+  (add-hook 'macher-agent-wire-invalidated-hook #'macher-agent-zero-mem--on-wire-invalidated)
   (setq macher-agent-search-backend-function #'macher-agent-memory-search-zero-mem))
 
 (defun macher-agent-zero-mem-uninstall ()
@@ -1125,10 +1275,13 @@ Returns trimmed non-empty string or nil."
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-memory-pipe--inject-directive)
   (macher-agent-unregister-pipeline-step 'transmission #'macher-agent-parent-memory-pipe--inject-directive)
   (remove-hook 'macher-agent-task-flush-hook #'macher-agent-memory--persist-interaction)
+  (remove-hook 'macher-agent-wire-pre-truncate-hook #'macher-agent-zero-mem--on-wire-pre-truncate)
+  (remove-hook 'macher-agent-wire-invalidated-hook #'macher-agent-zero-mem--on-wire-invalidated)
   (setq macher-agent-search-backend-function #'macher-agent-search-glob))
 
-(defun macher-agent-clear-zero-mem (&optional target-buf)
-  "Clear Zero-Mem graph, entity mappings, and vector storage for TARGET-BUF."
+(defun macher-agent-clear-zero-mem (&optional target-buf silent)
+  "Clear Zero-Mem graph, entity mappings, and vector storage for TARGET-BUF.
+When SILENT is non-nil, omit the echo-area status message."
   (interactive)
   (let* ((buf (or target-buf (current-buffer)))
          (buf-name (when (buffer-live-p buf) (buffer-name buf)))
@@ -1140,7 +1293,8 @@ Returns trimmed non-empty string or nil."
     (when (buffer-live-p buf)
       (with-current-buffer buf
         (setq-local macher-agent-zero-mem--event-horizon nil)))
-    (message "Macher-Agent: Zero-Mem graph and vector storage cleared for '%s'." (or buf-name "buffer"))))
+    (unless silent
+      (message "Macher-Agent: Zero-Mem graph and vector storage cleared for '%s'." (or buf-name "buffer")))))
 
 (provide 'macher-agent-zero-mem)
 ;;; macher-agent-zero-mem.el ends here

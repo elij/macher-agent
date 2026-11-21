@@ -18,6 +18,7 @@ The package integrates with `gptel` across several core boundaries:
 - Finite-state machine handlers (`gptel-fsm-handlers`) capture user prompts, inject base64-encoded visual media, protect callback closures, and trigger task completion flushes when execution reaches terminal states.
 - The pre-tool execution hook `gptel-pre-tool-call-functions` enforces strict tool scoping, blocking invocations of tools not permitted in the active skill configuration.
 - Settings such as `gptel-model`, `gptel-backend`, `gptel-system-prompt`, and `gptel-tools` are scoped buffer-locally to allow each agent buffer to maintain an independent identity.
+- Extends  `gptel`  to persists true-to-source `INIT` to `WAIT` request payloads across user prompts within an active Emacs session (not persisted across restarts) when `macher-agent-wire-buffer-mode` is non-nil (default `t`). User-buffer display verbosity follows `gptel`'s `gptel-include-tool-results` (`nil`, `call`, `auto`, or `t`) and `gptel-include-reasoning` (`nil`, `ignore`, `t`, or buffer name) settings independently of wire replay.
 
 ## Integration with macher
 

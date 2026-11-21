@@ -92,7 +92,8 @@
   (cl-check-type ctx macher-agent-context)
   (let* ((raw-root (macher-agent-context-project-root ctx))
          (canonical-root (when raw-root
-                           (file-truename (expand-file-name raw-root))))
+                           (file-name-as-directory
+                            (file-truename (expand-file-name raw-root)))))
          (ws (cons 'project canonical-root))
          (mapped-contents
           (mapcar (lambda (entry)
@@ -122,7 +123,7 @@
            (resolved (expand-file-name path canonical-ws))
            (truename (file-truename resolved)))
       (unless (string-prefix-p canonical-ws truename)
-        (error "SECURITY ERROR: Access denied. '%s' is outside the workspace '%s' and has not been explicitly added to the agent's scope"
+        (error "SECURITY ERROR: Access denied.  '%s' is outside the workspace '%s' and has not been explicitly added to the agent's scope"
                path canonical-ws))
       t)))
 
