@@ -1,140 +1,147 @@
-.PHONY: all compile checkdoc package-lint lint format fmt clean
+.PHONY: all compile checkdoc package-lint lint test integration-test format fmt clean
 
 EMACS ?= emacs
 
-# Find source files while ignoring hidden files, tests, package descriptors, and generated autoloads
-EL_FILES := $(shell find . -maxdepth 2 -name "*.el" \
-	! -path "./bench/*" \
-	! -path "./gptel/*" \
-	! -path "./macher/*" \
-	! -path "./tests/*" \
-	! -name "*test.el" \
-	! -name ".*" \
-	! -name "*-pkg.el" \
-	! -name "*-autoloads.el")
+# All 6 monorepo packages in topological DAG order
+PACKAGES := packages/macher-agent \
+	packages/macher-agent-wire \
+	packages/macher-agent-zero-mem \
+	packages/macher-agent-sandbox \
+	packages/macher-agent-vfs \
+	packages/macher-agent-skills
 
-# Elisp snippet to initialise package.el and install required dependencies safely
-define SETUP_DEPS
+define INTEGRATION_SETUP
 (progn \
+  (setq load-prefer-newer t) \
+  (require 'cl-lib) \
   (require 'package) \
   (add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/")) \
-  (package-initialize) \
-  (dolist (pkg '(gptel macher package-lint)) \
-    (unless (package-installed-p pkg) \
-      (unless package-archive-contents (package-refresh-contents)) \
-      (package-install pkg))) \
-  (when (file-directory-p (expand-file-name "macher" default-directory)) \
-    (push (expand-file-name "macher" default-directory) load-path)) \
-  (when (file-directory-p (expand-file-name "gptel" default-directory)) \
-    (push (expand-file-name "gptel" default-directory) load-path)) \
-  (push (expand-file-name default-directory) load-path))
+  (let ((local-gptel (file-directory-p (expand-file-name "gptel" default-directory))) \
+        (local-macher (file-directory-p (expand-file-name "macher" default-directory))) \
+        (register-local-pkg \
+         (lambda (file) \
+           (when (file-exists-p file) \
+             (let ((desc (with-temp-buffer \
+                           (insert-file-contents file) \
+                           (ignore-errors (package-buffer-info))))) \
+               (when desc \
+                 (setf (package-desc-dir desc) (file-name-directory file)) \
+                 (setq package-alist \
+                       (cons (cons (package-desc-name desc) (list desc)) \
+                             (assq-delete-all (package-desc-name desc) package-alist))))))))) \
+    (setq package-load-list \
+          (append \
+           (when local-gptel '((gptel nil))) \
+           (when local-macher '((macher nil))) \
+           '((macher-agent nil) \
+             (macher-agent-wire nil) \
+             (macher-agent-vfs nil) \
+             (macher-agent-sandbox nil) \
+             (macher-agent-zero-mem nil) \
+             (macher-agent-skills nil) \
+             all))) \
+    (package-initialize) \
+    (setq load-path \
+          (delq nil \
+                (mapcar (lambda (dir) \
+                          (unless (and (stringp dir) \
+                                       (or (string-match-p "/elpa/macher-agent\\(?:-\\(?:wire\\|vfs\\|sandbox\\|zero-mem\\|skills\\)\\)?-[0-9]" dir) \
+                                           (and local-gptel \
+                                                (string-match-p "/elpa/gptel-[0-9]" dir)) \
+                                           (and local-macher \
+                                                (string-match-p "/elpa/macher-[0-9]" dir)))) \
+                            dir)) \
+                        load-path))) \
+    (dolist (pkg '(gptel macher buttercup)) \
+      (unless (or (package-installed-p pkg) \
+                  (and (eq pkg 'gptel) local-gptel) \
+                  (and (eq pkg 'macher) local-macher)) \
+        (unless package-archive-contents (package-refresh-contents)) \
+        (package-install pkg))) \
+    (when local-gptel \
+      (let ((gdir (expand-file-name "gptel" default-directory))) \
+        (push gdir load-path) \
+        (funcall register-local-pkg (expand-file-name "gptel.el" gdir)))) \
+    (when local-macher \
+      (let ((mdir (expand-file-name "macher" default-directory))) \
+        (push mdir load-path) \
+        (funcall register-local-pkg (expand-file-name "macher.el" mdir)))) \
+    (dolist (spec '(("packages/macher-agent" . "macher-agent.el") \
+                    ("packages/macher-agent-wire" . "macher-agent-wire.el") \
+                    ("packages/macher-agent-zero-mem" . "macher-agent-zero-mem.el") \
+                    ("packages/macher-agent-sandbox" . "macher-agent-sandbox.el") \
+                    ("packages/macher-agent-vfs" . "macher-agent-vfs.el") \
+                    ("packages/macher-agent-skills" . "macher-agent-skills.el"))) \
+      (let ((pdir (expand-file-name (car spec) default-directory))) \
+        (when (file-directory-p pdir) \
+          (push pdir load-path) \
+          (funcall register-local-pkg (expand-file-name (cdr spec) pdir))))) \
+    (let ((core-test (expand-file-name "packages/macher-agent/test" default-directory)) \
+          (int-test (expand-file-name "test" default-directory))) \
+      (when (file-directory-p core-test) \
+        (push core-test load-path)) \
+      (when (file-directory-p int-test) \
+        (push int-test load-path)) \
+    (push (expand-file-name default-directory) load-path))) \
+  (require 'gptel) \
+  (require 'gptel-openai nil t) \
+  (require 'gptel-anthropic nil t) \
+  (require 'gptel-gemini nil t) \
+  (require 'buttercup))
 endef
-export SETUP_DEPS
-
-# Elisp snippet to auto-format files
-define FORMAT_ELISP
-(progn \
-  (dolist (file command-line-args-left) \
-    (with-current-buffer (find-file-noselect file) \
-      (setq-local indent-tabs-mode nil) \
-      (indent-region (point-min) (point-max)) \
-      (delete-trailing-whitespace) \
-      (save-buffer) \
-      (message "Formatted %s" file))))
-endef
-export FORMAT_ELISP
-
-# Elisp snippet to run checkdoc and print every issue line cleanly (FILE:LINE: MSG)
-define CHECKDOC_ELISP
-(progn \
-  (require 'checkdoc) \
-  (let ((errors 0)) \
-    (dolist (file command-line-args-left) \
-      (let* ((diag-name "*checkdoc-output*") \
-             (diag-buf (get-buffer-create diag-name))) \
-        (with-current-buffer diag-buf \
-          (let ((inhibit-read-only t)) \
-            (erase-buffer))) \
-        (with-current-buffer (find-file-noselect file) \
-          (let ((checkdoc-autofix-flag nil) \
-                (checkdoc-diagnostic-buffer diag-name)) \
-            (checkdoc-current-buffer t))) \
-        (with-current-buffer diag-buf \
-          (goto-char (point-min)) \
-          (let ((has-issues nil)) \
-            (while (not (eobp)) \
-              (let ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position)))) \
-                (when (and (not (string-match-p "^\\s-*$$" line)) \
-                           (not (string-match-p "^\\*\\*\\*" line))) \
-                  (unless has-issues \
-                    (setq has-issues t) \
-                    (setq errors (1+ errors)) \
-                    (princ (format "\n--- checkdoc issues in %s ---\n" file))) \
-                  (princ (format "  %s\n" (string-trim line))))) \
-              (forward-line 1)))))) \
-    (when (> errors 0) \
-      (message "checkdoc failed with issues across %d file(s)" errors) \
-      (kill-emacs 1))))
-endef
-export CHECKDOC_ELISP
-
-# Elisp snippet to run package-lint
-define PACKAGE_LINT_ELISP
-(progn \
-  (require 'package-lint) \
-  (let ((errors 0)) \
-    (dolist (file command-line-args-left) \
-      (with-current-buffer (find-file-noselect file) \
-        (setq-local package-lint-main-file (expand-file-name "macher-agent.el" default-directory)) \
-        (let ((lint-errors (package-lint-buffer))) \
-          (when lint-errors \
-            (message "\n--- package-lint issues in %s ---" file) \
-            (dolist (err lint-errors) \
-              (message "  Line %d: %s" (car err) (nth 3 err))) \
-            (setq errors (+ errors (length lint-errors))))))) \
-    (when (> errors 0) \
-      (message "package-lint failed with %d issue(s)" errors) \
-      (kill-emacs 1))))
-endef
-export PACKAGE_LINT_ELISP
+export INTEGRATION_SETUP
 
 all: lint
 
 format:
-	@echo "==> Auto-formatting Elisp source files..."
-	$(EMACS) -Q --batch \
-		-L . \
-		--eval "$$FORMAT_ELISP" \
-		$(EL_FILES)
+	@for pkg in $(PACKAGES); do \
+		echo "==> [$$pkg] format"; \
+		$(MAKE) -C $$pkg format || exit 1; \
+	done
 
 fmt: format
 
 compile:
-	@echo "==> Resolving dependencies and byte-compiling source files..."
-	$(EMACS) -Q --batch \
-		-L . \
-		--eval "$$SETUP_DEPS" \
-		--eval "(setq byte-compile-error-on-warn t)" \
-		-f batch-byte-compile $(EL_FILES)
+	@for pkg in $(PACKAGES); do \
+		echo "==> [$$pkg] compile"; \
+		$(MAKE) -C $$pkg compile || exit 1; \
+	done
 
 checkdoc:
-	@echo "==> Running checkdoc..."
-	$(EMACS) -Q --batch \
-		-L . \
-		--eval "$$SETUP_DEPS" \
-		--eval "$$CHECKDOC_ELISP" \
-		$(EL_FILES)
+	@for pkg in $(PACKAGES); do \
+		echo "==> [$$pkg] checkdoc"; \
+		$(MAKE) -C $$pkg checkdoc || exit 1; \
+	done
 
 package-lint:
-	@echo "==> Running package-lint..."
+	@for pkg in $(PACKAGES); do \
+		echo "==> [$$pkg] package-lint"; \
+		$(MAKE) -C $$pkg package-lint || exit 1; \
+	done
+
+lint:
+	@for pkg in $(PACKAGES); do \
+		echo "==> [$$pkg] lint"; \
+		$(MAKE) -C $$pkg lint || exit 1; \
+	done
+
+integration-test:
+	@echo "==> Running 6-package monorepo integration test suite..."
 	$(EMACS) -Q --batch \
 		-L . \
-		--eval "$$SETUP_DEPS" \
-		--eval "$$PACKAGE_LINT_ELISP" \
-		$(EL_FILES)
+		--eval "$$INTEGRATION_SETUP" \
+		-f buttercup-run-discover test
 
-lint: compile checkdoc package-lint
+test:
+	@for pkg in $(PACKAGES); do \
+		echo "==> [$$pkg] test"; \
+		$(MAKE) -C $$pkg test || exit 1; \
+	done
+	@$(MAKE) integration-test
 
 clean:
-	@echo "==> Removing generated .elc files..."
-	find . -name "*.elc" -delete
+	@for pkg in $(PACKAGES); do \
+		echo "==> [$$pkg] clean"; \
+		$(MAKE) -C $$pkg clean || exit 1; \
+	done
+	@if [ -d test ]; then find test -name "*.elc" -delete; fi
