@@ -18,7 +18,7 @@ The package integrates with `gptel` across several core boundaries:
 - Finite-state machine handlers (`gptel-fsm-handlers`) capture user prompts, inject base64-encoded visual media, protect callback closures, and trigger task completion flushes when execution reaches terminal states.
 - The pre-tool execution hook `gptel-pre-tool-call-functions` enforces strict tool scoping, blocking invocations of tools not permitted in the active skill configuration.
 - Settings such as `gptel-model`, `gptel-backend`, `gptel-system-prompt`, and `gptel-tools` are scoped buffer-locally to allow each agent buffer to maintain an independent identity.
-- Extends  `gptel`  to persists true-to-source `INIT` to `WAIT` request payloads across user prompts within an active Emacs session (not persisted across restarts) when `macher-agent-wire-buffer-mode` is non-nil (default `t`). User-buffer display verbosity follows `gptel`'s `gptel-include-tool-results` (`nil`, `call`, `auto`, or `t`) and `gptel-include-reasoning` (`nil`, `ignore`, `t`, or buffer name) settings independently of wire replay.
+- Extends `gptel` to persist true-to-source `INIT` to `WAIT` request payloads across user prompts within an active Emacs session (not persisted across restarts) when `macher-agent-wire` is installed and `macher-agent-wire-buffer-mode` is non-nil (default `t`). User-buffer display verbosity follows `gptel`'s `gptel-include-tool-results` (`nil`, `call`, `auto`, or `t`) and `gptel-include-reasoning` (`nil`, `ignore`, `t`, or buffer name) settings independently of wire replay.
 
 ## Integration with macher
 
@@ -28,7 +28,7 @@ The package extends `macher` to provide workspace-level isolation and Virtual Fi
 - `macher` tools are wrapped to inject a persistent context.
 - File modifications and buffer edits stage directly in the Virtual File System context. Diffs are generated separately for buffer changes and file modifications, presenting unified diffs for user review before committing changes.
 - Active workspaces and persistent contexts register in `macher-agent-active-workspaces` by project root. Subagents receive isolated child contexts that merge back into the orchestrator context upon task submission.
-- The tool `search_in_workspace` uses direct file system traversal to ensure consistent performance and avoid garbage collection bottlenecks on large workspaces.
+- The tool `search_in_workspace` runs `ripgrep` (`rg`) over a synchronised VFS sandbox copy so searches include uncommitted Virtual File System changes without blocking Emacs.
 
 ## Plug-in model and pipeline registry
 
@@ -52,7 +52,7 @@ Use `macher-agent-register-pipeline-step` to attach custom logic to a pipeline. 
 
 ```elisp
 ;; Define a custom transmission step that injects a project header directive
-(defun my-custom-transmission-header-step (state orig-buf presets skills redirect)
+(defun my-custom-transmission-header-step (state)
   "Inject a workspace banner into the transmission directives."
   (let ((banner (format "PROJECT ENVIRONMENT: %s" (macher-agent-root default-directory))))
     (push banner (macher-agent-transmission-state-directives state)))
@@ -99,7 +99,7 @@ The framework provides event hooks to monitor task flushes and workspace changes
 (add-hook 'macher-agent-task-flush-hook #'my-task-flush-logger)
 
 ;; Example: Listen for Virtual File System mutations
-(defun my-vfs-mutation-listener (path)
+(defun my-vfs-mutation-listener (path _context)
   "React to changes staged at PATH."
   (message "Workspace path modified in VFS: %s" path))
 
@@ -199,19 +199,57 @@ Ensure the following utilities and packages are available:
 
 ### Package configuration
 
-Install and configure `macher-agent` using `use-package`:
+Install and configure the `macher-agent` monorepo packages using `use-package`:
 
 ```elisp
 (use-package macher-agent
-  :vc (:url "https://github.com/elij/macher-agent/")
-  :ensure t
+  :vc (:url "https://github.com/elij/macher-agent"
+       :lisp-dir "packages/macher-agent")
   :after (gptel macher)
-  :hook (gptel-mode . macher-agent-mode)
   :config
-  (require 'macher-agent-vfs)      ;; Enable Virtual File System
-  (require 'macher-agent-sandbox)  ;; Enable Programmatic Tool Calling
-  (require 'macher-agent-zero-mem) ;; Enable dual-ledger conversation memory
-  (macher-agent-install))
+  (macher-agent-install)
+  (add-hook 'gptel-mode-hook
+            (lambda ()
+              (if gptel-mode
+                  (macher-agent-mode 1)
+                (macher-agent-mode -1)))))
+
+(use-package macher-agent-wire
+  :vc (:url "https://github.com/elij/macher-agent"
+       :lisp-dir "packages/macher-agent-wire")
+  :after macher-agent
+  :config
+  (macher-agent-wire-install))
+
+(use-package macher-agent-zero-mem
+  :vc (:url "https://github.com/elij/macher-agent"
+       :lisp-dir "packages/macher-agent-zero-mem")
+  :after macher-agent
+  :config
+  (macher-agent-zero-mem-install))
+
+(use-package macher-agent-sandbox
+  :vc (:url "https://github.com/elij/macher-agent"
+       :lisp-dir "packages/macher-agent-sandbox")
+  :after macher-agent
+  :config
+  (macher-agent-sandbox-install))
+
+(use-package macher-agent-vfs
+  :vc (:url "https://github.com/elij/macher-agent"
+       :lisp-dir "packages/macher-agent-vfs")
+  :after (macher-agent macher-agent-sandbox)
+  :config
+  (macher-agent-vfs-install)
+  (macher-agent-initialize-skills))
+
+(use-package macher-agent-skills
+  :vc (:url "https://github.com/elij/macher-agent"
+       :lisp-dir "packages/macher-agent-skills")
+  :after macher-agent
+  :config
+  (macher-agent-skills-install)
+  (macher-agent-initialize-skills))
 ```
 
 **NB**: Ensure `(macher-install)` and `(macher-enable)` are executed before macher-agent.
