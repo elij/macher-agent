@@ -1,7 +1,7 @@
 ;;; macher-agent-sandbox.el --- Sandboxed PTC evaluator for Macher Agent -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.3.66
+;; Version: 0.8.3.67
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher-agent "0.8.3.66"))
 ;; Keywords: convenience, gptel, llm
 ;; URL: https://github.com/elij/macher-agent
@@ -156,7 +156,28 @@ record any workspace-defined `ptc-function' (or `:none') in
                 (put sym 'command-fn old-cmd)
               (cl-remprop sym 'command-fn)))))
       (when (macher-agent-tool-valid-p captured-tool)
-        (puthash captured-tool (or ws-ptc-fn :none) macher-agent-sandbox-workspace-tool-overrides))
+        (puthash captured-tool (or ws-ptc-fn :none) macher-agent-sandbox-workspace-tool-overrides)
+        (when (and ws-ptc-fn (functionp (gptel-tool-function captured-tool)))
+          (let ((orig-fn (gptel-tool-function captured-tool))
+                (ptc-val ws-ptc-fn)
+                (syms ptc-syms))
+            (setf (gptel-tool-function captured-tool)
+                  (lambda (&rest args)
+                    (let ((prior (mapcar (lambda (s)
+                                           (list s
+                                                 (plist-member (symbol-plist s) 'ptc-function)
+                                                 (get s 'ptc-function)))
+                                         syms)))
+                      (unwind-protect
+                          (progn
+                            (dolist (s syms)
+                              (put s 'ptc-function ptc-val))
+                            (apply orig-fn args))
+                        (dolist (entry prior)
+                          (pcase-let ((`(,s ,had-prop ,old-val) entry))
+                            (if had-prop
+                                (put s 'ptc-function old-val)
+                              (cl-remprop s 'ptc-function)))))))))))
       captured-tool)))
 
 ;;;; Plugin State Accessors

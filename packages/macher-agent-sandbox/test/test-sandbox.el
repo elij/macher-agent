@@ -40,7 +40,7 @@
                          :name \"ws_override_demo\"
                          :description \"Workspace override demo\"
                          :args '((:name \"input\" :type \"string\"))
-                         :function (lambda (input) (format \"WS-FN:%s\" input))))
+                         :function (lambda (input) (format \"WS-FN:%s\" (funcall (get 'macher-agent-ws-override-demo-tool 'ptc-function) input)))))
                   (put 'macher-agent-ws-override-demo-tool 'ptc-function
                        (lambda (input &optional _ctx) (format \"WS-PTC:%s\" input)))")
                 ("skills/scripts/ws_pure_override.el" .
@@ -73,6 +73,11 @@
                 (expect ptc-err :to-be nil)
                 (expect ptc-res :to-equal "WS-PTC:alpha")
                 ;; Global symbol plist still intact after PTC run
+                (expect (funcall (get 'macher-agent-ws-override-demo-tool 'ptc-function) "beta")
+                        :to-equal "GLOBAL-DEMO:beta")
+                ;; Direct tool execution exposes workspace ptc-function without leaking global property
+                (expect (funcall (gptel-tool-function ws-tool) "direct")
+                        :to-equal "WS-FN:WS-PTC:direct")
                 (expect (funcall (get 'macher-agent-ws-override-demo-tool 'ptc-function) "beta")
                         :to-equal "GLOBAL-DEMO:beta"))
 
