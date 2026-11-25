@@ -1,7 +1,7 @@
 ;;; macher-agent-vfs.el --- Virtual File System plugin for Macher Agent -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.3.66
+;; Version: 0.8.3.67
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher "0.5.2") (macher-agent "0.8.3.66") (macher-agent-sandbox "0.8.3.66"))
 ;; Keywords: convenience, gptel, llm
 ;; URL: https://github.com/elij/macher-agent
@@ -561,7 +561,7 @@ directory string (with trailing slash) for ROOT."
   (when (stringp abs-path)
     (let ((attrs (file-attributes abs-path 'integer)))
       (when (and attrs (not (eq t (file-attribute-type attrs))))
-        (list (file-attribute-modification-time attrs)
+        (list (time-convert (file-attribute-modification-time attrs) t)
               (file-attribute-size attrs)
               (file-attribute-inode-number attrs))))))
 
@@ -1919,7 +1919,7 @@ OFFSET, LIMIT, and SHOW-LINE-NUMBERS."
                                (raw-after-files (cdr-safe proxy-outcome)))
                           (when (and (consp proxy-outcome) (listp raw-after-files))
                             (let ((seen-paths (make-hash-table :test #'equal
-                                                                :size (max 1 (length raw-after-files)))))
+                                                               :size (max 1 (length raw-after-files)))))
                               (dolist (item raw-after-files)
                                 (let* ((raw-path (cond
                                                   ((macher-agent-vfs-entry-p item) (macher-agent-vfs-entry-path item))
@@ -2646,6 +2646,36 @@ when non-nil, is called as `(funcall format-fn exit-code output)'."
            (memq #'macher-agent-fsm-hijack-transform
                  (default-value 'gptel-prompt-transform-functions)))
   (macher-agent-vfs-install))
+
+;;;###autoload
+(defun macher-agent-vfs-apply-patch ()
+  "Apply active patch from `diff-mode' context back to physical files."
+  (interactive)
+  (unless (derived-mode-p 'diff-mode)
+    (user-error "Not in a patch/diff buffer"))
+  (let* ((patch-content (buffer-substring-no-properties (point-min) (point-max)))
+         (ctx (macher-agent-resolve-context (current-buffer)))
+         (root (if ctx
+                   (macher-agent-context-project-root ctx)
+                 (or (locate-dominating-file default-directory ".git") default-directory)))
+         (default-directory (file-name-as-directory (expand-file-name root)))
+         (use-git (locate-dominating-file default-directory ".git"))
+         (cmd (if use-git "git" "patch"))
+         (args (if use-git '("apply" "-p1" "-") '("-p1"))))
+    (with-temp-buffer
+      (insert patch-content)
+      (let ((exit-code
+             (apply #'call-process-region
+                    (point-min) (point-max) cmd nil "*macher-patch-out*" nil args)))
+        (if (= exit-code 0)
+            (progn
+              (message "SUCCESS: Patch applied safely via %s from %s" cmd default-directory)
+              (when (get-buffer "*macher-patch-out*")
+                (kill-buffer "*macher-patch-out*")))
+          (pop-to-buffer "*macher-patch-out*")
+          (message
+           "ERROR: Failed to apply patch safely.  Check *macher-patch-out* for details."))))))
+
 
 (provide 'macher-agent-vfs)
 ;;; macher-agent-vfs.el ends here

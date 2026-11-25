@@ -1,7 +1,6 @@
 ;;; macher-agent-macher.el --- Bridge to Macher Core -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.3.66
 ;; Package-Requires: ((emacs "30.1") (macher "0.5.2") (macher-agent "0.8.3.66"))
 ;; Keywords: convenience, gptel, llm
 ;; URL: https://github.com/elij/macher-agent
@@ -208,32 +207,6 @@ Optional WRAP-TOOLS-FN wraps or replaces upstream Macher tools."
                          (fboundp 'macher-patch-buffer)
                          (macher-patch-buffer ws))))
     patch-buf))
-
-;;;###autoload
-(defun macher-agent-macher-apply-patch ()
-  "Apply active patch from `diff-mode' context back to physical files."
-  (interactive)
-  (unless (derived-mode-p 'diff-mode)
-    (user-error "Not in a patch/diff buffer"))
-  (let* ((patch-content (buffer-substring-no-properties (point-min) (point-max)))
-         (ctx (macher-agent-resolve-context (current-buffer)))
-         (root (if ctx
-                   (macher-agent-context-project-root ctx)
-                 (or (locate-dominating-file default-directory ".git") default-directory)))
-         (default-directory (file-name-as-directory (expand-file-name root)))
-         (use-git (locate-dominating-file default-directory ".git"))
-         (cmd (if use-git "git" "patch"))
-         (args (if use-git '("apply" "-p1" "-") '("-p1"))))
-    (with-temp-buffer
-      (insert patch-content)
-      (let ((exit-code (apply #'call-process-region (point-min) (point-max) cmd nil "*macher-patch-out*" nil args)))
-        (if (= exit-code 0)
-            (progn
-              (message "SUCCESS: Patch applied safely via %s from %s" cmd default-directory)
-              (when (get-buffer "*macher-patch-out*")
-                (kill-buffer "*macher-patch-out*")))
-          (pop-to-buffer "*macher-patch-out*")
-          (message "ERROR: Failed to apply patch safely.  Check *macher-patch-out* for details."))))))
 
 (provide 'macher-agent-macher)
 ;;; macher-agent-macher.el ends here
