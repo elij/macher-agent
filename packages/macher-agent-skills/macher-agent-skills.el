@@ -1,7 +1,7 @@
 ;;; macher-agent-skills.el --- Bundled skill pack for macher-agent -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.3.66
+;; Version: 0.8.3.67
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.0") (macher-agent "0.8.3.66"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/elij/macher-agent

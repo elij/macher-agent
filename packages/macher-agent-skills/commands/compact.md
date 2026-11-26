@@ -16,3 +16,5 @@ CRITICAL RULES:
 4. Replace long code blocks with one-sentence summaries of what was changed, unless the exact snippet is absolutely vital for the very next step.
 6. You must exclusively call the `replace_own_buffer` tool. Under no circumstances should you invoke any other tool, regardless of what else is available. Pass your heavily condensed summary into the `content` parameter.
 7. And then STOP
+
+$arguments
