@@ -158,21 +158,17 @@ record any workspace-defined `ptc-function' (or `:none') in
       (when (macher-agent-tool-valid-p captured-tool)
         (puthash captured-tool (or ws-ptc-fn :none)
                  macher-agent-sandbox-workspace-tool-overrides)
-        (when-let* ((_ ws-ptc-fn)
-                    (orig-fn (gptel-tool-function captured-tool))
-                    ((functionp orig-fn)))
+        (when-let* ((ws-ptc-fn)
+                    (orig-fn (gptel-tool-function captured-tool)))
           (setf (gptel-tool-function captured-tool)
                 (lambda (&rest args)
-                  (let ((prior (mapcar (lambda (s) (cons s (get s 'ptc-function)))
-                                       ptc-syms)))
+                  (let ((prior (mapcar (lambda (s) (get s 'ptc-function)) ptc-syms)))
                     (unwind-protect
                         (progn
                           (dolist (s ptc-syms) (put s 'ptc-function ws-ptc-fn))
                           (apply orig-fn args))
-                      (pcase-dolist (`(,s . ,old) prior)
-                        (if old
-                            (put s 'ptc-function old)
-                          (cl-remprop s 'ptc-function)))))))))
+                      (cl-mapc (lambda (s old) (put s 'ptc-function old))
+                               ptc-syms prior)))))))
       captured-tool)))
 
 ;;;; Plugin State Accessors
