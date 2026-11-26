@@ -212,7 +212,7 @@
               (expect patch-buf :not :to-be nil)
               (with-current-buffer patch-buf
                 (expect (string-suffix-p "/" default-directory) :to-be t)
-                (macher-agent-macher-apply-patch))
+                (macher-agent-vfs-apply-patch))
 
               ;; Physical disk reflects agent edit cleanly
               (expect (with-temp-buffer
@@ -368,7 +368,7 @@
               (setq-local macher-agent-persistent-context ctx)
               (insert patch-content)
               ;; Apply patch
-              (macher-agent-macher-apply-patch)
+              (macher-agent-vfs-apply-patch)
               ;; Physical file on disk is modified
               (let ((file-content (with-temp-buffer
                                     (insert-file-contents (expand-file-name "file.txt" root))
@@ -1053,6 +1053,7 @@
           ;;    read-context-file MUST sync (not skip when curr is nil) and return D5!
           (macher-agent-vfs-update-context-file ctx "ephem.txt" nil)
           (expect (macher-agent-vfs-read-context-file ctx "ephem.txt") :to-throw 'error)
+          (sleep-for 0.01)
           (with-temp-file file-path (insert "D5\n"))
           (expect (macher-agent-vfs-read-context-file ctx "ephem.txt") :to-equal "D5\n")
           (expect inval-count :to-equal 2)

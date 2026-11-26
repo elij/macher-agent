@@ -1,7 +1,7 @@
 ;;; macher-agent-sandbox.el --- Sandboxed PTC evaluator for Macher Agent -*- lexical-binding: t; -*-
 
 ;; Author: Elijah Charles
-;; Version: 0.8.3.66
+;; Version: 0.8.3.68
 ;; Package-Requires: ((emacs "30.1") (gptel "0.9.9.6") (macher-agent "0.8.3.66"))
 ;; Keywords: convenience, gptel, llm
 ;; URL: https://github.com/elij/macher-agent
@@ -156,7 +156,19 @@ record any workspace-defined `ptc-function' (or `:none') in
                 (put sym 'command-fn old-cmd)
               (cl-remprop sym 'command-fn)))))
       (when (macher-agent-tool-valid-p captured-tool)
-        (puthash captured-tool (or ws-ptc-fn :none) macher-agent-sandbox-workspace-tool-overrides))
+        (puthash captured-tool (or ws-ptc-fn :none)
+                 macher-agent-sandbox-workspace-tool-overrides)
+        (when-let* ((ws-ptc-fn)
+                    (orig-fn (gptel-tool-function captured-tool)))
+          (setf (gptel-tool-function captured-tool)
+                (lambda (&rest args)
+                  (let ((prior (mapcar (lambda (s) (get s 'ptc-function)) ptc-syms)))
+                    (unwind-protect
+                        (progn
+                          (dolist (s ptc-syms) (put s 'ptc-function ws-ptc-fn))
+                          (apply orig-fn args))
+                      (cl-mapc (lambda (s old) (put s 'ptc-function old))
+                               ptc-syms prior)))))))
       captured-tool)))
 
 ;;;; Plugin State Accessors
